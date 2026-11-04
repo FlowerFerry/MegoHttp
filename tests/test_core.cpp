@@ -1,0 +1,543 @@
+// Unit tests for url.hpp / headers.hpp. No framework: assert-based, one binary.
+// Build (from tests/), std mode:
+//   g++ -std=c++17 -DMGHTTP_BACKEND_LIBUV -I../include test_core.cpp -o test_core_std
+// Build (from tests/), MemeString mode:
+//   g++ -std=c++17 -DMGHTTP_USE_MEMESTRING -DMGHTTP_BACKEND_LIBUV \
+//       -I../include -I../../MemeString/include test_core.cpp \
+//       ../../MemeString/liblibmeme_string.dll -o test_core_memepp
+#include <megohttp/url.hpp>
+#include <megohttp/headers.hpp>
+#include <megohttp/error.hpp>
+#include <megohttp/format.hpp>
+#include <megohttp/idna.hpp>
+
+#include <cstdio>
+#include <cstring>
+
+using namespace MegoHttp;
+
+static int g_fail = 0;
+static int g_pass = 0;
+
+#define CHECK(cond) do { \
+    if (cond) { ++g_pass; } \
+    else { ++g_fail; std::printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond); } \
+} while (0)
+
+static bool sv_eq(string_view a, const char* b) {
+    const size_t n = detail::to_size(a);
+    return n == std::strlen(b) && std::memcmp(a.data(), b, n) == 0;
+}
+static bool s_eq(const string& a, const char* b) {
+    return a.size() == static_cast<string::size_type>(std::strlen(b))
+        && std::memcmp(a.data(), b, std::strlen(b)) == 0;
+}
+
+static void test_url_basic() {
+    // Simple http URL
+    {
+        auto r = parse_url("http://example.com/path?q=1");
+        CHECK(r.has_value());
+        if (!r) return;
+        const Url& u = r.value();
+        CHECK(u.scheme == Scheme::Http);
+        CHECK(s_eq(u.host, "example.com"));
+        CHECK(u.port == 80);
+        CHECK(!u.port_was_explicit);
+        CHECK(s_eq(u.path, "/path"));
+        CHECK(u.has_query);
+        CHECK(s_eq(u.query, "q=1"));
+        CHECK(!u.is_ip_literal);
+    }
+    // Default path when absent
+    {
+        auto r = parse_url("https://example.com");
+        CHECK(r.has_value());
+        if (!r) return;
+        CHECK(r.value().port == 443);
+        CHECK(s_eq(r.value().path, "/"));
+        CHECK(!r.value().has_query);
+        CHECK(s_eq(r.value().request_target(), "/"));
+    }
+    // Explicit port
+    {
+        auto r = parse_url("http://example.com:8080/x");
+        CHECK(r.has_value());
+        if (!r) return;
+        CHECK(r.value().port == 8080);
+        CHECK(r.value().port_was_explicit);
+        CHECK(s_eq(r.value().host_port_header(), "example.com:8080"));
+    }
+    // Default port written explicitly is omitted from the Host header
+    {
+        auto r = parse_url("http://example.com:80/");
+        CHECK(r.has_value());
+        if (!r) return;
+        CHECK(s_eq(r.value().host_port_header(), "example.com"));
+    }
+    // Host is lowercased
+    {
+        auto r = parse_url("http://ExAmPle.COM/");
+        CHECK(r.has_value());
+        if (!r) return;
+        CHECK(s_eq(r.value().host, "example.com"));
+    }
+    // ws / wss defaults
+    {
+        auto r = parse_url("ws://h/a");
+        CHECK(r.has_value() && r.value().port == 80);
+        auto r2 = parse_url("wss://h/a");
+        CHECK(r2.has_value() && r2.value().port == 443);
+    }
+}
+
+static void test_url_ipv6() {
+    {
+        auto r = parse_url("http://[::1]:8080/p");
+        CHECK(r.has_value());
+        if (!r) return;
+        CHECK(r.value().is_ipv6_literal);
+        CHECK(r.value().is_ip_literal);
+        CHECK(s_eq(r.value().host, "::1"));
+        CHECK(r.value().port == 8080);
+        CHECK(s_eq(r.value().host_port_header(), "[::1]:8080"));
+    }
+    {
+        auto r = parse_url("http://[2001:db8::1]/");
+        CHECK(r.has_value());
+        if (!r) return;
+        CHECK(s_eq(r.value().host_port_header(), "[2001:db8::1]"));
+    }
+    // Unterminated bracket
+    CHECK(parse_url("http://[::1/").has_error());
+    // Garbage after bracket
+    CHECK(parse_url("http://[::1]x/").has_error());
+}
+
+static void test_url_ipv4() {
+    auto r = parse_url("http://192.168.0.1:8080/");
+    CHECK(r.has_value());
+    if (!r) return;
+    CHECK(r.value().is_ip_literal);
+    CHECK(!r.value().is_ipv6_literal);
+    CHECK(s_eq(r.value().host, "192.168.0.1"));
+
+    // Out-of-range octet is not a valid IPv4 literal -> treated as a host name,
+    // which is still legal syntax (a DNS name may contain dots and digits).
+    auto r2 = parse_url("http://999.1.1.1/");
+    CHECK(r2.has_value());
+    if (r2) CHECK(!r2.value().is_ip_literal);
+}
+
+static void test_url_rejects() {
+    CHECK(parse_url("").has_error());                       // empty
+    CHECK(parse_url("example.com/x").has_error());          // relative
+    CHECK(parse_url("http:/example.com").has_error());      // one slash
+    CHECK(parse_url("ftp://example.com/").has_error());     // unsupported scheme
+    CHECK(parse_url("http://").has_error());                // empty authority
+    CHECK(parse_url("http:///path").has_error());           // empty host
+    CHECK(parse_url("http://exam ple.com/").has_error());   // space
+    CHECK(parse_url("http://example.com/a\r\nHost: x").has_error());  // CRLF injection
+    CHECK(parse_url("http://example.com:0/").has_error());  // port 0
+    CHECK(parse_url("http://example.com:99999/").has_error()); // port overflow
+    CHECK(parse_url("http://example.com:abc/").has_error());   // non-numeric port
+    CHECK(parse_url("http://example..com/").has_error());   // empty label
+    CHECK(parse_url("http://example.com./").has_error());   // trailing dot
+    // A non-ASCII host is now converted to its A-label form rather than rejected
+    // (see test_idna for the conversion itself).
+    {
+        auto r = parse_url("http://\xE4\xB8\xAD\xE6\x96\x87.com/");
+        CHECK(r.has_value());
+        if (r) CHECK(s_eq(r.value().host, "xn--fiq228c.com"));
+    }
+    // Invalid UTF-8 in the host is still rejected.
+    CHECK(parse_url("http://\xFF\xFE.com/").has_error());
+}
+
+static void test_url_userinfo() {
+    auto r = parse_url("http://user:pass@example.com/p");
+    CHECK(r.has_value());
+    if (!r) return;
+    CHECK(s_eq(r.value().host, "example.com"));
+    CHECK(r.value().username.has_value() && s_eq(*r.value().username, "user"));
+    CHECK(r.value().password.has_value() && s_eq(*r.value().password, "pass"));
+    // Credentials must not leak into the request target or Host header
+    CHECK(s_eq(r.value().request_target(), "/p"));
+    CHECK(s_eq(r.value().host_port_header(), "example.com"));
+}
+
+static void test_url_targets() {
+    auto r = parse_url("https://api.example.com:8443/v1/items?page=2");
+    CHECK(r.has_value());
+    if (!r) return;
+    CHECK(s_eq(r.value().request_target(), "/v1/items?page=2"));
+    CHECK(s_eq(r.value().origin(), "https://api.example.com:8443"));
+    CHECK(s_eq(r.value().absolute_form_target(), "http://api.example.com:8443/v1/items?page=2"));
+    CHECK(r.value().is_secure());
+    CHECK(!r.value().is_websocket());
+}
+
+static void test_headers_basic() {
+    Headers h;
+    CHECK(h.empty());
+
+    h.add("Content-Type", "text/plain");
+    h.add("Accept", "*/*");
+    CHECK(h.size() == 2);
+    CHECK(h.contains("content-type"));      // case-insensitive
+    CHECK(h.contains("CONTENT-TYPE"));
+    CHECK(!h.contains("X-Missing"));
+
+    auto ct = h.get("Content-Type");
+    CHECK(ct.has_value() && sv_eq(*ct, "text/plain"));
+
+    // Duplicate fields are preserved
+    h.add("Set-Cookie", "a=1");
+    h.add("Set-Cookie", "b=2");
+    auto all = h.get_all("set-cookie");
+    CHECK(all.size() == 2);
+    CHECK(sv_eq(all[0], "a=1"));
+    CHECK(sv_eq(all[1], "b=2"));
+
+    // get() returns the FIRST value
+    auto first = h.get("Set-Cookie");
+    CHECK(first.has_value() && sv_eq(*first, "a=1"));
+
+    // set() replaces every value of that name
+    h.set("set-cookie", "only=1");
+    CHECK(h.get_all("Set-Cookie").size() == 1);
+
+    // remove() reports whether anything was erased
+    CHECK(h.remove("Set-Cookie"));
+    CHECK(!h.remove("Set-Cookie"));
+    CHECK(!h.contains("Set-Cookie"));
+
+    // Insertion order is preserved
+    Headers ord;
+    ord.add("X-A", "1");
+    ord.add("X-B", "2");
+    ord.add("X-C", "3");
+    auto it = ord.begin();
+    CHECK(sv_eq(to_view(it->first), "X-A")); ++it;
+    CHECK(sv_eq(to_view(it->first), "X-B")); ++it;
+    CHECK(sv_eq(to_view(it->first), "X-C"));
+
+    // set() replaces in place: the field keeps its original position, and any
+    // duplicates are dropped. Removing then re-adding would have moved it to the
+    // end, silently reordering the header block.
+    Headers ord2;
+    ord2.add("X-A", "1");
+    ord2.add("X-B", "2");
+    ord2.add("X-C", "3");
+    ord2.set("X-B", "changed");
+    {
+        auto it = ord2.begin();
+        CHECK(sv_eq(to_view(it->first), "X-A")); ++it;
+        CHECK(sv_eq(to_view(it->first), "X-B"));
+        CHECK(sv_eq(to_view(it->second), "changed"));
+        ++it;
+        CHECK(sv_eq(to_view(it->first), "X-C"));
+    }
+    // Duplicates collapse to the first position.
+    Headers ord3;
+    ord3.add("Set-Cookie", "a=1");
+    ord3.add("X-Mid", "m");
+    ord3.add("Set-Cookie", "b=2");
+    ord3.set("set-cookie", "only=1");
+    CHECK(ord3.get_all("Set-Cookie").size() == 1);
+    {
+        auto it = ord3.begin();
+        CHECK(sv_eq(to_view(it->first), "Set-Cookie"));
+        CHECK(sv_eq(to_view(it->second), "only=1"));
+        ++it;
+        CHECK(sv_eq(to_view(it->first), "X-Mid"));   // X-Mid kept its place after
+    }
+    // set() on a missing name appends.
+    ord3.set("X-New", "n");
+    CHECK(ord3.size() == 3);
+
+    ord.clear();
+    CHECK(ord.empty());
+}
+
+static void test_headers_uint64() {
+    Headers h;
+    h.add("Content-Length", "12345");
+    auto cl = h.get_uint("content-length");
+    CHECK(cl.has_value() && *cl == 12345);
+
+    h.set("Content-Length", "abc");
+    CHECK(!h.get_uint("Content-Length").has_value());
+
+    h.set("Content-Length", "-5");
+    CHECK(!h.get_uint("Content-Length").has_value());
+
+    // Overflow must be rejected, not wrapped
+    h.set("Content-Length", "99999999999999999999999");
+    CHECK(!h.get_uint("Content-Length").has_value());
+
+    h.set("Content-Length", "");
+    CHECK(!h.get_uint("Content-Length").has_value());
+
+    h.set("Content-Length", "0");
+    auto zero = h.get_uint("Content-Length");
+    CHECK(zero.has_value() && *zero == 0);
+}
+
+static void test_header_validation() {
+    CHECK(is_valid_header_name("Content-Type"));
+    CHECK(is_valid_header_name("X-Custom_1"));
+    CHECK(!is_valid_header_name(""));
+    CHECK(!is_valid_header_name("Bad Header"));      // space
+    CHECK(!is_valid_header_name("Bad:Header"));      // colon
+    CHECK(!is_valid_header_name("Bad\r\nHeader"));   // CRLF
+
+    CHECK(is_valid_header_value("text/plain"));
+    CHECK(is_valid_header_value(""));
+    CHECK(is_valid_header_value("a\tb"));            // HTAB allowed
+    CHECK(!is_valid_header_value("a\rb"));           // CR rejected
+    CHECK(!is_valid_header_value("a\nb"));           // LF rejected
+    // Explicit length: a string literal "a\0b" would stop at the NUL.
+    CHECK(!is_valid_header_value(string_view("a\0b", 3)));   // NUL rejected
+    CHECK(is_valid_header_value(string_view("a\0b", 1)));    // "a" is fine
+}
+
+static void test_error() {
+    Error e{ErrorCode::HttpChunkError, ErrorPhase::Receive, string("bad chunk")};
+    CHECK(e.code() == ErrorCode::HttpChunkError);
+    CHECK(e.phase() == ErrorPhase::Receive);
+    CHECK(e);
+    CHECK(std::strcmp(to_string(e.code()), "HttpChunkError") == 0);
+    CHECK(std::strcmp(to_string(e.phase()), "Receive") == 0);
+
+    // Error families the spec requires to stay distinct
+    CHECK(std::strcmp(to_string(ErrorCode::WsCompressionNotCompiled),
+                      to_string(ErrorCode::WsCompressionMalformedData)) != 0);
+    CHECK(std::strcmp(to_string(ErrorCode::MultipartTruncated),
+                      to_string(ErrorCode::MultipartDelimiterInvalid)) != 0);
+
+    // Result<T>
+    Result<int> ok{42};
+    CHECK(ok.has_value());
+    CHECK(ok.value() == 42);
+    CHECK(static_cast<bool>(ok));
+    CHECK(ok.value_or(7) == 42);
+
+    Result<int> bad{Error{ErrorCode::TimeoutTotal}};
+    CHECK(bad.has_error());
+    CHECK(!static_cast<bool>(bad));
+    CHECK(bad.error().code() == ErrorCode::TimeoutTotal);
+    CHECK(bad.value_or(7) == 7);
+
+    // VoidResult
+    VoidResult vok;
+    CHECK(vok.has_value());
+    CHECK(static_cast<bool>(vok));
+    VoidResult vbad{Error{ErrorCode::Cancelled}};
+    CHECK(vbad.has_error());
+    CHECK(vbad.error().code() == ErrorCode::Cancelled);
+}
+
+static void test_format() {
+    // fmt is the only formatter: values must land in the library's string type,
+    // with the same text in both string modes.
+    string a = format("{}", 42);
+    CHECK(a.size() == 2);
+    CHECK(std::memcmp(a.data(), "42", 2) == 0);
+
+    string b = format("{}-{}", "x", 7);
+    CHECK(b.size() == 3);
+    CHECK(std::memcmp(b.data(), "x-7", 3) == 0);
+
+    // Hex formatting is what chunked encoding uses.
+    string c = format("{:x}", 26u);
+    CHECK(c.size() == 2);
+    CHECK(std::memcmp(c.data(), "1a", 2) == 0);
+
+    string d = format("{:x}", 0u);
+    CHECK(d.size() == 1 && d.data()[0] == '0');
+
+    // The megohttp alias exposes the same types.
+    megohttp::string e = megohttp::to_string(to_view(b));
+    CHECK(e.size() == b.size());
+}
+
+static void test_scheme_unknown() {
+    // Scheme has an Unknown value, and it is what default_port answers 0 for.
+    CHECK(static_cast<int>(Scheme::Unknown) == 0);
+    CHECK(Url::default_port(Scheme::Unknown) == 0);
+    CHECK(Url::default_port(Scheme::Http) == 80);
+
+    // A parsed URL never carries Unknown.
+    auto r = parse_url("https://example.com/");
+    CHECK(r.has_value());
+    if (r) CHECK(r.value().scheme != Scheme::Unknown);
+
+    // A failed parse produces an Error, not a Url with an Unknown scheme, so
+    // there is no state where scheme==Unknown escapes to a caller.
+    CHECK(parse_url("nonsense://x").has_error());
+}
+
+static void test_error_mgpp_bridge() {
+    // ErrorCode values live in the -400000 band, disjoint from every band
+    // mego/err/ec.h already uses (POSIX -100000, Windows -200000, SQLite -300000).
+    CHECK(static_cast<int32_t>(ErrorCode::Unknown) < -399999);
+    CHECK(static_cast<int32_t>(ErrorCode::SseEventTooLarge) > -499999);
+    CHECK(static_cast<int32_t>(ErrorCode::Success) == MGEC__OK);
+
+    // Round-trip through mgpp::err: the typed code and the phase survive.
+    Error e{ErrorCode::HttpChunkError, ErrorPhase::Receive, string("bad chunk")};
+    CHECK(e.code() == ErrorCode::HttpChunkError);
+    CHECK(e.phase() == ErrorPhase::Receive);
+    CHECK(!e.message().empty());
+    CHECK(e);
+    CHECK(e.native().code() == static_cast<int32_t>(ErrorCode::HttpChunkError));
+    CHECK(e.native().usercode() == static_cast<int32_t>(ErrorPhase::Receive));
+
+    // Wrapping a foreign mgpp::err keeps the payload and maps the code safely.
+    mgpp::err raw{MGEC__INVAL, memepp::string("invalid from platform")};
+    Error wrapped{raw};
+    CHECK(wrapped);
+    // MGEC__INVAL is outside our band, so it maps to Unknown rather than lying.
+    CHECK(wrapped.code() == ErrorCode::Unknown);
+    CHECK(wrapped.message().size() == static_cast<string::size_type>(raw.message().size()));
+    CHECK(std::memcmp(wrapped.message().data(), raw.message().data(),
+                      static_cast<size_t>(raw.message().size())) == 0);
+
+    // mgpp::err::message() reads the payload only -- the category is NOT consulted,
+    // it exists for err_cond comparison. So a code-only err has an empty message,
+    // and the name comes from to_string() / the category's message() instead.
+    mgpp::err cat_err{static_cast<int32_t>(ErrorCode::MultipartTruncated),
+                      const_cast<mgpp::err_cat*>(megohttp_err_cat())};
+    CHECK(cat_err.message().empty());          // no payload was supplied
+    CHECK(std::strcmp(megohttp_err_cat()->name(), "megohttp") == 0);
+    {
+        // The category can name a code on demand.
+        memepp::string named = megohttp_err_cat()->message(
+            static_cast<int32_t>(ErrorCode::MultipartTruncated));
+        CHECK(!named.empty());
+        CHECK(std::memcmp(named.data(), "MultipartTruncated", 18) == 0);
+    }
+
+    // err_cond comparison works through the category.
+    mgpp::err_cond cond = megohttp_err_cat()->get_err_cond(
+        static_cast<int32_t>(ErrorCode::MultipartTruncated));
+    CHECK(cat_err == cond);
+
+    // The five WS-compression codes and the multipart codes stay distinct.
+    CHECK(ErrorCode::WsCompressionNotCompiled != ErrorCode::WsCompressionMalformedData);
+    CHECK(ErrorCode::MultipartTruncated != ErrorCode::MultipartDelimiterInvalid);
+}
+
+static void test_idna() {
+    // --- Punycode: RFC 3492 section 7.1 sample vectors -----------------------
+    {
+        auto r = punycode_encode("bücher");
+        CHECK(r.has_value());
+        if (r) CHECK(s_eq(r.value(), "bcher-kva"));
+    }
+    {
+        // 他们为什么不说中文 -> "ihqwcrb4cv8a8dqg056pqjye" (punycode, no prefix)
+        auto r = punycode_encode("\xE4\xBB\x96\xE4\xBB\xAC\xE4\xB8\xBA"
+                                 "\xE4\xBB\x80\xE4\xB9\x88\xE4\xB8\x8D\xE8\xAF\xB4"
+                                 "\xE4\xB8\xAD\xE6\x96\x87");
+        CHECK(r.has_value());
+        if (r) CHECK(s_eq(r.value(), "ihqwcrb4cv8a8dqg056pqjye"));
+    }
+    {
+        // 3年B組金八先生 -> "3B-ww4c5e180e575a65lsy2b"
+        auto r = punycode_encode("3\xE5\xB9\xB4" "B\xE7\xB5\x84"
+                                 "\xE9\x87\x91\xE5\x85\xAB\xE5\x85\x88\xE7\x94\x9F");
+        CHECK(r.has_value());
+        if (r) CHECK(s_eq(r.value(), "3B-ww4c5e180e575a65lsy2b"));
+    }
+    // Pure ASCII label: no encoding, no trailing '-'.
+    {
+        auto r = punycode_encode("hello");
+        CHECK(r.has_value());
+        if (r) CHECK(s_eq(r.value(), "hello"));
+    }
+    CHECK(punycode_encode("").has_error());
+    // Invalid UTF-8 must be rejected, not silently mangled.
+    CHECK(punycode_encode("\xFF\xFE").has_error());
+    CHECK(punycode_encode("\xE4\xB8").has_error());   // truncated 3-byte seq
+
+    // --- idna_encode ---------------------------------------------------------
+    // ASCII passes through.
+    {
+        auto r = idna_encode("example.com");
+        CHECK(r.has_value());
+        if (r) CHECK(s_eq(r.value(), "example.com"));
+    }
+    // Already-encoded A-label is idempotent.
+    {
+        auto r = idna_encode("xn--fiq228c.com");
+        CHECK(r.has_value());
+        if (r) CHECK(s_eq(r.value(), "xn--fiq228c.com"));
+    }
+    // 中文.com -> xn--fiq228c.com
+    {
+        auto r = idna_encode("\xE4\xB8\xAD\xE6\x96\x87.com");
+        CHECK(r.has_value());
+        if (r) CHECK(s_eq(r.value(), "xn--fiq228c.com"));
+    }
+    // Mixed labels keep their ASCII parts.
+    {
+        auto r = idna_encode("www.b\xC3\xBC" "cher.example");
+        CHECK(r.has_value());
+        if (r) CHECK(s_eq(r.value(), "www.xn--bcher-kva.example"));
+    }
+    CHECK(idna_encode("").has_error());
+    CHECK(idna_encode("a..b").has_error());          // empty label
+
+    // --- integrated into parse_url -------------------------------------------
+    {
+        auto r = parse_url("https://\xE4\xB8\xAD\xE6\x96\x87.com/path");
+        CHECK(r.has_value());
+        if (r) {
+            // The stored host is the A-label, so DNS / SNI / Host all agree.
+            CHECK(s_eq(r.value().host, "xn--fiq228c.com"));
+            CHECK(r.value().port == 443);
+            CHECK(s_eq(r.value().host_port_header(), "xn--fiq228c.com"));
+            CHECK(s_eq(r.value().request_target(), "/path"));
+            CHECK(!r.value().is_ip_literal);
+        }
+    }
+    {
+        auto r = parse_url("http://www.b\xC3\xBC" "cher.example:8080/");
+        CHECK(r.has_value());
+        if (r) {
+            CHECK(s_eq(r.value().host, "www.xn--bcher-kva.example"));
+            CHECK(r.value().port == 8080);
+            CHECK(s_eq(r.value().host_port_header(), "www.xn--bcher-kva.example:8080"));
+        }
+    }
+    // ASCII hosts are untouched by the IDN path.
+    {
+        auto r = parse_url("http://example.com/");
+        CHECK(r.has_value());
+        if (r) CHECK(s_eq(r.value().host, "example.com"));
+    }
+    CHECK(is_ascii("example.com"));
+    CHECK(!is_ascii("\xE4\xB8\xAD"));
+}
+
+int main() {
+    test_url_basic();
+    test_url_ipv6();
+    test_url_ipv4();
+    test_url_rejects();
+    test_url_userinfo();
+    test_url_targets();
+    test_headers_basic();
+    test_headers_uint64();
+    test_header_validation();
+    test_error();
+    test_format();
+    test_scheme_unknown();
+    test_error_mgpp_bridge();
+    test_idna();
+
+    std::printf("=== %d passed, %d failed ===\n", g_pass, g_fail);
+    return g_fail == 0 ? 0 : 1;
+}
