@@ -31,6 +31,6 @@ int run_tu_a() {
 
 MegoHttp::string tu_a_make() {
     MegoHttp::string_builder b;
-    MegoHttp::detail::sb_append(b, "from-a");
+    MegoHttp::Detail::sb_append(b, "from-a");
     return b.release();
 }

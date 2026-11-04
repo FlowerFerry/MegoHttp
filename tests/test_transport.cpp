@@ -4,6 +4,8 @@
 // Threading contract exercised here: AsyncByteStream is NOT thread-safe, so every
 // stream call is issued from the loop thread (the documented pattern for the
 // higher layers too).
+#include <catch_amalgamated.hpp>
+
 #include <megohttp/config.hpp>
 #include <megohttp/format.hpp>
 #include <megohttp/resolver.hpp>
@@ -29,9 +31,6 @@
 using namespace MegoHttp;
 using namespace MegoHttp::libuv_backend;
 
-static int g_fail = 0, g_pass = 0;
-#define CHECK(c) do { if (c) ++g_pass; else { ++g_fail; \
-    std::printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #c); } } while (0)
 
 template<typename F>
 static bool wait_until(F pred, int max_ms = 5000) {
@@ -137,7 +136,7 @@ private:
     std::thread thread_;
 };
 
-static void test_resolve_literal() {
+TEST_CASE("resolve literal", "[transport]") {
     auto v4 = parse_ip_literal("127.0.0.1", 8080);
     CHECK(v4.size() == 1);
     if (!v4.empty()) {
@@ -155,7 +154,7 @@ static void test_resolve_literal() {
     CHECK(parse_ip_literal("example.com", 80).empty());
 }
 
-static void test_static_resolver() {
+TEST_CASE("static resolver", "[transport]") {
     auto ex = UvExecutor::create_internal();
     CHECK(ex != nullptr);
     if (!ex) return;
@@ -184,7 +183,7 @@ static void test_static_resolver() {
     ex->shutdown();
 }
 
-static void test_system_resolver_literal_fast_path() {
+TEST_CASE("system resolver literal fast path", "[transport]") {
     auto ex = UvExecutor::create_internal();
     CHECK(ex != nullptr);
     if (!ex) return;
@@ -201,7 +200,7 @@ static void test_system_resolver_literal_fast_path() {
     ex->shutdown();
 }
 
-static void test_chained_resolver() {
+TEST_CASE("chained resolver", "[transport]") {
     auto ex = UvExecutor::create_internal();
     CHECK(ex != nullptr);
     if (!ex) return;
@@ -231,7 +230,7 @@ static void test_chained_resolver() {
     ex->shutdown();
 }
 
-static void test_tcp_connect_and_echo() {
+TEST_CASE("tcp connect and echo", "[transport]") {
     EchoServer server;
     if (!server.start()) {
         std::printf("SKIP: could not start the local echo server\n");
@@ -295,7 +294,7 @@ static void test_tcp_connect_and_echo() {
     server.stop();
 }
 
-static void test_tcp_connect_refused() {
+TEST_CASE("tcp connect refused", "[transport]") {
     auto ex = UvExecutor::create_internal();
     CHECK(ex != nullptr);
     if (!ex) return;
@@ -324,7 +323,7 @@ static void test_tcp_connect_refused() {
     ex->shutdown();
 }
 
-static void test_connect_race() {
+TEST_CASE("connect race", "[transport]") {
     EchoServer server;
     if (!server.start()) {
         std::printf("SKIP: could not start the local echo server\n");
@@ -379,7 +378,7 @@ static void test_connect_race() {
 
 // Both addresses reach a live server. Only one terminal callback, and the
 // returned stream must be usable for real I/O.
-static void test_race_one_winner_usable() {
+TEST_CASE("race one winner usable", "[transport]") {
     EchoServer srvA;
     CHECK(srvA.start());
     EchoServer srvB;
@@ -444,7 +443,7 @@ static void test_race_one_winner_usable() {
 }
 
 // Every address fails: exactly one error terminal, and no second callback.
-static void test_race_single_terminal_error() {
+TEST_CASE("race single terminal error", "[transport]") {
     auto ex = UvExecutor::create_internal();
     CHECK(ex != nullptr);
     if (!ex) return;
@@ -495,7 +494,7 @@ static void test_race_single_terminal_error() {
 //   • exactly one terminal callback
 //   • after the race ends, the LOSER server must observe its connection closed
 // ---------------------------------------------------------------------------
-static void test_race_closes_loser() {
+TEST_CASE("race closes loser", "[transport]") {
     EchoServer srvA;
     CHECK(srvA.start());
     EchoServer srvB;
@@ -539,7 +538,7 @@ static void test_race_closes_loser() {
 
     // Both servers must have accepted a connection: that is what makes one of
     // them the loser rather than "an attempt that never happened".
-    CHECK(wait_until([&] { return srvA.accepted() == 1 && srvB.accepted() == 1; }, 5000));
+    CHECK((wait_until([&] { return srvA.accepted() == 1 && srvB.accepted() == 1; }, 5000)));
     CHECK(srvA.accepted() == 1);
     CHECK(srvB.accepted() == 1);
 
@@ -552,28 +551,11 @@ static void test_race_closes_loser() {
 
     // Now close the winner; the second server should observe its close too.
     if (winner) ex->post([winner] { winner->async_close(nullptr); });
-    CHECK(wait_until([&] { return srvA.closed() == 1 && srvB.closed() == 1; }, 5000));
+    CHECK((wait_until([&] { return srvA.closed() == 1 && srvB.closed() == 1; }, 5000)));
     CHECK(srvA.closed() == 1);
     CHECK(srvB.closed() == 1);
 
     ex->shutdown();
     srvA.stop();
     srvB.stop();
-}
-
-int main() {
-    test_resolve_literal();
-    test_static_resolver();
-    test_system_resolver_literal_fast_path();
-    test_chained_resolver();
-    test_tcp_connect_and_echo();
-    test_tcp_connect_refused();
-    test_connect_race();
-    test_race_one_winner_usable();
-    test_race_single_terminal_error();
-    test_race_closes_loser();
-    test_race_single_terminal_error();
-
-    std::printf("=== %d passed, %d failed ===\n", g_pass, g_fail);
-    return g_fail == 0 ? 0 : 1;
 }

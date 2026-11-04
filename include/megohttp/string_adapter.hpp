@@ -72,7 +72,7 @@ namespace MegoHttp {
     };
 #endif
 
-    namespace detail {
+    namespace Detail {
         // Append a borrowed view to a builder without spelling the mode-specific
         // overload at every call site.
         inline string_builder& sb_append(string_builder& b, string_view v) {
@@ -103,14 +103,14 @@ namespace MegoHttp {
         inline string sb_generate(const string_builder& b) {
             return b.generate();
         }
-    } // namespace detail
+    } // namespace Detail
 
     // Byte buffers are for raw network bytes, TLS ciphertext, compressed data and
     // file contents. They are deliberately NOT the string type: the string-switch
     // requirement applies to TEXT, and bytes must not be smuggled through it.
     using byte_buffer = std::vector<uint8_t>;
 
-    namespace detail {
+    namespace Detail {
 
         // Size type differs between backends (memepp uses mmint_t = int32_t).
         inline size_t to_size(string_view v) noexcept {
@@ -184,7 +184,7 @@ namespace MegoHttp {
         }
 #endif
 
-    } // namespace detail
+    } // namespace Detail
 
     // --- Conversions -----------------------------------------------------------
     // Constructing an owning string from a borrowed view. Both modes support this;
@@ -222,6 +222,13 @@ namespace MegoHttp {
 #else
         return string(data, size);
 #endif
+    }
+
+    // Overload for literal strings: array-to-pointer is a standard conversion,
+    // beating user-defined conversion to string_view/string_span in MemeString mode.
+    inline string to_string(const char* s) {
+        // std::strlen is fine for literals; we do not have memepp::strlen.
+        return to_string(s, std::strlen(s));
     }
 
     namespace literals {

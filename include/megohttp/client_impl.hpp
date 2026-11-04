@@ -22,7 +22,7 @@
 
 namespace MegoHttp {
 
-    namespace detail {
+    namespace Detail {
 
         // Creates the default executor for the compiled backend.
         inline std::shared_ptr<Executor> make_default_executor() {
@@ -80,6 +80,21 @@ namespace MegoHttp {
         // Per-request state. Self-holding: the request owns it from submission
         // until the terminal callback runs, so a caller that drops the cancel
         // handle does not abort anything.
+        //
+        // The phase field records which stage of the request lifecycle we are in,
+        // so errors carry the correct phase information (S2.1-01, S2.1-02).
+        enum class RequestPhase : int32_t {
+            Idle = 0,
+            UrlParse,
+            BuildHead,
+            Resolve,
+            Connect,
+            SendHead,
+            SendBody,
+            Receive,
+            Done,
+        };
+
         struct RequestState : std::enable_shared_from_this<RequestState> {
             std::shared_ptr<Executor> executor;
             std::shared_ptr<Resolver> resolver;
@@ -89,6 +104,8 @@ namespace MegoHttp {
 
             std::atomic<bool> finished{false};
             std::shared_ptr<Timer> total_timer;
+
+            RequestPhase phase{RequestPhase::Idle};
 
             // Held while the exchange is live so the stream outlives its callbacks.
             std::shared_ptr<AsyncByteStream> stream;
@@ -107,6 +124,27 @@ namespace MegoHttp {
                 self_hold.reset();
                 if (cb) cb(std::move(result));
             }
+
+            // Phase-aware error wrapper: fills in the ErrorPhase from the current
+            // request stage when the error did not already carry one.
+            void fail(const Error& e) {
+                ErrorCode code = e.code();
+                string msg = e.message();
+                ErrorPhase p = e.phase();
+                if (p == ErrorPhase::None) {
+                    switch (phase) {
+                    case RequestPhase::UrlParse:  p = ErrorPhase::Resolve;   break;
+                    case RequestPhase::BuildHead: p = ErrorPhase::Send;      break;
+                    case RequestPhase::Resolve:   p = ErrorPhase::Resolve;   break;
+                    case RequestPhase::Connect:   p = ErrorPhase::TcpConnect;break;
+                    case RequestPhase::SendHead:
+                    case RequestPhase::SendBody:  p = ErrorPhase::Send;      break;
+                    case RequestPhase::Receive:   p = ErrorPhase::Receive;   break;
+                    default: break;
+                    }
+                }
+                finish(Result<Response>(Error{code, p, std::move(msg)}));
+            }
         };
 
         // Drives one response over a connected stream: write the head, then feed
@@ -123,10 +161,28 @@ namespace MegoHttp {
 
             // Start by sending the encoded head.
             void start(string head) {
+                state_->phase = Detail::RequestPhase::SendHead;
                 auto self = shared_from_this();
                 auto stream = state_->stream;
                 stream->async_write(
                     reinterpret_cast<const uint8_t*>(head.data()), head.size(),
+                    [self](Result<size_t> w) {
+                        if (!w) { self->fail(w.error()); return; }
+                        self->send_body();
+                    });
+            }
+
+            // Send body if present, then start reading the response.
+            void send_body() {
+                state_->phase = Detail::RequestPhase::SendBody;
+                auto self = shared_from_this();
+                auto stream = state_->stream;
+                if (!state_->request.has_body() || state_->request.body_bytes().empty()) {
+                    read_more();
+                    return;
+                }
+                const auto& body = state_->request.body_bytes();
+                stream->async_write(body.data(), body.size(),
                     [self](Result<size_t> w) {
                         if (!w) { self->fail(w.error()); return; }
                         self->read_more();
@@ -204,6 +260,7 @@ namespace MegoHttp {
                             return;
                         }
 
+                        self->state_->phase = Detail::RequestPhase::Receive;
                         auto res = self->parser_->feed(self->buf_, n);
                         if (!res) { self->fail(res.error()); return; }
                         if (self->complete_) return;
@@ -212,7 +269,7 @@ namespace MegoHttp {
             }
 
             void fail(const Error& e) {
-                state_->finish(Result<Response>(e));
+                state_->fail(e);
             }
 
             std::shared_ptr<RequestState> state_;
@@ -239,7 +296,7 @@ namespace MegoHttp {
                                        to_view(url.request_target()), headers);
         }
 
-    } // namespace detail
+    } // namespace Detail
 
     // ---------------------------------------------------------------------------
     // Client::Impl
@@ -249,7 +306,7 @@ namespace MegoHttp {
         explicit Impl(ClientOptions opts) : options(std::move(opts)) {
             executor = options.executor;
             owns_executor = (executor == nullptr);
-            if (!executor) executor = detail::make_default_executor();
+            if (!executor) executor = Detail::make_default_executor();
 
             resolver = options.resolver;
             if (!resolver && executor) {
@@ -262,14 +319,14 @@ namespace MegoHttp {
         void shutdown() {
             bool expected = false;
             if (!stopped.compare_exchange_strong(expected, true)) return;
-            if (owns_executor) detail::shutdown_executor(executor);
+            if (owns_executor) Detail::shutdown_executor(executor);
         }
 
         void submit(const Request& req,
                     Client::ResponseCallback on_complete,
                     const CancelHandle& handle,
                     std::shared_ptr<CancelState> cancel_state) {
-            auto st = std::make_shared<detail::RequestState>();
+            auto st = std::make_shared<Detail::RequestState>();
             st->self_hold = st;
             st->executor = executor;
             st->resolver = resolver;
@@ -288,7 +345,7 @@ namespace MegoHttp {
 
             // Total timeout covers the WHOLE logical request (spec 8.2).
             if (options.total_timeout != Duration::zero()) {
-                std::weak_ptr<detail::RequestState> weak = st;
+                std::weak_ptr<Detail::RequestState> weak = st;
                 st->total_timer = executor->schedule_after(options.total_timeout, [weak] {
                     auto s = weak.lock();
                     if (!s) return;
@@ -299,7 +356,7 @@ namespace MegoHttp {
 
             // Cancellation is observed at the executor: the request is retired on
             // the loop thread, never from the cancelling caller's thread.
-            std::weak_ptr<detail::RequestState> weak = st;
+            std::weak_ptr<Detail::RequestState> weak = st;
             cancel_state->on_cancel([this, weak] {
                 auto s = weak.lock();
                 if (!s) return;
@@ -316,9 +373,10 @@ namespace MegoHttp {
     private:
         // Static: it runs from a posted handler, so it must not depend on `this`
         // staying alive (a Client may be destroyed while a request is in flight).
-        static void begin(const std::shared_ptr<detail::RequestState>& st) {
+        static void begin(const std::shared_ptr<Detail::RequestState>& st) {
             if (st->finished.load()) return;
 
+            st->phase = Detail::RequestPhase::UrlParse;
             auto parsed = parse_url(st->request.url());
             if (!parsed) { st->finish(parsed.error()); return; }
             Url url = std::move(parsed.value());
@@ -333,12 +391,14 @@ namespace MegoHttp {
             }
             st->request.set_parsed_url(url);
 
-            auto head = detail::build_request_head(st->request, url);
+            st->phase = Detail::RequestPhase::BuildHead;
+            auto head = Detail::build_request_head(st->request, url);
             if (!head) { st->finish(head.error()); return; }
 
-            std::weak_ptr<detail::RequestState> weak = st;
+            std::weak_ptr<Detail::RequestState> weak = st;
             const string host = url.host;
             const uint16_t port = url.port;
+            st->phase = Detail::RequestPhase::Resolve;
             st->resolver->resolve(host, port, [weak, head = std::move(head.value())](
                                            Result<AddressList> resolved) mutable {
                 auto s = weak.lock();
@@ -351,11 +411,12 @@ namespace MegoHttp {
                     return;
                 }
 
+                s->phase = Detail::RequestPhase::Connect;
                 ConnectOptions copts;
                 copts.connect_timeout = s->options.connect_timeout;
                 auto addresses = std::move(resolved.value());
 
-                std::weak_ptr<detail::RequestState> w2 = s;
+                std::weak_ptr<Detail::RequestState> w2 = s;
                 connect_race(s->executor, std::move(addresses), copts,
                     [w2, head = std::move(head)](Result<std::shared_ptr<AsyncByteStream>> conn) mutable {
                         auto s2 = w2.lock();
@@ -374,11 +435,11 @@ namespace MegoHttp {
 
         // Free of `this` so it can run from a detached async callback: the
         // request state carries everything the exchange needs.
-        static void begin_exchange(const std::shared_ptr<detail::RequestState>& st, string head) {
+        static void begin_exchange(const std::shared_ptr<Detail::RequestState>& st, string head) {
             // Order matters: the Exchange must exist before the parser (which
             // stores a reference to it), and the Exchange must keep itself alive
             // while the exchange is in flight. It does so via shared_from_this().
-            auto exchange = std::make_shared<detail::Exchange>(st);
+            auto exchange = std::make_shared<Detail::Exchange>(st);
             exchange->set_parser(std::make_unique<ResponseParser>(
                 *exchange, st->options.parser_limits));
             exchange->start(std::move(head));

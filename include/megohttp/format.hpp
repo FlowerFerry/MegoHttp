@@ -33,7 +33,7 @@
 // ---------------------------------------------------------------------------
 
 namespace MegoHttp {
-namespace detail {
+namespace Detail {
 
     // Convert any fmt-formattable argument into an owning `string`.
     //
@@ -51,12 +51,12 @@ namespace detail {
 #endif
     }
 
-} // namespace detail
+} // namespace Detail
 
     // Public spelling, so callers and the library share one entry point.
     template<typename... Args>
     inline string format(fmt::format_string<Args...> f, Args&&... args) {
-        return detail::format_string(f, std::forward<Args>(args)...);
+        return Detail::format_string(f, std::forward<Args>(args)...);
     }
 
 } // namespace MegoHttp

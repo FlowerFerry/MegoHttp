@@ -32,7 +32,7 @@ namespace MegoHttp {
     }
 
     inline Method method_from_string(string_view name) noexcept {
-        using detail::ascii_iequals;
+        using Detail::ascii_iequals;
         if (ascii_iequals(name, "GET"))     return Method::Get;
         if (ascii_iequals(name, "HEAD"))    return Method::Head;
         if (ascii_iequals(name, "POST"))    return Method::Post;
@@ -64,7 +64,7 @@ namespace MegoHttp {
                 while (j < n && p[j] != ',') ++j;
                 string_view item = trim_ows(string_view(p + i,
                                           static_cast<string_view::size_type>(j - i)));
-                if (detail::ascii_iequals(item, token)) return true;
+                if (Detail::ascii_iequals(item, token)) return true;
                 if (j >= n) break;
                 i = j + 1;
             }
@@ -166,21 +166,21 @@ namespace MegoHttp {
             if (!is_valid_header_name(custom_method)) {   // same token grammar
                 return Error{ErrorCode::InvalidArgument, "invalid custom method name"};
             }
-            detail::sb_append(b, custom_method);
+            Detail::sb_append(b, custom_method);
         } else {
-            detail::sb_append(b, to_string(method));
+            Detail::sb_append(b, to_string(method));
         }
-        detail::sb_append(b, ' ');
-        detail::sb_append(b, request_target);
-        detail::sb_append(b, " HTTP/1.1\r\n");
+        Detail::sb_append(b, ' ');
+        Detail::sb_append(b, request_target);
+        Detail::sb_append(b, " HTTP/1.1\r\n");
 
         for (const auto& f : headers) {
-            detail::sb_append(b, to_view(f.first));
-            detail::sb_append(b, ": ");
-            detail::sb_append(b, to_view(f.second));
-            detail::sb_append(b, "\r\n");
+            Detail::sb_append(b, to_view(f.first));
+            Detail::sb_append(b, ": ");
+            Detail::sb_append(b, to_view(f.second));
+            Detail::sb_append(b, "\r\n");
         }
-        detail::sb_append(b, "\r\n");
+        Detail::sb_append(b, "\r\n");
         return b.release();
     }
 
@@ -201,19 +201,19 @@ namespace MegoHttp {
         }
 
         string_builder b;
-        detail::sb_append(b, "HTTP/1.1 ");
-        detail::append_int(b, static_cast<uint32_t>(status_code));
-        detail::sb_append(b, ' ');
-        if (!reason.empty()) detail::sb_append(b, reason);
-        detail::sb_append(b, "\r\n");
+        Detail::sb_append(b, "HTTP/1.1 ");
+        Detail::append_int(b, static_cast<uint32_t>(status_code));
+        Detail::sb_append(b, ' ');
+        if (!reason.empty()) Detail::sb_append(b, reason);
+        Detail::sb_append(b, "\r\n");
 
         for (const auto& f : headers) {
-            detail::sb_append(b, to_view(f.first));
-            detail::sb_append(b, ": ");
-            detail::sb_append(b, to_view(f.second));
-            detail::sb_append(b, "\r\n");
+            Detail::sb_append(b, to_view(f.first));
+            Detail::sb_append(b, ": ");
+            Detail::sb_append(b, to_view(f.second));
+            Detail::sb_append(b, "\r\n");
         }
-        detail::sb_append(b, "\r\n");
+        Detail::sb_append(b, "\r\n");
         return b.release();
     }
 
@@ -227,28 +227,28 @@ namespace MegoHttp {
             // Lowercase hex, no padding and no leading zeros (the canonical and
             // shortest form). fmt handles it; a hand-rolled nibble loop would be
             // another place to get the ordering wrong.
-            detail::sb_append(b, detail::format_string("{:x}", size));
-            detail::sb_append(b, "\r\n");
+            Detail::sb_append(b, Detail::format_string("{:x}", size));
+            Detail::sb_append(b, "\r\n");
             if (size != 0) {
                 b += string(reinterpret_cast<const char*>(data),
                             static_cast<string::size_type>(size));
             }
-            detail::sb_append(b, "\r\n");
+            Detail::sb_append(b, "\r\n");
             return b.release();
         }
 
         inline string encode_last_chunk(const Headers* trailers) {
             string_builder b;
-            detail::sb_append(b, "0\r\n");
+            Detail::sb_append(b, "0\r\n");
             if (trailers != nullptr) {
                 for (const auto& f : *trailers) {
-                    detail::sb_append(b, to_view(f.first));
-                    detail::sb_append(b, ": ");
-                    detail::sb_append(b, to_view(f.second));
-                    detail::sb_append(b, "\r\n");
+                    Detail::sb_append(b, to_view(f.first));
+                    Detail::sb_append(b, ": ");
+                    Detail::sb_append(b, to_view(f.second));
+                    Detail::sb_append(b, "\r\n");
                 }
             }
-            detail::sb_append(b, "\r\n");
+            Detail::sb_append(b, "\r\n");
             return b.release();
         }
 
@@ -625,21 +625,21 @@ namespace MegoHttp {
             if (static_cast<size_t>((status_line).size()) < 12) {
                 return fail(ErrorCode::HttpInvalidResponse, "status line too short");
             }
-            if (!detail::ascii_iequals(string_view(p, 5), "HTTP/")) {
+            if (!Detail::ascii_iequals(string_view(p, 5), "HTTP/")) {
                 return fail(ErrorCode::HttpInvalidResponse, "not an HTTP response");
             }
             const char major = p[5];
-            if (p[6] != '.' || !detail::is_digit(major) || major == '0') {
+            if (p[6] != '.' || !Detail::is_digit(major) || major == '0') {
                 return fail(ErrorCode::HttpVersionNotSupported, "unsupported HTTP version");
             }
             const char minor = p[7];
-            if (!detail::is_digit(minor)) {
+            if (!Detail::is_digit(minor)) {
                 return fail(ErrorCode::HttpInvalidResponse, "bad HTTP minor version");
             }
             if (p[8] != ' ') return fail(ErrorCode::HttpInvalidResponse, "missing space after version");
             // status-code = 3DIGIT; the leading digit must be 1-9 (no "0xx" codes).
-            if (!detail::is_digit(p[9]) || p[9] == '0' ||
-                !detail::is_digit(p[10]) || !detail::is_digit(p[11])) {
+            if (!Detail::is_digit(p[9]) || p[9] == '0' ||
+                !Detail::is_digit(p[10]) || !Detail::is_digit(p[11])) {
                 return fail(ErrorCode::HttpInvalidResponse, "bad status code");
             }
             const int code = (p[9] - '0') * 100 + (p[10] - '0') * 10 + (p[11] - '0');
@@ -776,8 +776,8 @@ namespace MegoHttp {
                 // Combines all TE header values into one ordered token list.
                 string_builder te_b;
                 for (size_t k = 0; k < te_all.size(); ++k) {
-                    if (k > 0) detail::sb_append(te_b, ',');
-                    detail::sb_append(te_b, te_all[k]);
+                    if (k > 0) Detail::sb_append(te_b, ',');
+                    Detail::sb_append(te_b, te_all[k]);
                 }
                 string te = te_b.release();
                 auto tokens = http_detail::split_list(to_view(te));
@@ -786,14 +786,14 @@ namespace MegoHttp {
                                             "empty Transfer-Encoding"}};
                 }
                 // The FINAL coding must be chunked; anything else is ambiguous here.
-                if (!detail::ascii_iequals(tokens.back(), "chunked")) {
+                if (!Detail::ascii_iequals(tokens.back(), "chunked")) {
                     return VoidResult{Error{ErrorCode::HttpAmbiguousFraming,
                         "Transfer-Encoding does not end with chunked"}};
                 }
                 // "chunked" may appear only once and only as the last coding.
                 size_t chunked_count = 0;
                 for (size_t k = 0; k < tokens.size(); ++k) {
-                    if (detail::ascii_iequals(tokens[k], "chunked")) ++chunked_count;
+                    if (Detail::ascii_iequals(tokens[k], "chunked")) ++chunked_count;
                 }
                 if (chunked_count != 1) {
                     return VoidResult{Error{ErrorCode::HttpAmbiguousFraming,

@@ -1,12 +1,13 @@
 // uvw availability test: the C++ wrapper over libuv must actually compile and
 // run against the same libuv the raw backend uses. A build-time flag is not
 // evidence; this schedules real work on a uvw loop.
+#include <catch_amalgamated.hpp>
+
 #include <megohttp/config.hpp>
 
 #if !defined(MGHTTP_USE_UVW)
-int main() {
-    // uvw was not selected in this configuration; nothing to verify.
-    return 0;
+TEST_CASE("feature disabled", "[uvw]") {
+    SKIP("uvw not enabled in this configuration");
 }
 #else
 
@@ -17,9 +18,6 @@ int main() {
 #include <cstdio>
 #include <thread>
 
-static int g_fail = 0, g_pass = 0;
-#define CHECK(c) do { if (c) ++g_pass; else { ++g_fail; \
-    std::printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #c); } } while (0)
 
 template<typename F>
 static bool wait_until(F pred, int max_ms = 3000) {
@@ -32,7 +30,7 @@ static bool wait_until(F pred, int max_ms = 3000) {
     return pred();
 }
 
-static void test_timer() {
+TEST_CASE("timer", "[uvw]") {
     auto loop = uvw::loop::get_default();
     CHECK(loop != nullptr);
     if (!loop) return;
@@ -59,7 +57,7 @@ static void test_timer() {
     loop->run();
 }
 
-static void test_async_across_threads() {
+TEST_CASE("async across threads", "[uvw]") {
     // uvw's async handle is the same wake-up mechanism the executor uses.
     auto loop = uvw::loop::get_default();
     CHECK(loop != nullptr);
@@ -97,11 +95,4 @@ static void test_async_across_threads() {
     loop->run();
 }
 
-int main() {
-    test_timer();
-    test_async_across_threads();
-    std::printf("=== %d passed, %d failed ===\n", g_pass, g_fail);
-    return g_fail == 0 ? 0 : 1;
-}
-
-#endif  // MGHTTP_USE_UVW
+#endif

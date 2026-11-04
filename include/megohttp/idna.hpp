@@ -38,7 +38,7 @@ namespace MegoHttp {
     // because a caller may want to encode a label without the host rules.
     Result<string> punycode_encode(const string_view& utf8_label);
 
-    namespace detail {
+    namespace Detail {
 
         // Decode one UTF-8 code point starting at `i`; advances `i`.
         // Returns false on an invalid or truncated sequence.
@@ -48,7 +48,7 @@ namespace MegoHttp {
         // Returns the number of bytes written.
         size_t utf8_encode(uint32_t cp, char* out) noexcept;
 
-    } // namespace detail
+    } // namespace Detail
 
 } // namespace MegoHttp
 

@@ -1,4 +1,6 @@
 // ResponseParser tests: framing, chunked, trailers, 1xx, limits, byte-splitting.
+#include <catch_amalgamated.hpp>
+
 #include <megohttp/http.hpp>
 
 #include <cstdio>
@@ -8,9 +10,6 @@
 
 using namespace MegoHttp;
 
-static int g_fail = 0, g_pass = 0;
-#define CHECK(c) do { if (c) ++g_pass; else { ++g_fail; \
-    std::printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #c); } } while (0)
 
 // Collects everything the parser reports.
 struct Collector : ResponseParser::Callbacks {
@@ -77,7 +76,7 @@ static const std::string RESP_CHUNKED_TRAILER =
     "X-Sum: 42\r\n"
     "\r\n";
 
-static void test_content_length() {
+TEST_CASE("content length", "[http]") {
     // Whole message in one feed
     {
         Collector c; ResponseParser p(c);
@@ -102,14 +101,12 @@ static void test_content_length() {
         if (!ok) {
             std::printf("FAIL split step=%zu body=[%s] complete=%d\n",
                         step, c.body.c_str(), c.complete_count);
-            ++g_fail;
-        } else {
-            ++g_pass;
         }
+        CHECK(ok);
     }
 }
 
-static void test_chunked() {
+TEST_CASE("chunked", "[http]") {
     {
         Collector c; ResponseParser p(c);
         auto r = p.feed(reinterpret_cast<const uint8_t*>(RESP_CHUNKED.data()),
@@ -128,14 +125,12 @@ static void test_chunked() {
             std::printf("FAIL chunked split step=%zu body=[%s] complete=%d err=%s\n",
                         step, c.body.c_str(), c.complete_count,
                         r.has_error() ? to_string(r.error().code()) : "-");
-            ++g_fail;
-        } else {
-            ++g_pass;
         }
+        CHECK(ok);
     }
 }
 
-static void test_trailers() {
+TEST_CASE("trailers", "[http]") {
     Collector c; ResponseParser p(c);
     auto r = p.feed(reinterpret_cast<const uint8_t*>(RESP_CHUNKED_TRAILER.data()),
                     RESP_CHUNKED_TRAILER.size());
@@ -149,7 +144,7 @@ static void test_trailers() {
     CHECK(c.complete_count == 1);
 }
 
-static void test_no_body_semantics() {
+TEST_CASE("no body semantics", "[http]") {
     // 204 must not have a body even with Content-Length present
     {
         const std::string raw =
@@ -185,7 +180,7 @@ static void test_no_body_semantics() {
     }
 }
 
-static void test_informational() {
+TEST_CASE("informational", "[http]") {
     const std::string raw =
         "HTTP/1.1 100 Continue\r\n\r\n"
         "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
@@ -200,7 +195,7 @@ static void test_informational() {
     CHECK(c.complete_count == 1);
 }
 
-static void test_until_close() {
+TEST_CASE("until close", "[http]") {
     // No CL, no chunked -> body runs to EOF
     const std::string raw = "HTTP/1.1 200 OK\r\n\r\nstreamed until close";
     Collector c; ResponseParser p(c);
@@ -215,7 +210,7 @@ static void test_until_close() {
     CHECK(c.complete_count == 1);
 }
 
-static void test_ambiguous_framing() {
+TEST_CASE("ambiguous framing", "[http]") {
     // Both TE and CL: smuggling signal, must reject
     {
         const std::string raw =
@@ -265,7 +260,7 @@ static void test_ambiguous_framing() {
     }
 }
 
-static void test_content_length_overflow() {
+TEST_CASE("content length overflow", "[http]") {
     const std::string raw =
         "HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999999\r\n\r\n";
     Collector c; ResponseParser p(c);
@@ -275,7 +270,7 @@ static void test_content_length_overflow() {
     CHECK(r.error().code() == ErrorCode::HttpInvalidResponse);
 }
 
-static void test_chunk_size_overflow() {
+TEST_CASE("chunk size overflow", "[http]") {
     const std::string raw =
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
         "FFFFFFFFFFFFFFFFF\r\nx\r\n";
@@ -286,7 +281,7 @@ static void test_chunk_size_overflow() {
     CHECK(r.error().code() == ErrorCode::HttpChunkError);
 }
 
-static void test_bad_chunk_terminator() {
+TEST_CASE("bad chunk terminator", "[http]") {
     // chunk data not followed by CRLF
     const std::string raw =
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
@@ -298,7 +293,7 @@ static void test_bad_chunk_terminator() {
     CHECK(r.error().code() == ErrorCode::HttpChunkError);
 }
 
-static void test_limits() {
+TEST_CASE("limits", "[http]") {
     // header block too large
     {
         ParserLimits lim; lim.max_header_bytes = 100;
@@ -337,7 +332,7 @@ static void test_limits() {
     }
 }
 
-static void test_malformed_head() {
+TEST_CASE("malformed head", "[http]") {
     // Not HTTP
     {
         const std::string raw = "FOO/1.1 200 OK\r\n\r\n";
@@ -381,7 +376,7 @@ static void test_malformed_head() {
     }
 }
 
-static void test_leftover() {
+TEST_CASE("leftover", "[http]") {
     // Two responses in one buffer: the parser must report the second as leftover.
     const std::string raw = RESP_CL + RESP_CL;
     Collector c; ResponseParser p(c);
@@ -394,7 +389,7 @@ static void test_leftover() {
     CHECK(p.leftover_offset() <= raw.size());
 }
 
-static void test_eof_errors() {
+TEST_CASE("eof errors", "[http]") {
     // EOF in the middle of the head
     {
         const std::string raw = "HTTP/1.1 200 OK\r\nContent-Le";
@@ -417,7 +412,7 @@ static void test_eof_errors() {
     }
 }
 
-static void test_request_encoding() {
+TEST_CASE("request encoding", "[http]") {
     Headers h;
     h.add("Host", "example.com");
     h.add("Accept", "*/*");
@@ -442,7 +437,7 @@ static void test_request_encoding() {
     CHECK(encode_request_head(Method::Get, {}, "/a\r\nX: 1", h).has_error());
 }
 
-static void test_chunk_encode() {
+TEST_CASE("chunk encode", "[http]") {
     const char* payload = "hello";
     auto c = chunked::encode_chunk(reinterpret_cast<const uint8_t*>(payload), 5);
     const std::string got(c.data(), c.size());
@@ -459,17 +454,17 @@ static void test_chunk_encode() {
 
     // parse_chunk_size
     auto s1 = chunked::parse_chunk_size("1a");
-    CHECK(s1.has_value() && s1.value() == 26);
+    CHECK((s1.has_value() && s1.value() == 26));
     auto s2 = chunked::parse_chunk_size("FF");
-    CHECK(s2.has_value() && s2.value() == 255);
+    CHECK((s2.has_value() && s2.value() == 255));
     auto s3 = chunked::parse_chunk_size("5;ext=1");
-    CHECK(s3.has_value() && s3.value() == 5);
+    CHECK((s3.has_value() && s3.value() == 5));
     CHECK(chunked::parse_chunk_size("").has_error());
     CHECK(chunked::parse_chunk_size("zz").has_error());
     CHECK(chunked::parse_chunk_size("5\r").has_error());
 }
 
-static void test_token_helpers() {
+TEST_CASE("token helpers", "[http]") {
     CHECK(http_detail::header_has_token("keep-alive, Upgrade", "upgrade"));
     CHECK(http_detail::header_has_token("Upgrade", "UPGRADE"));
     CHECK(http_detail::header_has_token("a , b ,close", "close"));
@@ -480,31 +475,8 @@ static void test_token_helpers() {
     CHECK(parts.size() == 3);
 
     auto t = http_detail::trim_ows("  x  ");
-    CHECK(detail::to_size(t) == 1 && t.data()[0] == 'x');
+    CHECK((Detail::to_size(t) == 1 && t.data()[0] == 'x'));
 
     CHECK(!http_detail::status_reason(200).empty());
     CHECK(http_detail::status_reason(299).empty());   // never invent a phrase
-}
-
-int main() {
-    test_content_length();
-    test_chunked();
-    test_trailers();
-    test_no_body_semantics();
-    test_informational();
-    test_until_close();
-    test_ambiguous_framing();
-    test_content_length_overflow();
-    test_chunk_size_overflow();
-    test_bad_chunk_terminator();
-    test_limits();
-    test_malformed_head();
-    test_leftover();
-    test_eof_errors();
-    test_request_encoding();
-    test_chunk_encode();
-    test_token_helpers();
-
-    std::printf("=== %d passed, %d failed ===\n", g_pass, g_fail);
-    return g_fail == 0 ? 0 : 1;
 }

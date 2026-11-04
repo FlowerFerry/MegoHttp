@@ -1,4 +1,6 @@
 // libuv executor tests: cross-thread post, timers, cancel, internal/external loop.
+#include <catch_amalgamated.hpp>
+
 #include <megohttp/backend/executor_libuv.hpp>
 
 #include <atomic>
@@ -10,9 +12,6 @@
 using namespace MegoHttp;
 using namespace MegoHttp::libuv_backend;
 
-static int g_fail = 0, g_pass = 0;
-#define CHECK(c) do { if (c) ++g_pass; else { ++g_fail; \
-    std::printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #c); } } while (0)
 
 // Waits for a predicate with a bounded timeout, so a hang fails instead of hanging.
 template<typename F>
@@ -26,7 +25,7 @@ static bool wait_until(F pred, int max_ms = 3000) {
     return pred();
 }
 
-static void test_internal_post_from_other_thread() {
+TEST_CASE("internal post from other thread", "[executor]") {
     auto ex = UvExecutor::create_internal();
     CHECK(ex != nullptr);
     if (!ex) return;
@@ -53,7 +52,7 @@ static void test_internal_post_from_other_thread() {
     ex->shutdown();
 }
 
-static void test_post_from_loop_thread() {
+TEST_CASE("post from loop thread", "[executor]") {
     auto ex = UvExecutor::create_internal();
     CHECK(ex != nullptr);
     if (!ex) return;
@@ -73,7 +72,7 @@ static void test_post_from_loop_thread() {
     ex->shutdown();
 }
 
-static void test_timer() {
+TEST_CASE("timer", "[executor]") {
     auto ex = UvExecutor::create_internal();
     CHECK(ex != nullptr);
     if (!ex) return;
@@ -99,7 +98,7 @@ static void test_timer() {
     ex->shutdown();
 }
 
-static void test_timer_cancel() {
+TEST_CASE("timer cancel", "[executor]") {
     auto ex = UvExecutor::create_internal();
     CHECK(ex != nullptr);
     if (!ex) return;
@@ -123,7 +122,7 @@ static void test_timer_cancel() {
     ex->shutdown();
 }
 
-static void test_external_loop() {
+TEST_CASE("external loop", "[executor]") {
     // The caller owns and drives the loop; the executor must never stop it.
     uv_loop_t loop;
     CHECK(uv_loop_init(&loop) == 0);
@@ -160,7 +159,7 @@ static void test_external_loop() {
     CHECK(rc == 0);      // still closable by the caller
 }
 
-static void test_cancel_state() {
+TEST_CASE("cancel state", "[executor]") {
     auto st = std::make_shared<CancelState>();
     CancelHandle h(st);
 
@@ -189,7 +188,7 @@ static void test_cancel_state() {
     CHECK(!empty.valid());
 }
 
-static void test_shutdown_is_safe() {
+TEST_CASE("shutdown is safe", "[executor]") {
     // shutdown() twice, and after destruction of posted work.
     auto ex = UvExecutor::create_internal();
     CHECK(ex != nullptr);
@@ -198,19 +197,4 @@ static void test_shutdown_is_safe() {
     ex->shutdown();
     ex->shutdown();
     CHECK(true);   // reaching here without a crash is the assertion
-}
-
-int main() {
-    uv_setup_args(0, nullptr);   // harmless; keeps argv handling deterministic
-
-    test_cancel_state();
-    test_internal_post_from_other_thread();
-    test_post_from_loop_thread();
-    test_timer();
-    test_timer_cancel();
-    test_external_loop();
-    test_shutdown_is_safe();
-
-    std::printf("=== %d passed, %d failed ===\n", g_pass, g_fail);
-    return g_fail == 0 ? 0 : 1;
 }

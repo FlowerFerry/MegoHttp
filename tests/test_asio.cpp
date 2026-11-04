@@ -3,12 +3,13 @@
 //
 // Same shape as test_executor_libuv.cpp / test_transport.cpp so the two backends
 // are held to the same behaviour. No public network access is required.
+#include <catch_amalgamated.hpp>
+
 #include <megohttp/config.hpp>
 
 #if !defined(MGHTTP_BACKEND_ASIO)
-int main() {
-    // Asio backend not selected in this configuration.
-    return 0;
+TEST_CASE("feature disabled", "[asio]") {
+    SKIP("asio not enabled in this configuration");
 }
 #else
 
@@ -28,9 +29,6 @@ int main() {
 using namespace MegoHttp;
 using namespace MegoHttp::asio_backend;
 
-static int g_fail = 0, g_pass = 0;
-#define CHECK(c) do { if (c) ++g_pass; else { ++g_fail; \
-    std::printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #c); } } while (0)
 
 template<typename F>
 static bool wait_until(F pred, int max_ms = 5000) {
@@ -45,7 +43,7 @@ static bool wait_until(F pred, int max_ms = 5000) {
 
 // --- executor -------------------------------------------------------------
 
-static void test_executor_post() {
+TEST_CASE("executor post", "[asio]") {
     auto ex = AsioExecutor::create_internal();
     CHECK(ex != nullptr);
     if (!ex) return;
@@ -56,7 +54,7 @@ static void test_executor_post() {
     ex->shutdown();
 }
 
-static void test_executor_post_never_inline() {
+TEST_CASE("executor post never inline", "[asio]") {
     auto ex = AsioExecutor::create_internal();
     CHECK(ex != nullptr);
     if (!ex) return;
@@ -72,7 +70,7 @@ static void test_executor_post_never_inline() {
     ex->shutdown();
 }
 
-static void test_timer_fires() {
+TEST_CASE("timer fires", "[asio]") {
     auto ex = AsioExecutor::create_internal();
     CHECK(ex != nullptr);
     if (!ex) return;
@@ -87,7 +85,7 @@ static void test_timer_fires() {
     ex->shutdown();
 }
 
-static void test_timer_self_holding() {
+TEST_CASE("timer self holding", "[asio]") {
     // The caller drops the handle; the timer must still fire. This is the trap
     // the libuv backend hit with DeferredTimer.
     auto ex = AsioExecutor::create_internal();
@@ -101,7 +99,7 @@ static void test_timer_self_holding() {
     ex->shutdown();
 }
 
-static void test_timer_cancel() {
+TEST_CASE("timer cancel", "[asio]") {
     auto ex = AsioExecutor::create_internal();
     CHECK(ex != nullptr);
     if (!ex) return;
@@ -116,7 +114,7 @@ static void test_timer_cancel() {
     ex->shutdown();
 }
 
-static void test_external_loop() {
+TEST_CASE("external loop", "[asio]") {
     asio::io_context ioc;
     auto ex = AsioExecutor::create_external(ioc);
     CHECK(ex != nullptr);
@@ -132,11 +130,11 @@ static void test_external_loop() {
     // shutdown() releases the guard so our loop can return. It must not call
     // ioc.stop() on somebody else's context.
     ex->shutdown();
-    CHECK(wait_until([&] { return ioc.stopped() || true; }, 500));
+    CHECK((wait_until([&] { return ioc.stopped() || true; }, 500)));
     driver.join();
 }
 
-static void test_shutdown_is_idempotent() {
+TEST_CASE("shutdown is idempotent", "[asio]") {
     auto ex = AsioExecutor::create_internal();
     CHECK(ex != nullptr);
     if (!ex) return;
@@ -147,7 +145,7 @@ static void test_shutdown_is_idempotent() {
 
 // --- resolver -------------------------------------------------------------
 
-static void test_resolver_literal() {
+TEST_CASE("resolver literal", "[asio]") {
     auto ex = AsioExecutor::create_internal();
     CHECK(ex != nullptr);
     if (!ex) return;
@@ -164,7 +162,7 @@ static void test_resolver_literal() {
     ex->shutdown();
 }
 
-static void test_resolver_static() {
+TEST_CASE("resolver static", "[asio]") {
     auto ex = AsioExecutor::create_internal();
     CHECK(ex != nullptr);
     if (!ex) return;
@@ -265,7 +263,7 @@ private:
     std::thread thread_;
 };
 
-static void test_tcp_echo() {
+TEST_CASE("tcp echo", "[asio]") {
     AsioEchoServer server;
     if (!server.start()) {
         std::printf("SKIP: could not start the local echo server\n");
@@ -328,7 +326,7 @@ static void test_tcp_echo() {
     server.stop();
 }
 
-static void test_tcp_connect_refused() {
+TEST_CASE("tcp connect refused", "[asio]") {
     auto ex = AsioExecutor::create_internal();
     CHECK(ex != nullptr);
     if (!ex) return;
@@ -353,7 +351,7 @@ static void test_tcp_connect_refused() {
     ex->shutdown();
 }
 
-static void test_connect_race() {
+TEST_CASE("connect race", "[asio]") {
     AsioEchoServer server;
     if (!server.start()) {
         std::printf("SKIP: could not start the local echo server\n");
@@ -399,7 +397,7 @@ static void test_connect_race() {
 // Race loser close: both servers accept a connection, exactly one is closed once
 // the race decides, and the winner still works. Uses server-side counters, so
 // this observes real sockets rather than internal race state.
-static void test_race_closes_loser() {
+TEST_CASE("race closes loser", "[asio]") {
     AsioEchoServer srvA;
     CHECK(srvA.start());
     AsioEchoServer srvB;
@@ -442,7 +440,7 @@ static void test_race_closes_loser() {
     CHECK(got_stream.load());
 
     // Both connected, which is what makes one of them a loser.
-    CHECK(wait_until([&] { return srvA.accepted() == 1 && srvB.accepted() == 1; }, 5000));
+    CHECK((wait_until([&] { return srvA.accepted() == 1 && srvB.accepted() == 1; }, 5000)));
     CHECK(srvA.accepted() == 1);
     CHECK(srvB.accepted() == 1);
 
@@ -451,7 +449,7 @@ static void test_race_closes_loser() {
     CHECK(srvA.closed() + srvB.closed() == 1);
 
     if (winner) ex->post([winner] { winner->async_close(nullptr); });
-    CHECK(wait_until([&] { return srvA.closed() == 1 && srvB.closed() == 1; }, 5000));
+    CHECK((wait_until([&] { return srvA.closed() == 1 && srvB.closed() == 1; }, 5000)));
     CHECK(srvA.closed() == 1);
     CHECK(srvB.closed() == 1);
 
@@ -460,23 +458,4 @@ static void test_race_closes_loser() {
     srvB.stop();
 }
 
-int main() {
-    test_executor_post();
-    test_executor_post_never_inline();
-    test_timer_fires();
-    test_timer_self_holding();
-    test_timer_cancel();
-    test_external_loop();
-    test_shutdown_is_idempotent();
-    test_resolver_literal();
-    test_resolver_static();
-    test_tcp_echo();
-    test_tcp_connect_refused();
-    test_connect_race();
-    test_race_closes_loser();
-
-    std::printf("=== %d passed, %d failed ===\n", g_pass, g_fail);
-    return g_fail == 0 ? 0 : 1;
-}
-
-#endif // MGHTTP_BACKEND_ASIO
+#endif

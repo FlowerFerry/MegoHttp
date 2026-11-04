@@ -5,6 +5,8 @@
 //   g++ -std=c++17 -DMGHTTP_USE_MEMESTRING -DMGHTTP_BACKEND_LIBUV \
 //       -I../include -I../../MemeString/include test_core.cpp \
 //       ../../MemeString/liblibmeme_string.dll -o test_core_memepp
+#include <catch_amalgamated.hpp>
+
 #include <megohttp/url.hpp>
 #include <megohttp/headers.hpp>
 #include <megohttp/error.hpp>
@@ -16,16 +18,10 @@
 
 using namespace MegoHttp;
 
-static int g_fail = 0;
-static int g_pass = 0;
 
-#define CHECK(cond) do { \
-    if (cond) { ++g_pass; } \
-    else { ++g_fail; std::printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond); } \
-} while (0)
 
 static bool sv_eq(string_view a, const char* b) {
-    const size_t n = detail::to_size(a);
+    const size_t n = Detail::to_size(a);
     return n == std::strlen(b) && std::memcmp(a.data(), b, n) == 0;
 }
 static bool s_eq(const string& a, const char* b) {
@@ -33,7 +29,7 @@ static bool s_eq(const string& a, const char* b) {
         && std::memcmp(a.data(), b, std::strlen(b)) == 0;
 }
 
-static void test_url_basic() {
+TEST_CASE("url basic", "[core]") {
     // Simple http URL
     {
         auto r = parse_url("http://example.com/path?q=1");
@@ -85,13 +81,13 @@ static void test_url_basic() {
     // ws / wss defaults
     {
         auto r = parse_url("ws://h/a");
-        CHECK(r.has_value() && r.value().port == 80);
+        CHECK((r.has_value() && r.value().port == 80));
         auto r2 = parse_url("wss://h/a");
-        CHECK(r2.has_value() && r2.value().port == 443);
+        CHECK((r2.has_value() && r2.value().port == 443));
     }
 }
 
-static void test_url_ipv6() {
+TEST_CASE("url ipv6", "[core]") {
     {
         auto r = parse_url("http://[::1]:8080/p");
         CHECK(r.has_value());
@@ -114,7 +110,7 @@ static void test_url_ipv6() {
     CHECK(parse_url("http://[::1]x/").has_error());
 }
 
-static void test_url_ipv4() {
+TEST_CASE("url ipv4", "[core]") {
     auto r = parse_url("http://192.168.0.1:8080/");
     CHECK(r.has_value());
     if (!r) return;
@@ -129,7 +125,7 @@ static void test_url_ipv4() {
     if (r2) CHECK(!r2.value().is_ip_literal);
 }
 
-static void test_url_rejects() {
+TEST_CASE("url rejects", "[core]") {
     CHECK(parse_url("").has_error());                       // empty
     CHECK(parse_url("example.com/x").has_error());          // relative
     CHECK(parse_url("http:/example.com").has_error());      // one slash
@@ -154,19 +150,19 @@ static void test_url_rejects() {
     CHECK(parse_url("http://\xFF\xFE.com/").has_error());
 }
 
-static void test_url_userinfo() {
+TEST_CASE("url userinfo", "[core]") {
     auto r = parse_url("http://user:pass@example.com/p");
     CHECK(r.has_value());
     if (!r) return;
     CHECK(s_eq(r.value().host, "example.com"));
-    CHECK(r.value().username.has_value() && s_eq(*r.value().username, "user"));
-    CHECK(r.value().password.has_value() && s_eq(*r.value().password, "pass"));
+    CHECK((r.value().username.has_value() && s_eq(*r.value().username, "user")));
+    CHECK((r.value().password.has_value() && s_eq(*r.value().password, "pass")));
     // Credentials must not leak into the request target or Host header
     CHECK(s_eq(r.value().request_target(), "/p"));
     CHECK(s_eq(r.value().host_port_header(), "example.com"));
 }
 
-static void test_url_targets() {
+TEST_CASE("url targets", "[core]") {
     auto r = parse_url("https://api.example.com:8443/v1/items?page=2");
     CHECK(r.has_value());
     if (!r) return;
@@ -177,7 +173,7 @@ static void test_url_targets() {
     CHECK(!r.value().is_websocket());
 }
 
-static void test_headers_basic() {
+TEST_CASE("headers basic", "[core]") {
     Headers h;
     CHECK(h.empty());
 
@@ -189,7 +185,7 @@ static void test_headers_basic() {
     CHECK(!h.contains("X-Missing"));
 
     auto ct = h.get("Content-Type");
-    CHECK(ct.has_value() && sv_eq(*ct, "text/plain"));
+    CHECK((ct.has_value() && sv_eq(*ct, "text/plain")));
 
     // Duplicate fields are preserved
     h.add("Set-Cookie", "a=1");
@@ -201,7 +197,7 @@ static void test_headers_basic() {
 
     // get() returns the FIRST value
     auto first = h.get("Set-Cookie");
-    CHECK(first.has_value() && sv_eq(*first, "a=1"));
+    CHECK((first.has_value() && sv_eq(*first, "a=1")));
 
     // set() replaces every value of that name
     h.set("set-cookie", "only=1");
@@ -260,11 +256,11 @@ static void test_headers_basic() {
     CHECK(ord.empty());
 }
 
-static void test_headers_uint64() {
+TEST_CASE("headers uint64", "[core]") {
     Headers h;
     h.add("Content-Length", "12345");
     auto cl = h.get_uint("content-length");
-    CHECK(cl.has_value() && *cl == 12345);
+    CHECK((cl.has_value() && *cl == 12345));
 
     h.set("Content-Length", "abc");
     CHECK(!h.get_uint("Content-Length").has_value());
@@ -281,10 +277,10 @@ static void test_headers_uint64() {
 
     h.set("Content-Length", "0");
     auto zero = h.get_uint("Content-Length");
-    CHECK(zero.has_value() && *zero == 0);
+    CHECK((zero.has_value() && *zero == 0));
 }
 
-static void test_header_validation() {
+TEST_CASE("header validation", "[core]") {
     CHECK(is_valid_header_name("Content-Type"));
     CHECK(is_valid_header_name("X-Custom_1"));
     CHECK(!is_valid_header_name(""));
@@ -302,7 +298,7 @@ static void test_header_validation() {
     CHECK(is_valid_header_value(string_view("a\0b", 1)));    // "a" is fine
 }
 
-static void test_error() {
+TEST_CASE("error", "[core]") {
     Error e{ErrorCode::HttpChunkError, ErrorPhase::Receive, string("bad chunk")};
     CHECK(e.code() == ErrorCode::HttpChunkError);
     CHECK(e.phase() == ErrorPhase::Receive);
@@ -338,7 +334,7 @@ static void test_error() {
     CHECK(vbad.error().code() == ErrorCode::Cancelled);
 }
 
-static void test_format() {
+TEST_CASE("format", "[core]") {
     // fmt is the only formatter: values must land in the library's string type,
     // with the same text in both string modes.
     string a = format("{}", 42);
@@ -355,14 +351,14 @@ static void test_format() {
     CHECK(std::memcmp(c.data(), "1a", 2) == 0);
 
     string d = format("{:x}", 0u);
-    CHECK(d.size() == 1 && d.data()[0] == '0');
+    CHECK((d.size() == 1 && d.data()[0] == '0'));
 
     // The megohttp alias exposes the same types.
     megohttp::string e = megohttp::to_string(to_view(b));
     CHECK(e.size() == b.size());
 }
 
-static void test_scheme_unknown() {
+TEST_CASE("scheme unknown", "[core]") {
     // Scheme has an Unknown value, and it is what default_port answers 0 for.
     CHECK(static_cast<int>(Scheme::Unknown) == 0);
     CHECK(Url::default_port(Scheme::Unknown) == 0);
@@ -378,7 +374,7 @@ static void test_scheme_unknown() {
     CHECK(parse_url("nonsense://x").has_error());
 }
 
-static void test_error_std_bridge() {
+TEST_CASE("error std bridge", "[core]") {
     // ErrorCode values live in the -400000 band, disjoint from everything else.
     CHECK(static_cast<int32_t>(ErrorCode::Unknown) < -399999);
     CHECK(static_cast<int32_t>(ErrorCode::SseEventTooLarge) > -499999);
@@ -432,7 +428,7 @@ static void test_error_std_bridge() {
     CHECK(ErrorCode::MultipartTruncated != ErrorCode::MultipartDelimiterInvalid);
 }
 
-static void test_idna() {
+TEST_CASE("idna", "[core]") {
     // --- Punycode: RFC 3492 section 7.1 sample vectors -----------------------
     {
         auto r = punycode_encode("bücher");
@@ -523,24 +519,4 @@ static void test_idna() {
     }
     CHECK(is_ascii("example.com"));
     CHECK(!is_ascii("\xE4\xB8\xAD"));
-}
-
-int main() {
-    test_url_basic();
-    test_url_ipv6();
-    test_url_ipv4();
-    test_url_rejects();
-    test_url_userinfo();
-    test_url_targets();
-    test_headers_basic();
-    test_headers_uint64();
-    test_header_validation();
-    test_error();
-    test_format();
-    test_scheme_unknown();
-    test_error_std_bridge();
-    test_idna();
-
-    std::printf("=== %d passed, %d failed ===\n", g_pass, g_fail);
-    return g_fail == 0 ? 0 : 1;
 }

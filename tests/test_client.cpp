@@ -1,6 +1,8 @@
 // Client tests: end-to-end HTTP request with the minimal Client.
 // Uses a local HTTP server on the same executor so no public network is needed.
 // The server is deliberately NOT built from any MegoHttp code.
+#include <catch_amalgamated.hpp>
+
 #include <megohttp/client.hpp>
 #include <megohttp/transport.hpp>
 
@@ -29,9 +31,6 @@
 
 using namespace MegoHttp;
 
-static int g_fail = 0, g_pass = 0;
-#define CHECK(c) do { if (c) ++g_pass; else { ++g_fail; \
-    std::printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #c); } } while (0)
 
 template<typename F>
 static bool wait_until(F pred, int max_ms = 5000) {
@@ -99,20 +98,47 @@ private:
             socklen_t plen = sizeof peer;
             auto c = ::accept(sock_, reinterpret_cast<sockaddr*>(&peer), &plen);
             if (c == INVALID_SOCKET) return;
-            // Read the request line.
-            char buf[4096];
-            const int n = ::recv(c, buf, sizeof buf - 1, 0);
-            if (n > 0) {
-                buf[n] = '\0';
-                // Respond with a 200 OK.
-                const char* resp =
-                    "HTTP/1.1 200 OK\r\n"
-                    "Content-Type: text/plain\r\n"
-                    "Connection: close\r\n"
-                    "\r\n"
-                    "Hello from TinyHttpServer";
-                ::send(c, resp, static_cast<int>(std::strlen(resp)), 0);
+            // Read the request head, then Content-Length bytes of body. Record what
+            // actually arrived so a test can assert the body was sent.
+            char buf[8192];
+            std::string accum;
+            size_t content_length = 0;
+            bool head_complete = false;
+            while (accum.size() < sizeof buf) {
+                int n = ::recv(c, buf, sizeof buf, 0);
+                if (n <= 0) break;
+                accum.append(buf, n);
+                if (!head_complete) {
+                    size_t he = accum.find("\r\n\r\n");
+                    if (he != std::string::npos) {
+                        head_complete = true;
+                        size_t cl = accum.find("Content-Length:");
+                        if (cl != std::string::npos && cl < he) {
+                            const char* p = accum.data() + cl + 15;
+                            while (*p == ' ' || *p == '\t') ++p;
+                            content_length = strtoull(p, nullptr, 10);
+                        }
+                    }
+                }
+                if (head_complete) {
+                    size_t need = accum.find("\r\n\r\n") + 4 + content_length;
+                    if (accum.size() >= need) break;
+                }
             }
+            {
+                const size_t he = accum.find("\r\n\r\n");
+                if (he != std::string::npos) {
+                    body_seen_.store(accum.size() - (he + 4));
+                }
+            }
+            const char* resp =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/plain\r\n"
+                "Content-Length: 25\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "Hello from TinyHttpServer";
+            ::send(c, resp, static_cast<int>(std::strlen(resp)), 0);
 #if defined(_WIN32)
             closesocket(c);
 #else
@@ -130,11 +156,15 @@ private:
     uint16_t port_{0};
     std::atomic<bool> stop_{false};
     std::thread thread_;
+    std::atomic<size_t> body_seen_{0};
+
+public:
+    size_t body_seen() const noexcept { return body_seen_.load(); }
 };
 
 // --- tests ---
 
-static void test_get_ok() {
+TEST_CASE("get ok", "[client]") {
     TinyHttpServer srv;
     if (!srv.start()) {
         std::printf("SKIP: could not start the local HTTP server\n");
@@ -168,7 +198,7 @@ static void test_get_ok() {
     srv.stop();
 }
 
-static void test_get_cancel() {
+TEST_CASE("get cancel", "[client]") {
     TinyHttpServer srv;
     if (!srv.start()) {
         std::printf("SKIP: could not start the local HTTP server\n");
@@ -194,7 +224,7 @@ static void test_get_cancel() {
     srv.stop();
 }
 
-static void test_get_invalid_scheme() {
+TEST_CASE("get invalid scheme", "[client]") {
     Client client;
     std::atomic<bool> done{false}, failed{false};
     // The server is never contacted — this tests URL parse rejection.
@@ -207,7 +237,7 @@ static void test_get_invalid_scheme() {
     client.shutdown();
 }
 
-static void test_client_shutdown() {
+TEST_CASE("client shutdown", "[client]") {
     Client client;
     std::atomic<bool> done{false};
     client.shutdown();
@@ -218,12 +248,37 @@ static void test_client_shutdown() {
     CHECK(wait_until([&] { return done.load(); }));
 }
 
-int main() {
-    test_get_ok();
-    test_get_cancel();
-    test_get_invalid_scheme();
-    test_client_shutdown();
+TEST_CASE("post sends body", "[client]") {
+    TinyHttpServer srv;
+    if (!srv.start()) {
+        std::printf("SKIP: could not start the local HTTP server\n");
+        return;
+    }
 
-    std::printf("=== %d passed, %d failed ===\n", g_pass, g_fail);
-    return g_fail == 0 ? 0 : 1;
+    ClientOptions opts;
+    Client client(opts);
+
+    std::atomic<bool> done{false}, ok{false};
+    int status = 0;
+
+    string url_str = string("http://127.0.0.1:") + format("{}", srv.port()) + "/";
+    Request req(Method::Post, url_str);
+    string payload = to_string("hello-body-12345");
+    req.set_body(payload);
+
+    client.request(req, [&](Result<Response> r) {
+        if (r) {
+            ok.store(true);
+            status = r.value().head().status_code;
+        }
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    REQUIRE(ok.load());
+    REQUIRE(status == 200);
+    REQUIRE(srv.body_seen() == 16);
+
+    client.shutdown();
+    srv.stop();
 }

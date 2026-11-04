@@ -259,12 +259,13 @@ if(MGHTTP_USE_MEMESTRING)
     target_compile_definitions(megohttp INTERFACE MGHTTP_USE_MEMESTRING=1)
 endif()
 
-# MemeString's include dir is needed even in std-string mode: config.hpp reuses
-# mego/predef for platform/compiler/language detection instead of re-detecting
-# them. Only the runtime DLL and the MGHTTP_USE_MEMESTRING switch are conditional.
-target_include_directories(megohttp INTERFACE
-    $<BUILD_INTERFACE:${MEMESTRING_ROOT}/include>
-)
+# MemeString's headers are only on the include path in MemeString mode: config.hpp
+# and error.hpp are self-contained, so a std::string build needs nothing from it.
+if(MGHTTP_USE_MEMESTRING)
+    target_include_directories(megohttp INTERFACE
+        $<BUILD_INTERFACE:${MEMESTRING_ROOT}/include>
+    )
+endif()
 
 # Compile definitions
 target_compile_definitions(megohttp INTERFACE

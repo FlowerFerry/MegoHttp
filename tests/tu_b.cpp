@@ -19,7 +19,7 @@ int tu_b_check(const MegoHttp::string& s) {
 // Called from main; also builds a string A consumes via tu_b_check.
 MegoHttp::string tu_b_make() {
     MegoHttp::string_builder b;
-    MegoHttp::detail::sb_append(b, "from-b");
+    MegoHttp::Detail::sb_append(b, "from-b");
     return b.release();
 }
 
