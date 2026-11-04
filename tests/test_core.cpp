@@ -378,51 +378,54 @@ static void test_scheme_unknown() {
     CHECK(parse_url("nonsense://x").has_error());
 }
 
-static void test_error_mgpp_bridge() {
-    // ErrorCode values live in the -400000 band, disjoint from every band
-    // mego/err/ec.h already uses (POSIX -100000, Windows -200000, SQLite -300000).
+static void test_error_std_bridge() {
+    // ErrorCode values live in the -400000 band, disjoint from everything else.
     CHECK(static_cast<int32_t>(ErrorCode::Unknown) < -399999);
     CHECK(static_cast<int32_t>(ErrorCode::SseEventTooLarge) > -499999);
-    CHECK(static_cast<int32_t>(ErrorCode::Success) == MGEC__OK);
+    CHECK(static_cast<int32_t>(ErrorCode::Success) == 0);
 
-    // Round-trip through mgpp::err: the typed code and the phase survive.
+    // code / phase / message survive construction.
     Error e{ErrorCode::HttpChunkError, ErrorPhase::Receive, string("bad chunk")};
     CHECK(e.code() == ErrorCode::HttpChunkError);
     CHECK(e.phase() == ErrorPhase::Receive);
     CHECK(!e.message().empty());
     CHECK(e);
-    CHECK(e.native().code() == static_cast<int32_t>(ErrorCode::HttpChunkError));
-    CHECK(e.native().usercode() == static_cast<int32_t>(ErrorPhase::Receive));
 
-    // Wrapping a foreign mgpp::err keeps the payload and maps the code safely.
-    mgpp::err raw{MGEC__INVAL, memepp::string("invalid from platform")};
-    Error wrapped{raw};
-    CHECK(wrapped);
-    // MGEC__INVAL is outside our band, so it maps to Unknown rather than lying.
-    CHECK(wrapped.code() == ErrorCode::Unknown);
-    CHECK(wrapped.message().size() == static_cast<string::size_type>(raw.message().size()));
-    CHECK(std::memcmp(wrapped.message().data(), raw.message().data(),
-                      static_cast<size_t>(raw.message().size())) == 0);
+    // std::error_code carries the code and our category.
+    std::error_code ec = e;
+    CHECK(ec.value() == static_cast<int>(ErrorCode::HttpChunkError));
+    CHECK(ec.category() == megohttp_category());
+    CHECK(std::strcmp(ec.category().name(), "megohttp") == 0);
 
-    // mgpp::err::message() reads the payload only -- the category is NOT consulted,
-    // it exists for err_cond comparison. So a code-only err has an empty message,
-    // and the name comes from to_string() / the category's message() instead.
-    mgpp::err cat_err{static_cast<int32_t>(ErrorCode::MultipartTruncated),
-                      const_cast<mgpp::err_cat*>(megohttp_err_cat())};
-    CHECK(cat_err.message().empty());          // no payload was supplied
-    CHECK(std::strcmp(megohttp_err_cat()->name(), "megohttp") == 0);
-    {
-        // The category can name a code on demand.
-        memepp::string named = megohttp_err_cat()->message(
-            static_cast<int32_t>(ErrorCode::MultipartTruncated));
-        CHECK(!named.empty());
-        CHECK(std::memcmp(named.data(), "MultipartTruncated", 18) == 0);
-    }
+    // The category names a code on demand, in std::string (its虚 interface).
+    CHECK(ec.message() == std::string("HttpChunkError"));
 
-    // err_cond comparison works through the category.
-    mgpp::err_cond cond = megohttp_err_cat()->get_err_cond(
-        static_cast<int32_t>(ErrorCode::MultipartTruncated));
-    CHECK(cat_err == cond);
+    // std::error_condition comparison: same code matches, different does not.
+    std::error_condition cond{static_cast<int>(ErrorCode::HttpChunkError),
+                              megohttp_category()};
+    CHECK(ec == cond);
+    CHECK(e == cond);                       // via the implicit conversion
+
+    Error other{ErrorCode::HttpTrailerError};
+    std::error_code ec2 = other;
+    CHECK(ec2 != cond);
+
+    // make_error_code() and the category agree with the explicit form.
+    CHECK(make_error_code(ErrorCode::HttpChunkError) == ec);
+
+    // A foreign code maps to Unknown rather than lying about the band.
+    CHECK(error_code_from_int(-100000) == ErrorCode::Unknown);
+    CHECK(error_code_from_int(0) == ErrorCode::Success);
+
+    // native_code is diagnostic-only and round-trips.
+    e.set_native_code(42);
+    CHECK(e.native_code() == 42);
+
+    // describe() is never empty and includes the phase when present.
+    CHECK(!e.describe().empty());
+    Error no_phase{ErrorCode::Cancelled};
+    CHECK(no_phase.phase() == ErrorPhase::None);
+    CHECK(!no_phase.describe().empty());
 
     // The five WS-compression codes and the multipart codes stay distinct.
     CHECK(ErrorCode::WsCompressionNotCompiled != ErrorCode::WsCompressionMalformedData);
@@ -535,7 +538,7 @@ int main() {
     test_error();
     test_format();
     test_scheme_unknown();
-    test_error_mgpp_bridge();
+    test_error_std_bridge();
     test_idna();
 
     std::printf("=== %d passed, %d failed ===\n", g_pass, g_fail);

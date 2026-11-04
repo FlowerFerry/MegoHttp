@@ -75,6 +75,8 @@ public:
     }
 
     uint16_t port() const noexcept { return port_; }
+    int accepted() const noexcept { return accepted_.load(); }
+    int closed() const noexcept { return closed_.load(); }
 
     void stop() {
         stop_.store(true);
@@ -100,6 +102,7 @@ private:
             socklen_t plen = sizeof peer;
             auto c = ::accept(sock_, reinterpret_cast<sockaddr*>(&peer), &plen);
             if (c == INVALID_SOCKET) return;
+            accepted_.fetch_add(1);
             char buf[4096];
             for (;;) {
                 const int n = ::recv(c, buf, sizeof buf, 0);
@@ -116,9 +119,13 @@ private:
 #else
             ::close(c);
 #endif
+            closed_.fetch_add(1);
             if (stop_.load()) return;
         }
     }
+
+    std::atomic<int> accepted_{0};
+    std::atomic<int> closed_{0};
 
 #if defined(_WIN32)
     SOCKET sock_{INVALID_SOCKET};
@@ -473,6 +480,87 @@ static void test_race_single_terminal_error() {
     ex->shutdown();
 }
 
+
+// ---------------------------------------------------------------------------
+// Race loser close.
+//
+// To reach race_finish's loser branch both attempts must be IN FLIGHT at the
+// same time and BOTH must connect: the first to report wins, the second must be
+// closed. With attempt_delay == 0 every attempt is posted on the next loop turn,
+// so both really do connect.
+//
+// Observable from outside, without touching library internals:
+//   • each server counts how many connections it accepted and how many it saw
+//     close
+//   • exactly one terminal callback
+//   • after the race ends, the LOSER server must observe its connection closed
+// ---------------------------------------------------------------------------
+static void test_race_closes_loser() {
+    EchoServer srvA;
+    CHECK(srvA.start());
+    EchoServer srvB;
+    CHECK(srvB.start());
+    if (srvA.port() == 0 || srvB.port() == 0) { srvA.stop(); srvB.stop(); return; }
+
+    auto ex = UvExecutor::create_internal();
+    CHECK(ex != nullptr);
+    if (!ex) { srvA.stop(); srvB.stop(); return; }
+
+    ResolvedAddress a;
+    a.family = ResolvedAddress::Family::IPv4;
+    a.bytes = {127, 0, 0, 1};
+    a.port = srvA.port();
+    ResolvedAddress b = a;
+    b.port = srvB.port();
+
+    AddressList list{a, b};
+
+    ConnectOptions opts;
+    opts.connect_timeout = std::chrono::seconds(10);
+    // 0 => every attempt is posted on the next loop turn, so both connect.
+    opts.attempt_delay = Duration::zero();
+
+    std::atomic<int> cb_count{0};
+    std::atomic<bool> got_stream{false};
+    std::shared_ptr<AsyncByteStream> winner;
+
+    connect_race(ex, list, opts,
+        [&](Result<std::shared_ptr<AsyncByteStream>> r) {
+            cb_count.fetch_add(1);
+            if (r && r.value()) {
+                winner = r.value();
+                got_stream.store(true);
+            }
+        });
+
+    CHECK(wait_until([&] { return cb_count.load() > 0; }, 10000));
+    CHECK(cb_count.load() == 1);
+    CHECK(got_stream.load());
+
+    // Both servers must have accepted a connection: that is what makes one of
+    // them the loser rather than "an attempt that never happened".
+    CHECK(wait_until([&] { return srvA.accepted() == 1 && srvB.accepted() == 1; }, 5000));
+    CHECK(srvA.accepted() == 1);
+    CHECK(srvB.accepted() == 1);
+
+    // The loser is closed by race_finish, so exactly ONE server should see its
+    // connection drop BEFORE we close the winner ourselves.
+    const bool one_closed =
+        wait_until([&] { return srvA.closed() + srvB.closed() == 1; }, 5000);
+    CHECK(one_closed);
+    CHECK(srvA.closed() + srvB.closed() == 1);
+
+    // Now close the winner; the second server should observe its close too.
+    if (winner) ex->post([winner] { winner->async_close(nullptr); });
+    CHECK(wait_until([&] { return srvA.closed() == 1 && srvB.closed() == 1; }, 5000));
+    CHECK(srvA.closed() == 1);
+    CHECK(srvB.closed() == 1);
+
+    ex->shutdown();
+    srvA.stop();
+    srvB.stop();
+}
+
 int main() {
     test_resolve_literal();
     test_static_resolver();
@@ -483,6 +571,7 @@ int main() {
     test_connect_race();
     test_race_one_winner_usable();
     test_race_single_terminal_error();
+    test_race_closes_loser();
     test_race_single_terminal_error();
 
     std::printf("=== %d passed, %d failed ===\n", g_pass, g_fail);

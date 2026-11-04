@@ -4,52 +4,29 @@
 #include <megohttp/config.hpp>
 #include <megohttp/string_adapter.hpp>
 
-// The error carrier is MemeString's mgpp::err and the code space is
-// mego/err/ec.h. Using them instead of a hand-rolled error class means this
-// library's errors compose with the rest of the ecosystem: the same err_cat /
-// err_cond machinery, the same message/solution/funcinfo payload, the same
-// chaining via set_next().
-#include <megopp/err/err.hpp>
-#include <mego/err/ec.h>
-
+// Self-contained error handling: no MemeString dependency.
+//
+// The carrier is std::error_code, so this composes with the standard ecosystem
+// (std::system_error, std::error_condition, generic_category comparisons) and
+// keeps working when MGHTTP_USE_MEMESTRING is not defined.
+#include <cstdint>
 #include <optional>
-#include <variant>
+#include <string>
+#include <system_error>
 #include <utility>
+#include <variant>
 
 namespace MegoHttp {
 
-    namespace detail {
-        // mgpp::err always speaks memepp::string, regardless of which string type
-        // this library is configured to use. Convert at the boundary only.
-        inline memepp::string to_memepp(const string& s) {
-#if MEGOHTTP_HAS_MEMESTRING
-            return s;
-#else
-            return memepp::string(s.data(), static_cast<memepp::string::size_type>(s.size()));
-#endif
-        }
-
-        // And back, for the payload mgpp::err hands out.
-        inline string from_memepp(const memepp::string& s) {
-#if MEGOHTTP_HAS_MEMESTRING
-            return s;
-#else
-            return string(s.data(), static_cast<size_t>(s.size()));
-#endif
-        }
-    } // namespace detail
-
     // MegoHttp-specific codes live in their own numeric band so they can never
-    // collide with the POSIX band (-100000..) or the two bands mego/err/ec.h
-    // already uses (-200000.. Windows, -300000.. SQLite). -400000.. is free.
-    //
-    // Expressed as offsets from a BEGIN macro (the same shape ec.h uses) so the
-    // band is obvious and inserting a code in the middle stays cheap.
+    // collide with system/POSIX errno values or with any other library's band.
+    // Expressed as offsets from a BEGIN macro so the band is obvious and
+    // inserting a code in the middle stays cheap.
 #define MGEC__HTTP_BEGIN    (-400000)
 #define MGEC__HTTP_END      (-499999)
 
     enum class ErrorCode : int32_t {
-        Success = MGEC__OK,
+        Success = 0,
 
         Unknown                 = MGEC__HTTP_BEGIN - 1,
         InvalidArgument         = MGEC__HTTP_BEGIN - 2,
@@ -149,8 +126,7 @@ namespace MegoHttp {
     };
 
     // Which stage of a multi-stage connection failed. Tells a proxy certificate
-    // error apart from a target certificate error. Carried as mgpp::err's
-    // user_code, so it travels with the code without widening mgpp::err.
+    // error apart from a target certificate error without widening ErrorCode.
     enum class ErrorPhase : int32_t {
         None = 0,
         Resolve,
@@ -171,59 +147,47 @@ namespace MegoHttp {
         MultipartParse,
     };
 
-    // err_cat for MegoHttp codes: supplies the name for each code and the category
-    // identity used by mgpp::err_cond comparisons.
-    class MegoHttpErrCat final : public mgpp::err_cat {
-    public:
-        const char* name() const noexcept override { return "megohttp"; }
-        memepp::string message(int _errval) const noexcept override;
-    };
-
-    // Process-wide category instance (function-local static: created on first use,
-    // so there is no static-initialization-order problem).
-    const mgpp::err_cat* megohttp_err_cat() noexcept;
-
-    // Raw int code from mgpp::err back to the typed enum. An unrecognized value
-    // maps to ErrorCode::Unknown rather than asserting: the error may have come
-    // from a platform call that used its own numbering.
+    // Raw int back to the typed enum. An unrecognized value maps to
+    // ErrorCode::Unknown rather than asserting: the code may have come from a
+    // platform call that used its own numbering.
     ErrorCode error_code_from_int(int32_t code) noexcept;
 
+    // The std::error_category for MegoHttp codes. Function-local static inside
+    // megohttp_category(), so there is no static-initialization-order problem.
+    const std::error_category& megohttp_category() noexcept;
+
+    // Convenience: Error -> std::error_code without naming the cast.
+    inline std::error_code make_error_code(ErrorCode code) noexcept {
+        return std::error_code(static_cast<int>(code), megohttp_category());
+    }
+
     // ---------------------------------------------------------------------------
-    // Error: a thin adapter over mgpp::err.
+    // Error: code + phase + message, convertible to std::error_code.
     //
-    // Keeps mgpp::err's payload (message / solution / funcinfo / chaining) and adds
-    // the two things this library needs on top: the typed ErrorCode and the
-    // ErrorPhase. Both travel inside the mgpp::err (code and user_code), so an
-    // Error can be handed to code that only understands mgpp::err and back.
+    // Deliberately not a std::error_code wrapper: the phase would not fit (it is
+    // a second dimension, not part of the code space), and a native transport
+    // detail (errno / uv_errno) is diagnostic only. Those two ride alongside the
+    // code instead of being smuggled into it.
     // ---------------------------------------------------------------------------
     class Error {
     public:
         Error() noexcept = default;
 
         Error(ErrorCode code, ErrorPhase phase, string message)
-            : err_(static_cast<int32_t>(code), static_cast<int32_t>(phase),
-                   detail::to_memepp(message)) {}
+            : code_(code), phase_(phase), message_(std::move(message)) {}
 
-        explicit Error(ErrorCode code)
-            : err_(static_cast<int32_t>(code)) {}
+        explicit Error(ErrorCode code) : code_(code) {}
 
         Error(ErrorCode code, string message)
-            : err_(static_cast<int32_t>(code), detail::to_memepp(message)) {}
+            : code_(code), message_(std::move(message)) {}
 
-        // Wrap an existing mgpp::err (e.g. one surfaced from MemeString or libuv).
-        explicit Error(mgpp::err e) : err_(std::move(e)) {}
+        ErrorCode code() const noexcept { return code_; }
 
-        ErrorCode code() const noexcept {
-            return error_code_from_int(err_.code());
-        }
+        ErrorPhase phase() const noexcept { return phase_; }
 
-        ErrorPhase phase() const noexcept {
-            return static_cast<ErrorPhase>(err_.usercode());
-        }
-
-        // Returns this library's string type. The payload lives in a
-        // memepp::string (mgpp::err's carrier), so in std mode this copies once.
-        string message() const { return detail::from_memepp(err_.message()); }
+        // This library's string type: memepp::string or std::string, whichever
+        // the build selected. No conversion happens here.
+        const string& message() const noexcept { return message_; }
 
         // Transport-level detail code (errno / uv_errno / OpenSSL verify result).
         // Deliberately NOT folded into the MegoHttp code space: it is diagnostic
@@ -231,19 +195,25 @@ namespace MegoHttp {
         int native_code() const noexcept { return native_code_; }
         void set_native_code(int v) noexcept { native_code_ = v; }
 
-        // Access to the underlying carrier, for callers already using mgpp::err.
-        const mgpp::err& native() const noexcept { return err_; }
-        mgpp::err& native() noexcept { return err_; }
+        // Interoperate with the standard error facility. std::error_code carries
+        // the code only; phase() and native_code() stay here.
+        operator std::error_code() const noexcept {
+            return std::error_code(static_cast<int>(code_), megohttp_category());
+        }
 
         // Human-readable description, always non-empty for a real error.
         string describe() const;
 
-        explicit operator bool() const noexcept { return err_.code() != MGEC__OK; }
+        explicit operator bool() const noexcept { return code_ != ErrorCode::Success; }
 
     private:
-        mgpp::err err_;
+        ErrorCode code_{ErrorCode::Success};
+        ErrorPhase phase_{ErrorPhase::None};
+        string message_;
         int native_code_{0};
     };
+
+
 
     // Name of an error code, for logs and test assertions.
     const char* to_string(ErrorCode code) noexcept;

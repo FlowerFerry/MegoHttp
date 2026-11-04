@@ -404,30 +404,31 @@ if(MGHTTP_USE_UVW AND MGHTTP_UVW_AVAILABLE)
         $<BUILD_INTERFACE:${UVW_ROOT}/src>)
 endif()
 
-# MemeString is linked UNCONDITIONALLY, not only in string mode: error.hpp carries
-# mgpp::err as its error payload, so even the std::string build needs the runtime.
-# Only MGHTTP_USE_MEMESTRING (which string type the library exposes) is conditional.
-if(WIN32)
-    # Link the DLL directly. Its import library in deps/MemeString/build_verify
-    # was produced by a different toolchain build and resolves some symbols to a
-    # stale `__imp_` form, which fails at link time even though the DLL exports
-    # them. Passing the .dll makes MinGW generate a matching import library for
-    # exactly the binary we run against.
-    if(NOT MEMESTRING_RUNTIME)
-        message(FATAL_ERROR
-            "MemeString runtime DLL not found. Pass -DMEMESTRING_RUNTIME=<path>.")
+# MemeString is linked ONLY in MemeString mode: error.hpp and config.hpp no longer
+# pull in any MemeString header, so the std::string build needs nothing from it.
+if(MGHTTP_USE_MEMESTRING)
+    if(WIN32)
+        # Link the DLL directly. Its import library in deps/MemeString/build_verify
+        # was produced by a different toolchain build and resolves some symbols to a
+        # stale `__imp_` form, which fails at link time even though the DLL exports
+        # them. Passing the .dll makes MinGW generate a matching import library for
+        # exactly the binary we run against.
+        if(NOT MEMESTRING_RUNTIME)
+            message(FATAL_ERROR
+                "MemeString runtime DLL not found. Pass -DMEMESTRING_RUNTIME=<path>.")
+        endif()
+        message(STATUS "MemeString runtime: ${MEMESTRING_RUNTIME}")
+        target_link_libraries(megohttp INTERFACE "$<BUILD_INTERFACE:${MEMESTRING_RUNTIME}>")
+        get_filename_component(MEMESTRING_RUNTIME_DIR "${MEMESTRING_RUNTIME}" DIRECTORY)
+        target_compile_definitions(megohttp INTERFACE MGHTTP_MEMESTRING_DIR="${MEMESTRING_RUNTIME_DIR}")
+    else()
+        target_link_libraries(megohttp INTERFACE "${MEMESTRING_ROOT}/libmeme_string.so")
     endif()
-    message(STATUS "MemeString runtime: ${MEMESTRING_RUNTIME}")
-    target_link_libraries(megohttp INTERFACE "$<BUILD_INTERFACE:${MEMESTRING_RUNTIME}>")
-    get_filename_component(MEMESTRING_RUNTIME_DIR "${MEMESTRING_RUNTIME}" DIRECTORY)
-    target_compile_definitions(megohttp INTERFACE MGHTTP_MEMESTRING_DIR="${MEMESTRING_RUNTIME_DIR}")
-else()
-    target_link_libraries(megohttp INTERFACE "${MEMESTRING_ROOT}/libmeme_string.so")
 endif()
 
 # Runtime DLLs must sit next to the executables. CMake cannot "link-install" a DLL
 # this project does not build, so each consumer target copies it after linking.
-if(WIN32 AND MEMESTRING_RUNTIME)
+if(WIN32 AND MEMESTRING_RUNTIME AND MGHTTP_USE_MEMESTRING)
     function(mghttp_copy_runtime_dll target)
         add_custom_command(TARGET ${target} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different

@@ -210,6 +210,8 @@ public:
     }
 
     uint16_t port() const noexcept { return port_; }
+    int accepted() const noexcept { return accepted_.load(); }
+    int closed() const noexcept { return closed_.load(); }
 
     void stop() {
         asio::error_code ec;
@@ -225,6 +227,7 @@ private:
         auto sock = std::make_shared<asio::ip::tcp::socket>(ioc_);
         acc_.async_accept(*sock, [this, sock](const asio::error_code& ec) {
             if (ec) return;
+            accepted_.fetch_add(1);
             auto buf = std::make_shared<std::vector<char>>(4096);
             read_loop(sock, buf);
         });
@@ -234,16 +237,29 @@ private:
                    std::shared_ptr<std::vector<char>> buf) {
         sock->async_read_some(asio::buffer(*buf),
             [this, sock, buf](const asio::error_code& ec, size_t n) {
-                if (ec || n == 0) return;
+                if (ec || n == 0) {
+                    // Peer closed: count it so tests can observe a dropped connection.
+                    asio::error_code ig;
+                    sock->close(ig);
+                    closed_.fetch_add(1);
+                    return;
+                }
                 asio::async_write(*sock, asio::buffer(buf->data(), n),
                     [this, sock, buf](const asio::error_code& wec, size_t) {
-                        if (wec) return;
+                        if (wec) {
+                            asio::error_code ig;
+                            sock->close(ig);
+                            closed_.fetch_add(1);
+                            return;
+                        }
                         read_loop(sock, buf);
                     });
             });
     }
 
     asio::io_context ioc_;
+    std::atomic<int> accepted_{0};
+    std::atomic<int> closed_{0};
     asio::ip::tcp::acceptor acc_{ioc_};
     uint16_t port_{0};
     std::thread thread_;
@@ -379,6 +395,71 @@ static void test_connect_race() {
     server.stop();
 }
 
+
+// Race loser close: both servers accept a connection, exactly one is closed once
+// the race decides, and the winner still works. Uses server-side counters, so
+// this observes real sockets rather than internal race state.
+static void test_race_closes_loser() {
+    AsioEchoServer srvA;
+    CHECK(srvA.start());
+    AsioEchoServer srvB;
+    CHECK(srvB.start());
+    if (srvA.port() == 0 || srvB.port() == 0) { srvA.stop(); srvB.stop(); return; }
+
+    auto ex = AsioExecutor::create_internal();
+    CHECK(ex != nullptr);
+    if (!ex) { srvA.stop(); srvB.stop(); return; }
+
+    ResolvedAddress a;
+    a.family = ResolvedAddress::Family::IPv4;
+    a.bytes = {127, 0, 0, 1};
+    a.port = srvA.port();
+    ResolvedAddress b = a;
+    b.port = srvB.port();
+
+    AddressList list{a, b};
+
+    ConnectOptions opts;
+    opts.connect_timeout = std::chrono::seconds(10);
+    // 0 => every attempt is posted on the next loop turn, so both really connect.
+    opts.attempt_delay = Duration::zero();
+
+    std::atomic<int> cb_count{0};
+    std::atomic<bool> got_stream{false};
+    std::shared_ptr<AsyncByteStream> winner;
+
+    connect_race(ex, list, opts,
+        [&](Result<std::shared_ptr<AsyncByteStream>> r) {
+            cb_count.fetch_add(1);
+            if (r && r.value()) {
+                winner = r.value();
+                got_stream.store(true);
+            }
+        });
+
+    CHECK(wait_until([&] { return cb_count.load() > 0; }, 10000));
+    CHECK(cb_count.load() == 1);
+    CHECK(got_stream.load());
+
+    // Both connected, which is what makes one of them a loser.
+    CHECK(wait_until([&] { return srvA.accepted() == 1 && srvB.accepted() == 1; }, 5000));
+    CHECK(srvA.accepted() == 1);
+    CHECK(srvB.accepted() == 1);
+
+    // The loser must already be closed by the race, before we touch the winner.
+    CHECK(wait_until([&] { return srvA.closed() + srvB.closed() == 1; }, 5000));
+    CHECK(srvA.closed() + srvB.closed() == 1);
+
+    if (winner) ex->post([winner] { winner->async_close(nullptr); });
+    CHECK(wait_until([&] { return srvA.closed() == 1 && srvB.closed() == 1; }, 5000));
+    CHECK(srvA.closed() == 1);
+    CHECK(srvB.closed() == 1);
+
+    ex->shutdown();
+    srvA.stop();
+    srvB.stop();
+}
+
 int main() {
     test_executor_post();
     test_executor_post_never_inline();
@@ -392,6 +473,7 @@ int main() {
     test_tcp_echo();
     test_tcp_connect_refused();
     test_connect_race();
+    test_race_closes_loser();
 
     std::printf("=== %d passed, %d failed ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

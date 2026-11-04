@@ -4,20 +4,65 @@
 // ---------------------------------------------------------------------------
 // Platform / compiler / language detection.
 //
-// Reused from MemeString's `mego/predef` headers rather than re-detected here.
-// That keeps this library and MemeString agreeing on every platform question by
-// construction, and it puts MSVC's _MSVC_LANG quirk in exactly one place
-// (mego/predef/lang/version.h) instead of two places doing it differently.
+// Self-contained: this header must work with NO third-party dependency at all,
+// because MegoHttp is usable with MGHTTP_USE_MEMESTRING undefined. Reaching into
+// MemeString's mego/predef headers here would force every user of the library to
+// have MemeString on the include path even when they asked for std::string.
+//
+// MSVC quirk handled explicitly: MSVC reports C++17 as __cplusplus == 199711L
+// unless /Zc:__cplusplus is given, so _MSVC_LANG is authoritative there.
 // ---------------------------------------------------------------------------
 
-#include <mego/predef/lang/version.h>     // MG_LANG__CXX17_AVAIL, MG_LANG__CXX_VER
-#include <mego/predef/compiler.h>         // MG_COMP__GCC/CLANG/MSVC_AVAIL
-#include <mego/predef/os/windows.h>       // MG_OS__WIN_AVAIL
-#include <mego/predef/os/linux.h>         // MG_OS__LINUX_AVAIL
-#include <mego/predef/os/macos.h>         // MG_OS__MACOS_AVAIL
-#include <mego/predef/os/ios.h>           // MG_OS__IOS_AVAIL
-#include <mego/predef/os/bsd.h>           // MG_OS__BSD_AVAIL (+ FREE/NET/OPEN/DRAGONFLY)
-#include <mego/predef/platform/android.h> // MG_PLAT__ANDROID_AVAIL
+// --- Language level --------------------------------------------------------
+#if defined(_MSVC_LANG)
+#   define MEGOHTTP_CPLUSPLUS _MSVC_LANG
+#else
+#   define MEGOHTTP_CPLUSPLUS __cplusplus
+#endif
+
+#if MEGOHTTP_CPLUSPLUS >= 202002L
+#   define MEGOHTTP_HAS_CXX20 1
+#else
+#   define MEGOHTTP_HAS_CXX20 0
+#endif
+
+#if MEGOHTTP_CPLUSPLUS >= 201703L
+#   define MEGOHTTP_HAS_CXX17 1
+#else
+#   define MEGOHTTP_HAS_CXX17 0
+#endif
+
+// --- Compiler --------------------------------------------------------------
+#if defined(__clang__)
+#   define MEGOHTTP_COMPILER_CLANG 1
+#elif defined(__GNUC__)
+#   define MEGOHTTP_COMPILER_GCC 1
+#elif defined(_MSC_VER)
+#   define MEGOHTTP_COMPILER_MSVC 1
+#else
+#   define MEGOHTTP_COMPILER_UNKNOWN 1
+#endif
+
+// --- Platform --------------------------------------------------------------
+#if defined(_WIN32)
+#   define MEGOHTTP_PLATFORM_WINDOWS 1
+#elif defined(__ANDROID__)
+#   define MEGOHTTP_PLATFORM_ANDROID 1
+#elif defined(__APPLE__)
+#   include <TargetConditionals.h>
+#   if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+#       define MEGOHTTP_PLATFORM_IOS 1
+#   else
+#       define MEGOHTTP_PLATFORM_MACOS 1
+#   endif
+#elif defined(__linux__)
+#   define MEGOHTTP_PLATFORM_LINUX 1
+#elif defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || \
+      defined(__DragonFly__) || defined(__bsdi__)
+#   define MEGOHTTP_PLATFORM_BSD 1
+#else
+#   define MEGOHTTP_PLATFORM_UNKNOWN 1
+#endif
 
 // Version
 #define MEGOHTTP_VERSION_MAJOR 0
@@ -27,7 +72,7 @@
 #define MEGOHTTP_VERSION_STRING "0.1.0"
 
 // C++17 is the baseline; C++20 only adds the coroutine surface.
-#if !MG_LANG__CXX17_AVAIL
+#if !MEGOHTTP_HAS_CXX17
 #   error "MegoHttp requires C++17 or later"
 #endif
 
@@ -86,7 +131,7 @@
 // ============================================================================
 
 #if defined(MGHTTP_ENABLE_COROUTINES)
-#   if !MG_LANG__CXX20_AVAIL
+#   if !MEGOHTTP_HAS_CXX20
 #       error "C++20 required for coroutines"
 #   endif
 #   ifdef __has_include
@@ -152,40 +197,6 @@
 #   define MEGOHTTP_HAS_COROUTINES 1
 #else
 #   define MEGOHTTP_HAS_COROUTINES 0
-#endif
-
-// ============================================================================
-// Platform, spelled once, in terms of the mego predef macros.
-// ============================================================================
-
-#if MG_OS__WIN_AVAIL
-#   define MEGOHTTP_PLATFORM_WINDOWS 1
-#elif MG_PLAT__ANDROID_AVAIL
-#   define MEGOHTTP_PLATFORM_ANDROID 1
-#elif MG_OS__IOS_AVAIL
-#   define MEGOHTTP_PLATFORM_IOS 1
-#elif MG_OS__MACOS_AVAIL
-#   define MEGOHTTP_PLATFORM_MACOS 1
-#elif MG_OS__LINUX_AVAIL
-#   define MEGOHTTP_PLATFORM_LINUX 1
-#elif MG_OS__BSD_AVAIL
-#   define MEGOHTTP_PLATFORM_BSD 1
-#else
-#   define MEGOHTTP_PLATFORM_UNKNOWN 1
-#endif
-
-// ============================================================================
-// Compiler
-// ============================================================================
-
-#if MG_COMP__CLANG_AVAIL
-#   define MEGOHTTP_COMPILER_CLANG 1
-#elif MG_COMP__GCC_AVAIL
-#   define MEGOHTTP_COMPILER_GCC 1
-#elif MG_COMP__MSVC_AVAIL
-#   define MEGOHTTP_COMPILER_MSVC 1
-#else
-#   define MEGOHTTP_COMPILER_UNKNOWN 1
 #endif
 
 // ============================================================================

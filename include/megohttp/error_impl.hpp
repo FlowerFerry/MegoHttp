@@ -5,11 +5,15 @@
 
 #include <megohttp/format.hpp>
 
+#include <string>
+#include <system_error>
+
 namespace MegoHttp {
 
-    // One table drives three things: the err_cat message, the to_string() name, and
-    // the reverse lookup used by error_code_from_int(). Keeping them in a single
-    // array makes it impossible for a name and its message to disagree.
+    // One table drives three things: the std::error_category message, the
+    // to_string() name, and the reverse lookup used by error_code_from_int().
+    // Keeping them in a single array makes it impossible for a name and its
+    // message to disagree.
     namespace detail {
 
         struct ErrorCodeEntry {
@@ -140,19 +144,29 @@ namespace MegoHttp {
         return "None";
     }
 
-    // The err_cat half of the bridge: mgpp::err asks its category for a message,
-    // so the name table above is what every mgpp::err::message() call returns.
-    inline memepp::string MegoHttpErrCat::message(int _errval) const noexcept {
-        return memepp::string(to_string(error_code_from_int(_errval)));
-    }
+    namespace detail {
+        // std::error_category's message() must return std::string, so this is the
+        // one place where std::string appears regardless of the configured string
+        // type. It is only reached through std::error_code::message().
+        class MegoHttpCategory final : public std::error_category {
+        public:
+            const char* name() const noexcept override { return "megohttp"; }
 
-    inline const mgpp::err_cat* megohttp_err_cat() noexcept {
-        static const MegoHttpErrCat cat;
-        return &cat;
+            std::string message(int ev) const override {
+                return std::string(to_string(error_code_from_int(ev)));
+            }
+        };
+    } // namespace detail
+
+    inline const std::error_category& megohttp_category() noexcept {
+        // Function-local static: created on first use, so no static-init-order
+        // problem, and the address is stable for the life of the program.
+        static const detail::MegoHttpCategory cat;
+        return cat;
     }
 
     inline ErrorCode error_code_from_int(int32_t code) noexcept {
-        if (code == MGEC__OK) return ErrorCode::Success;
+        if (code == 0) return ErrorCode::Success;
         // Only our own band is a valid MegoHttp code; anything else is foreign.
         if (code > MGEC__HTTP_BEGIN || code < MGEC__HTTP_END) return ErrorCode::Unknown;
         const auto value = static_cast<ErrorCode>(code);

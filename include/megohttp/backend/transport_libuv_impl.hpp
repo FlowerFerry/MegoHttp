@@ -323,24 +323,28 @@ namespace detail {
             std::shared_ptr<RaceState> self_hold;
         };
 
+        // Decides the race outcome. Does NOT release the self-hold: attempts that
+        // are still in flight must be able to come back through the loser path,
+        // and they need `st` to still be alive to do it. The LAST attempt to
+        // report (remaining hits 0) releases the hold; see connect_race().
         inline void race_finish(const std::shared_ptr<RaceState>& st,
                                 Result<std::shared_ptr<AsyncByteStream>> result) {
             if (st->finished.exchange(true)) {
-                // Somebody already won: a live stream handed in now is a loser.
+                // Somebody already won: a live stream reported now is a loser.
+                // It really did connect, so its socket must be closed or the
+                // peer keeps a half-open connection and we leak a descriptor.
                 if (result.has_value() && result.value()) {
                     auto extra = result.value();
-                    std::lock_guard<std::mutex> lk(st->m);
-                    st->losers.push_back(extra);
+                    {
+                        std::lock_guard<std::mutex> lk(st->m);
+                        st->losers.push_back(extra);
+                    }
                     extra->async_close(nullptr);
                 }
-                st->self_hold.reset();
                 return;
             }
             if (st->deadline_timer) st->deadline_timer->cancel();
             auto cb = std::move(st->on_done);
-            // Drop the self-hold before invoking the callback so a callback that
-            // re-enters (or inspects liveness) sees the state already released.
-            st->self_hold.reset();
             if (cb) cb(std::move(result));
         }
 
@@ -408,6 +412,9 @@ namespace detail {
                 detail::race_finish(s, Error{ErrorCode::ConnectTimeout,
                                              ErrorPhase::TcpConnect,
                                              string("connection race timed out")});
+                // A timeout retires the race, but in-flight attempts still have to
+                // report. Do not release the hold here; the last one does.
+                if (s->remaining.load() == 0) s->self_hold.reset();
             });
 
         for (size_t i = 0; i < st->addresses.size(); ++i) {
@@ -441,12 +448,17 @@ namespace detail {
                                 e = s2->last_error;
                             }
                             detail::race_finish(s2, e);
+                            s2->self_hold.reset();
                         }
                         return;
                     }
                     std::shared_ptr<AsyncByteStream> as_stream = stream;
-                    s2->remaining.fetch_sub(1);
+                    const bool last = (s2->remaining.fetch_sub(1) == 1);
                     detail::race_finish(s2, std::move(as_stream));
+                    // Released here, by the last attempt, not inside race_finish:
+                    // a late attempt must still find `st` alive to reach the
+                    // loser path above.
+                    if (last) s2->self_hold.reset();
                 });
             };
 
