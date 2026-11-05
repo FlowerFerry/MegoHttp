@@ -11,7 +11,7 @@
 #include <optional>
 #include <vector>
 
-namespace MegoHttp {
+namespace megohttp {
 
     // ---------------------------------------------------------------------------
     // ResponseHead
@@ -77,7 +77,7 @@ namespace MegoHttp {
         std::unique_ptr<Impl> impl_;
     };
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #include <megohttp/response_impl.hpp>
 

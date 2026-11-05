@@ -9,8 +9,8 @@
 #include <cctype>
 #include <cstring>
 
-namespace MegoHttp {
-namespace Detail {
+namespace megohttp {
+namespace detail {
 
     // Character classification and case folding come from the standard library,
     // not hand-written range compares. Each call site converts to unsigned char
@@ -59,7 +59,7 @@ namespace Detail {
         sb_append(b, text);
     }
 
-} // namespace Detail
+} // namespace detail
 
     inline uint16_t Url::default_port(Scheme s) noexcept {
         switch (s) {
@@ -96,7 +96,7 @@ namespace Detail {
         while (i < n) {
             size_t start = i;
             uint32_t acc = 0;
-            while (i < n && Detail::is_digit(p[i]) && (i - start) < 3) {
+            while (i < n && detail::is_digit(p[i]) && (i - start) < 3) {
                 acc = acc * 10u + static_cast<uint32_t>(p[i] - '0');
                 ++i;
             }
@@ -153,10 +153,10 @@ namespace Detail {
         const string_view scheme_sv(p, static_cast<string_view::size_type>(pos));
 
         Url u;
-        if (Detail::ascii_iequals(scheme_sv, "http"))       u.scheme = Scheme::Http;
-        else if (Detail::ascii_iequals(scheme_sv, "https")) u.scheme = Scheme::Https;
-        else if (Detail::ascii_iequals(scheme_sv, "ws"))    u.scheme = Scheme::Ws;
-        else if (Detail::ascii_iequals(scheme_sv, "wss"))   u.scheme = Scheme::Wss;
+        if (detail::ascii_iequals(scheme_sv, "http"))       u.scheme = Scheme::Http;
+        else if (detail::ascii_iequals(scheme_sv, "https")) u.scheme = Scheme::Https;
+        else if (detail::ascii_iequals(scheme_sv, "ws"))    u.scheme = Scheme::Ws;
+        else if (detail::ascii_iequals(scheme_sv, "wss"))   u.scheme = Scheme::Wss;
         else return Error{ErrorCode::InvalidArgument, "unsupported URL scheme"};
 
         size_t i = pos + 3;   // past "://"
@@ -259,18 +259,18 @@ namespace Detail {
                     return Error{ErrorCode::InvalidArgument,
                                  "IDN host is invalid after IDNA encoding"};
                 }
-                u.host = Detail::lower_ascii(to_view(encoded.value()));
+                u.host = detail::lower_ascii(to_view(encoded.value()));
                 u.is_ip_literal = false;
             }
         }
 
         if (u.host.empty()) {
-            u.host = Detail::lower_ascii(host_sv);
+            u.host = detail::lower_ascii(host_sv);
         }
 
         if (have_port) {
             uint16_t port = 0;
-            if (!Detail::parse_port(port_sv, &port)) {
+            if (!detail::parse_port(port_sv, &port)) {
                 return Error{ErrorCode::InvalidArgument, "invalid port in URL"};
             }
             u.port = port;
@@ -309,13 +309,13 @@ namespace Detail {
 
     inline string Url::host_port_header() const {
         string_builder b;
-        if (is_ipv6_literal) { Detail::sb_append(b, '['); Detail::sb_append(b, host); Detail::sb_append(b, ']'); }
-        else { Detail::sb_append(b, host); }
+        if (is_ipv6_literal) { detail::sb_append(b, '['); detail::sb_append(b, host); detail::sb_append(b, ']'); }
+        else { detail::sb_append(b, host); }
 
         // Omit the port only when it equals the scheme default (RFC 7230 Host rules).
         if (port != default_port(scheme)) {
-            Detail::sb_append(b, ':');
-            Detail::append_int(b, static_cast<uint32_t>(port));
+            detail::sb_append(b, ':');
+            detail::append_int(b, static_cast<uint32_t>(port));
         }
         return b.release();
     }
@@ -323,33 +323,33 @@ namespace Detail {
     inline string Url::origin() const {
         string_builder b;
         switch (scheme) {
-        case Scheme::Http:  Detail::sb_append(b, "http");  break;
-        case Scheme::Https: Detail::sb_append(b, "https"); break;
-        case Scheme::Ws:    Detail::sb_append(b, "ws");    break;
-        case Scheme::Wss:   Detail::sb_append(b, "wss");   break;
+        case Scheme::Http:  detail::sb_append(b, "http");  break;
+        case Scheme::Https: detail::sb_append(b, "https"); break;
+        case Scheme::Ws:    detail::sb_append(b, "ws");    break;
+        case Scheme::Wss:   detail::sb_append(b, "wss");   break;
         case Scheme::Unknown: break;   // no scheme text for an unparsed URL
         }
-        Detail::sb_append(b, "://");
-        Detail::sb_append(b, host_port_header());
+        detail::sb_append(b, "://");
+        detail::sb_append(b, host_port_header());
         return b.release();
     }
 
     inline string Url::request_target() const {
         string_builder b;
-        if (path.empty()) Detail::sb_append(b, '/'); else Detail::sb_append(b, path);
-        if (has_query) { Detail::sb_append(b, '?'); Detail::sb_append(b, query); }
+        if (path.empty()) detail::sb_append(b, '/'); else detail::sb_append(b, path);
+        if (has_query) { detail::sb_append(b, '?'); detail::sb_append(b, query); }
         return b.release();
     }
 
     inline string Url::absolute_form_target() const {
         // absolute-form is only defined for http (a plain forward proxy).
         string_builder b;
-        Detail::sb_append(b, "http://");
-        Detail::sb_append(b, host_port_header());
-        Detail::sb_append(b, request_target());
+        detail::sb_append(b, "http://");
+        detail::sb_append(b, host_port_header());
+        detail::sb_append(b, request_target());
         return b.release();
     }
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #endif // MEGOHTTP_URL_IMPL_HPP_INCLUDED

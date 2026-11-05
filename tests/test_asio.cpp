@@ -26,8 +26,8 @@ TEST_CASE("feature disabled", "[asio]") {
 #include <memory>
 #include <thread>
 
-using namespace MegoHttp;
-using namespace MegoHttp::asio_backend;
+using namespace megohttp;
+using namespace megohttp::asio_backend;
 
 
 template<typename F>

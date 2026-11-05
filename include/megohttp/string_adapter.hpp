@@ -17,7 +17,7 @@
 #include <cstring>
 #include <vector>
 
-namespace MegoHttp {
+namespace megohttp {
 
     // Unified string adapter. Two modes selected by MGHTTP_USE_MEMESTRING.
     //
@@ -72,7 +72,7 @@ namespace MegoHttp {
     };
 #endif
 
-    namespace Detail {
+    namespace detail {
         // Append a borrowed view to a builder without spelling the mode-specific
         // overload at every call site.
         inline string_builder& sb_append(string_builder& b, string_view v) {
@@ -103,14 +103,14 @@ namespace MegoHttp {
         inline string sb_generate(const string_builder& b) {
             return b.generate();
         }
-    } // namespace Detail
+    } // namespace detail
 
     // Byte buffers are for raw network bytes, TLS ciphertext, compressed data and
     // file contents. They are deliberately NOT the string type: the string-switch
     // requirement applies to TEXT, and bytes must not be smuggled through it.
     using byte_buffer = std::vector<uint8_t>;
 
-    namespace Detail {
+    namespace detail {
 
         // Size type differs between backends (memepp uses mmint_t = int32_t).
         inline size_t to_size(string_view v) noexcept {
@@ -184,7 +184,7 @@ namespace MegoHttp {
         }
 #endif
 
-    } // namespace Detail
+    } // namespace detail
 
     // --- Conversions -----------------------------------------------------------
     // Constructing an owning string from a borrowed view. Both modes support this;
@@ -233,7 +233,7 @@ namespace MegoHttp {
 
     namespace literals {
 
-        // Owned literal, e.g. `using namespace MegoHttp::literals; "abc"_s`
+        // Owned literal, e.g. `using namespace megohttp::literals; "abc"_s`
 #if MEGOHTTP_HAS_MEMESTRING
         inline string operator""_s(const char* p, size_t n) {
             return string(p, static_cast<string::size_type>(n));
@@ -246,21 +246,21 @@ namespace MegoHttp {
 
     } // namespace literals
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 // Lower-case spelling for the string layer only: every type name here is already
 // lower-case (string / string_view / string_span), so a matching lower-case
 // namespace keeps `megohttp::string` reading naturally without renaming anything
 // in the rest of the library.
-namespace megohttp {
-    using MegoHttp::string;
-    using MegoHttp::string_view;
-    using MegoHttp::string_span;
-    using MegoHttp::string_builder;
-    using MegoHttp::byte_buffer;
-    using MegoHttp::to_string;
-    using MegoHttp::to_view;
-    namespace literals = MegoHttp::literals;
-}
+// namespace megohttp {
+//     using megohttp::string;
+//     using megohttp::string_view;
+//     using megohttp::string_span;
+//     using megohttp::string_builder;
+//     using megohttp::byte_buffer;
+//     using megohttp::to_string;
+//     using megohttp::to_view;
+//     namespace literals = megohttp::literals;
+// }
 
 #endif // MEGOHTTP_STRING_ADAPTER_HPP_INCLUDED

@@ -22,7 +22,7 @@
 #include <mutex>
 #include <vector>
 
-namespace MegoHttp {
+namespace megohttp {
 
     // --- TcpStream ------------------------------------------------------------
     inline TcpStream::TcpStream(std::shared_ptr<Executor> executor,
@@ -220,7 +220,7 @@ namespace MegoHttp {
     }
 
     // --- connect_race (same structure as the libuv backend) ------------------
-    namespace Detail {
+    namespace detail {
 
         struct RaceState {
             std::shared_ptr<Executor> executor;
@@ -292,7 +292,7 @@ namespace MegoHttp {
             return out;
         }
 
-    } // namespace Detail
+    } // namespace detail
 
     inline void connect_race(
         std::shared_ptr<Executor> executor,
@@ -308,21 +308,21 @@ namespace MegoHttp {
             return;
         }
 
-        auto st = std::make_shared<Detail::RaceState>();
+        auto st = std::make_shared<detail::RaceState>();
         st->self_hold = st;
         st->executor = executor;
         st->options = options;
         st->on_done = std::move(on_done);
-        st->addresses = Detail::interleave_by_family(std::move(addresses), options.preference);
+        st->addresses = detail::interleave_by_family(std::move(addresses), options.preference);
         st->remaining.store(st->addresses.size());
 
-        std::weak_ptr<Detail::RaceState> weak = st;
+        std::weak_ptr<detail::RaceState> weak = st;
         st->deadline_timer = executor->schedule_after(
             options.connect_timeout,
             [weak] {
                 auto s = weak.lock();
                 if (!s) return;
-                Detail::race_finish(s, Error{ErrorCode::ConnectTimeout,
+                detail::race_finish(s, Error{ErrorCode::ConnectTimeout,
                                              ErrorPhase::TcpConnect,
                                              string("connection race timed out")});
                 // A timeout retires the race, but in-flight attempts still have to
@@ -354,14 +354,14 @@ namespace MegoHttp {
                                 std::lock_guard<std::mutex> lk(s2->m);
                                 e = s2->last_error;
                             }
-                            Detail::race_finish(s2, e);
+                            detail::race_finish(s2, e);
                             s2->self_hold.reset();
                         }
                         return;
                     }
                     std::shared_ptr<AsyncByteStream> as_stream = stream;
                     const bool last = (s2->remaining.fetch_sub(1) == 1);
-                    Detail::race_finish(s2, std::move(as_stream));
+                    detail::race_finish(s2, std::move(as_stream));
                     // Released here, by the last attempt, not inside race_finish:
                     // a late attempt must still find `st` alive to reach the
                     // loser path above.
@@ -377,6 +377,6 @@ namespace MegoHttp {
         }
     }
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #endif

@@ -6,8 +6,8 @@
 #include <asio.hpp>
 #include <asio/ip/tcp.hpp>
 
-namespace MegoHttp {
-namespace Detail {
+namespace megohttp {
+namespace detail {
 
     // Shared ownership of the async resolver request: it self-holds until the
     // callback fires, so a cancel racing the completion cannot destroy it.
@@ -84,7 +84,7 @@ namespace Detail {
         }
     };
 
-} // namespace Detail
+} // namespace detail
 
     inline SystemResolverImpl::~SystemResolverImpl() = default;
 
@@ -119,7 +119,7 @@ namespace Detail {
         }
 
         // The resolver request self-holds through the async call.
-        auto req = std::make_shared<Detail::AsioResolveRequest>(
+        auto req = std::make_shared<detail::AsioResolveRequest>(
             *asio_exec->context(), port, std::move(cb), state);
 
         state->on_cancel([req]() {
@@ -131,6 +131,6 @@ namespace Detail {
         return handle;
     }
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #endif

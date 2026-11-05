@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-using namespace MegoHttp;
+using namespace megohttp;
 
 
 // Collects everything the parser reports.
@@ -475,7 +475,7 @@ TEST_CASE("token helpers", "[http]") {
     CHECK(parts.size() == 3);
 
     auto t = http_detail::trim_ows("  x  ");
-    CHECK((Detail::to_size(t) == 1 && t.data()[0] == 'x'));
+    CHECK((detail::to_size(t) == 1 && t.data()[0] == 'x'));
 
     CHECK(!http_detail::status_reason(200).empty());
     CHECK(http_detail::status_reason(299).empty());   // never invent a phrase

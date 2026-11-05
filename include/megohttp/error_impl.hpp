@@ -8,13 +8,13 @@
 #include <string>
 #include <system_error>
 
-namespace MegoHttp {
+namespace megohttp {
 
     // One table drives three things: the std::error_category message, the
     // to_string() name, and the reverse lookup used by error_code_from_int().
     // Keeping them in a single array makes it impossible for a name and its
     // message to disagree.
-    namespace Detail {
+    namespace detail {
 
         struct ErrorCodeEntry {
             ErrorCode code;
@@ -115,10 +115,10 @@ namespace MegoHttp {
             return "Unknown";
         }
 
-    } // namespace Detail
+    } // namespace detail
 
     inline const char* to_string(ErrorCode code) noexcept {
-        return Detail::code_name(code);
+        return detail::code_name(code);
     }
 
     inline const char* to_string(ErrorPhase phase) noexcept {
@@ -144,7 +144,7 @@ namespace MegoHttp {
         return "None";
     }
 
-    namespace Detail {
+    namespace detail {
         // std::error_category's message() must return std::string, so this is the
         // one place where std::string appears regardless of the configured string
         // type. It is only reached through std::error_code::message().
@@ -156,12 +156,12 @@ namespace MegoHttp {
                 return std::string(to_string(error_code_from_int(ev)));
             }
         };
-    } // namespace Detail
+    } // namespace detail
 
     inline const std::error_category& megohttp_category() noexcept {
         // Function-local static: created on first use, so no static-init-order
         // problem, and the address is stable for the life of the program.
-        static const Detail::MegoHttpCategory cat;
+        static const detail::MegoHttpCategory cat;
         return cat;
     }
 
@@ -170,7 +170,7 @@ namespace MegoHttp {
         // Only our own band is a valid MegoHttp code; anything else is foreign.
         if (code > MGEC__HTTP_BEGIN || code < MGEC__HTTP_END) return ErrorCode::Unknown;
         const auto value = static_cast<ErrorCode>(code);
-        for (const auto& e : Detail::kErrorCodes) {
+        for (const auto& e : detail::kErrorCodes) {
             if (e.code == value) return value;
         }
         return ErrorCode::Unknown;
@@ -188,6 +188,6 @@ namespace MegoHttp {
         return out;
     }
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #endif // MEGOHTTP_ERROR_IMPL_HPP_INCLUDED

@@ -29,7 +29,7 @@
 #   include <unistd.h>
 #endif
 
-using namespace MegoHttp;
+using namespace megohttp;
 
 
 template<typename F>
@@ -112,8 +112,16 @@ private:
                     size_t he = accum.find("\r\n\r\n");
                     if (he != std::string::npos) {
                         head_complete = true;
-                        size_t cl = accum.find("Content-Length:");
-                        if (cl != std::string::npos && cl < he) {
+                        // Header names are case-insensitive: the client may emit
+                        // any casing, so fold before searching.
+                        std::string lower;
+                        lower.reserve(he);
+                        for (size_t k = 0; k < he; ++k) {
+                            lower.push_back(static_cast<char>(
+                                std::tolower(static_cast<unsigned char>(accum[k]))));
+                        }
+                        size_t cl = lower.find("content-length:");
+                        if (cl != std::string::npos) {
                             const char* p = accum.data() + cl + 15;
                             while (*p == ' ' || *p == '\t') ++p;
                             content_length = strtoull(p, nullptr, 10);
@@ -160,6 +168,84 @@ private:
 
 public:
     size_t body_seen() const noexcept { return body_seen_.load(); }
+};
+
+// Accepts a connection then never writes anything, so only a receive timeout
+// can end the request.
+class TinysilentServer {
+public:
+    bool start() {
+#if defined(_WIN32)
+        WSADATA wsa{};
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+        sock_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (sock_ == INVALID_SOCKET) return false;
+        int one = 1;
+        setsockopt(sock_, SOL_SOCKET, SO_REUSEADDR,
+                   reinterpret_cast<const char*>(&one), sizeof one);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        if (::bind(sock_, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0) return false;
+        if (::listen(sock_, 8) != 0) return false;
+        socklen_t len = sizeof addr;
+        if (::getsockname(sock_, reinterpret_cast<sockaddr*>(&addr), &len) != 0) return false;
+        port_ = ntohs(addr.sin_port);
+        thread_ = std::thread([this] { serve(); });
+        return true;
+    }
+
+    uint16_t port() const noexcept { return port_; }
+
+    void stop() {
+        if (stop_.exchange(true)) return;
+        if (sock_ != INVALID_SOCKET) {
+#if defined(_WIN32)
+            ::closesocket(sock_);
+#else
+            ::close(sock_);
+#endif
+            sock_ = INVALID_SOCKET;
+        }
+        if (thread_.joinable()) thread_.join();
+    }
+
+    ~TinysilentServer() { stop(); }
+
+private:
+    void serve() {
+        for (;;) {
+            if (stop_.load()) return;
+            sockaddr_in peer{};
+            socklen_t plen = sizeof peer;
+            auto c = ::accept(sock_, reinterpret_cast<sockaddr*>(&peer), &plen);
+            if (c == INVALID_SOCKET) return;
+            // Read the request so the client's send completes, then stay silent
+            // until the client gives up and closes.
+            char buf[4096];
+            ::recv(c, buf, sizeof buf, 0);
+            while (!stop_.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+#if defined(_WIN32)
+            closesocket(c);
+#else
+            ::close(c);
+#endif
+            return;
+        }
+    }
+
+#if defined(_WIN32)
+    SOCKET sock_{INVALID_SOCKET};
+#else
+    int sock_{-1};
+#endif
+    uint16_t port_{0};
+    std::atomic<bool> stop_{false};
+    std::thread thread_;
 };
 
 // --- tests ---
@@ -266,19 +352,128 @@ TEST_CASE("post sends body", "[client]") {
     string payload = to_string("hello-body-12345");
     req.set_body(payload);
 
+    ErrorCode err_code = ErrorCode::Unknown;
+    std::string err_msg;
     client.request(req, [&](Result<Response> r) {
         if (r) {
             ok.store(true);
             status = r.value().head().status_code;
+        } else {
+            err_code = r.error().code();
+            err_msg = std::string(r.error().describe().data(), r.error().describe().size());
         }
         done.store(true);
     });
 
     REQUIRE(wait_until([&] { return done.load(); }));
+    if (!ok.load()) {
+        std::printf("post FAILED: code=%d msg=%s\n",
+                    static_cast<int>(err_code), err_msg.c_str());
+    }
     REQUIRE(ok.load());
     REQUIRE(status == 200);
     REQUIRE(srv.body_seen() == 16);
 
+    client.shutdown();
+    srv.stop();
+}
+
+
+TEST_CASE("options validate rejects bad timeouts", "[client][timeout]") {
+    SECTION("negative dns_timeout") {
+        ClientOptions o;
+        o.dns_timeout = -std::chrono::seconds(1);
+        REQUIRE_FALSE(o.validate());
+        REQUIRE(o.validate().error().code() == ErrorCode::InvalidArgument);
+    }
+    SECTION("negative send_timeout") {
+        ClientOptions o;
+        o.send_timeout = -std::chrono::milliseconds(5);
+        REQUIRE_FALSE(o.validate());
+    }
+    SECTION("absurdly large total_timeout") {
+        ClientOptions o;
+        o.total_timeout = std::chrono::hours(24 * 365 * 100);   // 100 years
+        REQUIRE_FALSE(o.validate());
+    }
+    SECTION("defaults are valid") {
+        ClientOptions o;
+        REQUIRE(o.validate());
+    }
+}
+
+TEST_CASE("invalid options fail the request instead of running", "[client][timeout]") {
+    ClientOptions o;
+    o.dns_timeout = -std::chrono::seconds(1);
+    Client client(o);
+
+    std::atomic<bool> done{false};
+    ErrorCode code = ErrorCode::Unknown;
+    // The URL is never touched: option validation rejects first.
+    client.get("http://127.0.0.1:1/", [&](Result<Response> r) {
+        if (!r) code = r.error().code();
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    REQUIRE(code == ErrorCode::InvalidArgument);
+    client.shutdown();
+}
+
+TEST_CASE("dns timeout fails with TimeoutResolve and phase Resolve", "[client][timeout]") {
+    // A resolver that never calls back: only the DNS timer can end the request.
+    class StuckResolver final : public Resolver {
+    public:
+        const char* name() const noexcept override { return "stuck"; }
+        CancelHandle resolve(string, uint16_t, Callback) override {
+            return CancelHandle{};   // never invoked
+        }
+    };
+
+    ClientOptions o;
+    o.resolver = std::make_shared<StuckResolver>();
+    o.dns_timeout = std::chrono::milliseconds(120);
+    Client client(o);
+
+    std::atomic<bool> done{false};
+    ErrorCode code = ErrorCode::Unknown;
+    ErrorPhase phase = ErrorPhase::None;
+    client.get("http://127.0.0.1:1/", [&](Result<Response> r) {
+        if (!r) { code = r.error().code(); phase = r.error().phase(); }
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    REQUIRE(code == ErrorCode::TimeoutResolve);
+    REQUIRE(phase == ErrorPhase::Resolve);
+    client.shutdown();
+}
+
+TEST_CASE("recv timeout fires when the server never responds", "[client][timeout]") {
+    // Server accepts and then stays silent, so only recv_timeout can end it.
+    TinysilentServer srv;
+    if (!srv.start()) {
+        std::printf("SKIP: could not start the silent server\n");
+        return;
+    }
+
+    ClientOptions o;
+    o.recv_timeout = std::chrono::milliseconds(150);
+    o.total_timeout = Duration::zero();
+    Client client(o);
+
+    std::atomic<bool> done{false};
+    ErrorCode code = ErrorCode::Unknown;
+    ErrorPhase phase = ErrorPhase::None;
+    client.get(string("http://127.0.0.1:") + format("{}", srv.port()) + "/",
+               [&](Result<Response> r) {
+        if (!r) { code = r.error().code(); phase = r.error().phase(); }
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }, 5000));
+    REQUIRE(code == ErrorCode::TimeoutRecv);
+    REQUIRE(phase == ErrorPhase::Receive);
     client.shutdown();
     srv.stop();
 }

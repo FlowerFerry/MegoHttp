@@ -13,8 +13,8 @@
 #   include <arpa/inet.h>
 #endif
 
-namespace MegoHttp {
-namespace Detail {
+namespace megohttp {
+namespace detail {
 
     inline string format_ip(const sockaddr* sa) {
         char buf[INET6_ADDRSTRLEN] = {0};
@@ -131,7 +131,7 @@ namespace Detail {
         if (cb) cb(AddressList(std::move(out)));
     }
 
-} // namespace Detail
+} // namespace detail
 
     inline SystemResolverImpl::~SystemResolverImpl() = default;
 
@@ -172,7 +172,7 @@ namespace Detail {
         executor_->post([loop, host, port, cb, state]() mutable {
             if (state->is_cancelled()) return;
 
-            auto req = std::make_shared<Detail::AddrInfoRequest>();
+            auto req = std::make_shared<detail::AddrInfoRequest>();
             req->self = req;                 // self-hold until the callback clears it
             req->cb = std::move(cb);
             req->port = port;
@@ -199,7 +199,7 @@ namespace Detail {
 
             req->req.data = req.get();
             const int rc = uv_getaddrinfo(loop, &req->req,
-                                          &Detail::addrinfo_cb,
+                                          &detail::addrinfo_cb,
                                           req->host.c_str(), req->service.c_str(), &hints);
             if (rc < 0) {
                 // Starting failed: no callback will come, so release here.
@@ -216,6 +216,6 @@ namespace Detail {
         return handle;
     }
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #endif // MEGOHTTP_RESOLVER_LIBUV_IMPL_HPP_INCLUDED

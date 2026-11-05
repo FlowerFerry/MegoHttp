@@ -5,7 +5,7 @@
 #include <megohttp/error.hpp>
 #include <megohttp/string_adapter.hpp>
 
-namespace MegoHttp {
+namespace megohttp {
 
     // ---------------------------------------------------------------------------
     // IDNA (Internationalized Domain Names) support.
@@ -38,7 +38,7 @@ namespace MegoHttp {
     // because a caller may want to encode a label without the host rules.
     Result<string> punycode_encode(const string_view& utf8_label);
 
-    namespace Detail {
+    namespace detail {
 
         // Decode one UTF-8 code point starting at `i`; advances `i`.
         // Returns false on an invalid or truncated sequence.
@@ -48,9 +48,9 @@ namespace MegoHttp {
         // Returns the number of bytes written.
         size_t utf8_encode(uint32_t cp, char* out) noexcept;
 
-    } // namespace Detail
+    } // namespace detail
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #include <megohttp/idna_impl.hpp>
 

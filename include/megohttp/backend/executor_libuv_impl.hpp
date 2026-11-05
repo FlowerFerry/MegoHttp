@@ -3,7 +3,7 @@
 
 // Header-only, all definitions inline. Linked against libuv.
 
-namespace MegoHttp {
+namespace megohttp {
 namespace libuv_backend {
 
     // --- UvTimer ---------------------------------------------------------------
@@ -288,6 +288,6 @@ namespace libuv_backend {
     }
 
 } // namespace libuv_backend
-} // namespace MegoHttp
+} // namespace megohttp
 
 #endif // MEGOHTTP_EXECUTOR_LIBUV_IMPL_HPP_INCLUDED

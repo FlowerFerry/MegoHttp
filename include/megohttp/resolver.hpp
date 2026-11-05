@@ -22,7 +22,7 @@
 #   include <arpa/inet.h>
 #endif
 
-namespace MegoHttp {
+namespace megohttp {
 
     // One resolved address. Kept protocol-agnostic: no sockaddr in the public API,
     // so a consumer never has to include a platform header.
@@ -140,7 +140,7 @@ namespace MegoHttp {
     // when `host` is a name rather than a literal.
     AddressList parse_ip_literal(const string_view& host, uint16_t port);
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #if defined(MGHTTP_BACKEND_LIBUV)
 #   include <megohttp/backend/resolver_libuv.hpp>

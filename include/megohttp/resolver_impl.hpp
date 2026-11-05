@@ -5,7 +5,7 @@
 
 #include <utility>
 
-namespace MegoHttp {
+namespace megohttp {
 
     // --- SystemResolver ------------------------------------------------------
     // The body lives in backend/resolver_<backend>.hpp because the async lookup
@@ -142,6 +142,6 @@ namespace MegoHttp {
         return handle;
     }
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #endif // MEGOHTTP_RESOLVER_IMPL_HPP_INCLUDED

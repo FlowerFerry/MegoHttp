@@ -16,7 +16,7 @@
 #include <utility>
 #include <variant>
 
-namespace MegoHttp {
+namespace megohttp {
 
     // MegoHttp-specific codes live in their own numeric band so they can never
     // collide with system/POSIX errno values or with any other library's band.
@@ -270,7 +270,7 @@ namespace MegoHttp {
         std::optional<Error> error_;
     };
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #include <megohttp/error_impl.hpp>
 

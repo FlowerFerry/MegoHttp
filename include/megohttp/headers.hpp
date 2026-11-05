@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-namespace MegoHttp {
+namespace megohttp {
 
 
     // Ordered multimap of header fields.
@@ -69,7 +69,7 @@ namespace MegoHttp {
     bool is_valid_header_name(string_view name) noexcept;
     bool is_valid_header_value(string_view value) noexcept;
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #include <megohttp/headers_impl.hpp>
 

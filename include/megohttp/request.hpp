@@ -13,7 +13,7 @@
 #include <optional>
 #include <vector>
 
-namespace MegoHttp {
+namespace megohttp {
 
     class BodySource;
 
@@ -75,7 +75,7 @@ namespace MegoHttp {
         std::unique_ptr<Impl> impl_;
     };
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #include <megohttp/request_impl.hpp>
 

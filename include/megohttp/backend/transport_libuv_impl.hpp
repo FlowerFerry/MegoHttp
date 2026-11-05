@@ -11,8 +11,8 @@
 #   include <arpa/inet.h>
 #endif
 
-namespace MegoHttp {
-namespace Detail {
+namespace megohttp {
+namespace detail {
 
     // Builds a sockaddr from a ResolvedAddress. Returns the initialised size, or 0
     // when the family/byte-count combination is unusable.
@@ -35,7 +35,7 @@ namespace Detail {
         return 0;
     }
 
-} // namespace Detail
+} // namespace detail
 
     inline TcpStream::TcpStream(std::shared_ptr<Executor> executor,
                                 const ResolvedAddress& address,
@@ -71,7 +71,7 @@ namespace Detail {
         tcp_.data = this;
 
         sockaddr_storage ss{};
-        if (Detail::to_sockaddr(address_, &ss) == 0) {
+        if (detail::to_sockaddr(address_, &ss) == 0) {
             if (auto cb = std::move(ready_cb_)) {
                 cb(VoidResult{Error{ErrorCode::InvalidArgument, ErrorPhase::TcpConnect,
                                     string("unusable resolved address")}});
@@ -297,7 +297,7 @@ namespace Detail {
     // whole race shares ONE deadline; a late success from a loser is closed rather
     // than leaked.
     // ---------------------------------------------------------------------------
-    namespace Detail {
+    namespace detail {
 
         struct RaceState {
             std::shared_ptr<Executor> executor;
@@ -377,7 +377,7 @@ namespace Detail {
             return out;
         }
 
-    } // namespace Detail
+    } // namespace detail
 
     inline void connect_race(
         std::shared_ptr<Executor> executor,
@@ -393,23 +393,23 @@ namespace Detail {
             return;
         }
 
-        auto st = std::make_shared<Detail::RaceState>();
+        auto st = std::make_shared<detail::RaceState>();
         st->self_hold = st;        // released in race_finish(); see RaceState
         st->executor = executor;
         st->options = options;
         st->on_done = std::move(on_done);
-        st->addresses = Detail::interleave_by_family(std::move(addresses), options.preference);
+        st->addresses = detail::interleave_by_family(std::move(addresses), options.preference);
         st->remaining.store(st->addresses.size());
 
         // ONE deadline for the whole race: the connection phase gets a single
         // budget, not a fresh one per address.
-        std::weak_ptr<Detail::RaceState> weak = st;
+        std::weak_ptr<detail::RaceState> weak = st;
         st->deadline_timer = executor->schedule_after(
             options.connect_timeout,
             [weak] {
                 auto s = weak.lock();
                 if (!s) return;
-                Detail::race_finish(s, Error{ErrorCode::ConnectTimeout,
+                detail::race_finish(s, Error{ErrorCode::ConnectTimeout,
                                              ErrorPhase::TcpConnect,
                                              string("connection race timed out")});
                 // A timeout retires the race, but in-flight attempts still have to
@@ -447,14 +447,14 @@ namespace Detail {
                                 std::lock_guard<std::mutex> lk(s2->m);
                                 e = s2->last_error;
                             }
-                            Detail::race_finish(s2, e);
+                            detail::race_finish(s2, e);
                             s2->self_hold.reset();
                         }
                         return;
                     }
                     std::shared_ptr<AsyncByteStream> as_stream = stream;
                     const bool last = (s2->remaining.fetch_sub(1) == 1);
-                    Detail::race_finish(s2, std::move(as_stream));
+                    detail::race_finish(s2, std::move(as_stream));
                     // Released here, by the last attempt, not inside race_finish:
                     // a late attempt must still find `st` alive to reach the
                     // loser path above.
@@ -470,6 +470,6 @@ namespace Detail {
         }
     }
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #endif // MEGOHTTP_TRANSPORT_LIBUV_IMPL_HPP_INCLUDED

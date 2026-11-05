@@ -7,19 +7,19 @@
 #include <cstring>
 
 int run_tu_a();
-MegoHttp::string tu_a_make();
+megohttp::string tu_a_make();
 
 // Called from A with a value A built.
-int tu_b_check(const MegoHttp::string& s) {
+int tu_b_check(const megohttp::string& s) {
     if (s.size() != 6) return 10;
     if (std::memcmp(s.data(), "from-a", 6) != 0) return 11;
     return 0;
 }
 
 // Called from main; also builds a string A consumes via tu_b_check.
-MegoHttp::string tu_b_make() {
-    MegoHttp::string_builder b;
-    MegoHttp::Detail::sb_append(b, "from-b");
+megohttp::string tu_b_make() {
+    megohttp::string_builder b;
+    megohttp::detail::sb_append(b, "from-b");
     return b.release();
 }
 
@@ -31,13 +31,13 @@ int main() {
     }
 
     // B's own use of the same inline definitions.
-    auto r = MegoHttp::parse_url("https://tu-b.example.com/");
+    auto r = megohttp::parse_url("https://tu-b.example.com/");
     if (!r || r.value().port != 443) {
         std::printf("FAIL multi-TU: tu_b url parse\n");
         return 2;
     }
 
-    MegoHttp::Headers h;
+    megohttp::Headers h;
     h.add("Content-Length", "42");
     auto cl = h.get_uint("content-length");
     if (!cl || *cl != 42) {
@@ -45,7 +45,7 @@ int main() {
         return 3;
     }
 
-    MegoHttp::string sb = tu_b_make();
+    megohttp::string sb = tu_b_make();
     if (sb.size() != 6 || std::memcmp(sb.data(), "from-b", 6) != 0) {
         std::printf("FAIL multi-TU: tu_b make\n");
         return 4;

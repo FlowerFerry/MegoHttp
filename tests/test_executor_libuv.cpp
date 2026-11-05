@@ -9,8 +9,8 @@
 #include <thread>
 #include <vector>
 
-using namespace MegoHttp;
-using namespace MegoHttp::libuv_backend;
+using namespace megohttp;
+using namespace megohttp::libuv_backend;
 
 
 // Waits for a predicate with a bounded timeout, so a hang fails instead of hanging.

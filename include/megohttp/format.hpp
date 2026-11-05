@@ -32,8 +32,8 @@
 // (small/medium/large, buffer takeover) rather than this library guessing.
 // ---------------------------------------------------------------------------
 
-namespace MegoHttp {
-namespace Detail {
+namespace megohttp {
+namespace detail {
 
     // Convert any fmt-formattable argument into an owning `string`.
     //
@@ -51,14 +51,14 @@ namespace Detail {
 #endif
     }
 
-} // namespace Detail
+} // namespace detail
 
     // Public spelling, so callers and the library share one entry point.
     template<typename... Args>
     inline string format(fmt::format_string<Args...> f, Args&&... args) {
-        return Detail::format_string(f, std::forward<Args>(args)...);
+        return detail::format_string(f, std::forward<Args>(args)...);
     }
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #endif // MEGOHTTP_FORMAT_HPP_INCLUDED

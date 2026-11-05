@@ -25,7 +25,7 @@
 #include <memory>
 #include <thread>
 
-namespace MegoHttp {
+namespace megohttp {
 namespace asio_backend {
 
     class AsioExecutor final : public Executor {
@@ -79,7 +79,7 @@ namespace asio_backend {
     // is for libuv, so the shared layers do not branch on backend.
     using asio_backend::AsioExecutor;
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #include <megohttp/backend/executor_asio_impl.hpp>
 

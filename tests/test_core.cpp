@@ -16,12 +16,12 @@
 #include <cstdio>
 #include <cstring>
 
-using namespace MegoHttp;
+using namespace megohttp;
 
 
 
 static bool sv_eq(string_view a, const char* b) {
-    const size_t n = Detail::to_size(a);
+    const size_t n = detail::to_size(a);
     return n == std::strlen(b) && std::memcmp(a.data(), b, n) == 0;
 }
 static bool s_eq(const string& a, const char* b) {

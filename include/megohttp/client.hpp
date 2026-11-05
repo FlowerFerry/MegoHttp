@@ -19,7 +19,7 @@
 #include <functional>
 #include <memory>
 
-namespace MegoHttp {
+namespace megohttp {
 
     // ---------------------------------------------------------------------------
     // ClientOptions
@@ -31,7 +31,9 @@ namespace MegoHttp {
     struct ClientOptions {
         Duration dns_timeout{std::chrono::seconds(30)};
         Duration connect_timeout{std::chrono::seconds(30)};
-        Duration total_timeout{std::chrono::seconds(0)};   // 0 = disabled
+        Duration send_timeout{std::chrono::seconds(30)};     // 0 = disabled
+        Duration recv_timeout{std::chrono::seconds(30)};     // 0 = disabled, whole body
+        Duration total_timeout{std::chrono::seconds(0)};     // 0 = disabled, whole request
 
         // Response body cap for buffered mode. 0 = unlimited.
         uint64_t max_response_body{64ULL * 1024 * 1024};
@@ -48,6 +50,33 @@ namespace MegoHttp {
         std::shared_ptr<Executor> executor;
 
         string user_agent{"MegoHttp/0.1"};
+
+        // Rejects any duration that cannot be represented as a timer deadline.
+        // Called by the Client constructor so a bad option fails immediately
+        // instead of producing an overflowing deadline much later (S2.3-03).
+        VoidResult validate() const {
+            const auto max_d = std::chrono::duration_cast<Duration>(
+                std::chrono::hours(24 * 365 * 20));   // 20 years, far beyond any use
+            struct Check { const char* name; Duration d; };
+            const Check checks[] = {
+                {"dns_timeout", dns_timeout},
+                {"connect_timeout", connect_timeout},
+                {"send_timeout", send_timeout},
+                {"recv_timeout", recv_timeout},
+                {"total_timeout", total_timeout},
+            };
+            for (const auto& c : checks) {
+                if (c.d < Duration::zero()) {
+                    return Error{ErrorCode::InvalidArgument, ErrorPhase::None,
+                                 format("{} must not be negative", c.name)};
+                }
+                if (c.d > max_d) {
+                    return Error{ErrorCode::InvalidArgument, ErrorPhase::None,
+                                 format("{} exceeds the supported maximum", c.name)};
+                }
+            }
+            return VoidResult{};
+        }
     };
 
     // ---------------------------------------------------------------------------
@@ -88,7 +117,7 @@ namespace MegoHttp {
         std::unique_ptr<Impl> impl_;
     };
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #include <megohttp/client_impl.hpp>
 

@@ -12,7 +12,7 @@
 #include <mutex>
 #include <vector>
 
-namespace MegoHttp {
+namespace megohttp {
 
     // Monotonic clock, used for every timeout and backoff computation.
     // Deliberately not steady_clock directly: tests need to inject a clock.
@@ -115,6 +115,6 @@ namespace MegoHttp {
         std::shared_ptr<CancelState> state_;
     };
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #endif // MEGOHTTP_EXECUTOR_HPP_INCLUDED

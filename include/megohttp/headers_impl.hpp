@@ -7,7 +7,7 @@
 #include <cstring>
 #include <string_view>
 
-namespace MegoHttp {
+namespace megohttp {
 
     // RFC 7230 tchar: ALPHA / DIGIT / "!" / "#" / "$" / "%" / "&" / "'" / "*"
     // / "+" / "-" / "." / "^" / "_" / "`" / "|" / "~"
@@ -64,7 +64,7 @@ namespace MegoHttp {
         string new_value = to_string(value);
         bool replaced = false;
         for (auto it = fields_.begin(); it != fields_.end();) {
-            if (Detail::ascii_iequals(to_view(it->first), name)) {
+            if (detail::ascii_iequals(to_view(it->first), name)) {
                 if (!replaced) {
                     it->second = new_value;
                     replaced = true;
@@ -84,7 +84,7 @@ namespace MegoHttp {
     inline bool Headers::remove(string_view name) {
         bool erased = false;
         for (auto it = fields_.begin(); it != fields_.end();) {
-            if (Detail::ascii_iequals(to_view(it->first), name)) {
+            if (detail::ascii_iequals(to_view(it->first), name)) {
                 it = fields_.erase(it);
                 erased = true;
             } else {
@@ -96,14 +96,14 @@ namespace MegoHttp {
 
     inline bool Headers::contains(string_view name) const noexcept {
         for (const auto& f : fields_) {
-            if (Detail::ascii_iequals(to_view(f.first), name)) return true;
+            if (detail::ascii_iequals(to_view(f.first), name)) return true;
         }
         return false;
     }
 
     inline std::optional<string_view> Headers::get(string_view name) const noexcept {
         for (const auto& f : fields_) {
-            if (Detail::ascii_iequals(to_view(f.first), name)) return to_view(f.second);
+            if (detail::ascii_iequals(to_view(f.first), name)) return to_view(f.second);
         }
         return std::nullopt;
     }
@@ -111,7 +111,7 @@ namespace MegoHttp {
     inline std::vector<string_view> Headers::get_all(string_view name) const {
         std::vector<string_view> out;
         for (const auto& f : fields_) {
-            if (Detail::ascii_iequals(to_view(f.first), name)) out.push_back(to_view(f.second));
+            if (detail::ascii_iequals(to_view(f.first), name)) out.push_back(to_view(f.second));
         }
         return out;
     }
@@ -142,6 +142,6 @@ namespace MegoHttp {
         return total;
     }
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #endif // MEGOHTTP_HEADERS_IMPL_HPP_INCLUDED

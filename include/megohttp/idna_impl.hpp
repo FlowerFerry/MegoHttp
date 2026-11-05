@@ -6,8 +6,8 @@
 #include <cstring>
 #include <vector>
 
-namespace MegoHttp {
-namespace Detail {
+namespace megohttp {
+namespace detail {
 
     inline bool utf8_next(const char* p, size_t n, size_t& i, uint32_t& cp) noexcept {
         if (i >= n) return false;
@@ -62,7 +62,7 @@ namespace Detail {
         return 4;
     }
 
-} // namespace Detail
+} // namespace detail
 
     inline bool is_ascii(const string_view& text) noexcept {
         const size_t n = static_cast<size_t>(text.size());
@@ -73,7 +73,7 @@ namespace Detail {
         return true;
     }
 
-    namespace Detail {
+    namespace detail {
 
         // RFC 3492 parameters (Punycode).
         constexpr uint32_t kBase = 36;
@@ -101,7 +101,7 @@ namespace Detail {
             return static_cast<char>(d < 26 ? d + 'a' : d - 26 + '0');
         }
 
-    } // namespace Detail
+    } // namespace detail
 
     inline Result<string> punycode_encode(const string_view& utf8_label) {
         const size_t n = static_cast<size_t>(utf8_label.size());
@@ -116,7 +116,7 @@ namespace Detail {
         size_t i = 0;
         while (i < n) {
             uint32_t cp = 0;
-            if (!Detail::utf8_next(p, n, i, cp)) {
+            if (!detail::utf8_next(p, n, i, cp)) {
                 return Error{ErrorCode::InvalidArgument, "label is not valid UTF-8"};
             }
             cps.push_back(cp);
@@ -126,7 +126,7 @@ namespace Detail {
 
         // Basic code points are copied through verbatim.
         for (uint32_t cp : cps) {
-            if (cp < 0x80) Detail::sb_append(out, static_cast<char>(cp));
+            if (cp < 0x80) detail::sb_append(out, static_cast<char>(cp));
         }
         size_t handled = out.size();
         const size_t basic_count = handled;
@@ -135,12 +135,12 @@ namespace Detail {
         // part to follow. A label that is entirely ASCII encodes to itself with no
         // trailing '-', which is what makes idna_encode idempotent.
         if (basic_count > 0 && basic_count < cps.size()) {
-            Detail::sb_append(out, '-');
+            detail::sb_append(out, '-');
         }
 
-        uint32_t n_val = Detail::kInitialN;
+        uint32_t n_val = detail::kInitialN;
         uint32_t delta = 0;
-        uint32_t bias = Detail::kInitialBias;
+        uint32_t bias = detail::kInitialBias;
 
         while (handled < cps.size()) {
             // Smallest code point >= n_val.
@@ -152,7 +152,7 @@ namespace Detail {
                 return Error{ErrorCode::InvalidArgument, "punycode: no code point left"};
             }
             // Overflow check from RFC 3492 section 6.3.
-            if (static_cast<uint64_t>(m - n_val) > (Detail::kMaxInt - delta) /
+            if (static_cast<uint64_t>(m - n_val) > (detail::kMaxInt - delta) /
                                                       static_cast<uint64_t>(handled + 1)) {
                 return Error{ErrorCode::InvalidArgument, "punycode: overflow"};
             }
@@ -161,25 +161,25 @@ namespace Detail {
 
             for (uint32_t cp : cps) {
                 if (cp < n_val) {
-                    if (delta == Detail::kMaxInt) {
+                    if (delta == detail::kMaxInt) {
                         return Error{ErrorCode::InvalidArgument, "punycode: overflow"};
                     }
                     ++delta;
                 }
                 if (cp == n_val) {
                     uint32_t q = delta;
-                    for (uint32_t k = Detail::kBase;; k += Detail::kBase) {
+                    for (uint32_t k = detail::kBase;; k += detail::kBase) {
                         const uint32_t t =
-                            (k <= bias) ? Detail::kTMin
-                                        : (k >= bias + Detail::kTMax ? Detail::kTMax
+                            (k <= bias) ? detail::kTMin
+                                        : (k >= bias + detail::kTMax ? detail::kTMax
                                                                      : k - bias);
                         if (q < t) break;
-                        Detail::sb_append(out, Detail::encode_digit(
-                            t + (q - t) % (Detail::kBase - t)));
-                        q = (q - t) / (Detail::kBase - t);
+                        detail::sb_append(out, detail::encode_digit(
+                            t + (q - t) % (detail::kBase - t)));
+                        q = (q - t) / (detail::kBase - t);
                     }
-                    Detail::sb_append(out, Detail::encode_digit(q));
-                    bias = Detail::adapt(delta, static_cast<uint32_t>(handled + 1),
+                    detail::sb_append(out, detail::encode_digit(q));
+                    bias = detail::adapt(delta, static_cast<uint32_t>(handled + 1),
                                          handled == basic_count);
                     delta = 0;
                     ++handled;
@@ -232,15 +232,15 @@ namespace Detail {
             }
             const string_view label(p + label_start,
                                     static_cast<string_view::size_type>(len));
-            if (!first) Detail::sb_append(out, '.');
+            if (!first) detail::sb_append(out, '.');
 
             if (is_ascii(label)) {
-                Detail::sb_append(out, label);
+                detail::sb_append(out, label);
             } else {
                 auto encoded = punycode_encode(label);
                 if (!encoded) return encoded.error();
-                Detail::sb_append(out, "xn--");
-                Detail::sb_append(out, to_view(encoded.value()));
+                detail::sb_append(out, "xn--");
+                detail::sb_append(out, to_view(encoded.value()));
             }
 
             first = false;
@@ -269,6 +269,6 @@ namespace Detail {
         return result;
     }
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #endif // MEGOHTTP_IDNA_IMPL_HPP_INCLUDED

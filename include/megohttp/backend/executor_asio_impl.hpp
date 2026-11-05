@@ -8,7 +8,7 @@
 #include <chrono>
 #include <thread>
 
-namespace MegoHttp {
+namespace megohttp {
 namespace asio_backend {
 
     // Timer over asio::steady_timer.
@@ -133,6 +133,6 @@ namespace asio_backend {
     }
 
 } // namespace asio_backend
-} // namespace MegoHttp
+} // namespace megohttp
 
 #endif

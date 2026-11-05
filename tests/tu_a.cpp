@@ -7,21 +7,21 @@
 #include <megohttp/headers.hpp>
 #include <megohttp/error.hpp>
 
-MegoHttp::string tu_a_make();
-int tu_b_check(const MegoHttp::string& s);
+megohttp::string tu_a_make();
+int tu_b_check(const megohttp::string& s);
 
 // Same headers used here, producing values B also constructs.
 int run_tu_a() {
-    auto r = MegoHttp::parse_url("http://tu-a.example.com:8080/p?x=1");
+    auto r = megohttp::parse_url("http://tu-a.example.com:8080/p?x=1");
     if (!r) return 1;
     if (r.value().port != 8080) return 2;
 
-    MegoHttp::Headers h;
+    megohttp::Headers h;
     h.add("X-TU", "a");
     h.add("X-TU", "b");
     if (h.get_all("x-tu").size() != 2) return 3;
 
-    MegoHttp::Error e{MegoHttp::ErrorCode::HttpChunkError};
+    megohttp::Error e{megohttp::ErrorCode::HttpChunkError};
     if (e.describe().empty()) return 4;
 
     // Cross-TU: a value built here is consumed by B, and vice versa.
@@ -29,8 +29,8 @@ int run_tu_a() {
     return 0;
 }
 
-MegoHttp::string tu_a_make() {
-    MegoHttp::string_builder b;
-    MegoHttp::Detail::sb_append(b, "from-a");
+megohttp::string tu_a_make() {
+    megohttp::string_builder b;
+    megohttp::detail::sb_append(b, "from-a");
     return b.release();
 }

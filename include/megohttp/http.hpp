@@ -12,7 +12,7 @@
 #include <cstdint>
 #include <optional>
 
-namespace MegoHttp {
+namespace megohttp {
 
     enum class Method {
         Get, Head, Post, Put, Delete, Patch, Options, Trace, Connect,
@@ -187,7 +187,7 @@ namespace MegoHttp {
 
     } // namespace http_detail
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #include <megohttp/http_impl.hpp>
 

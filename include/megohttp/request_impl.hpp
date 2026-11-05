@@ -3,7 +3,7 @@
 
 // Included at the end of request.hpp. Header-only: every definition is inline.
 
-namespace MegoHttp {
+namespace megohttp {
 
     class Request::Impl {
     public:
@@ -100,6 +100,6 @@ namespace MegoHttp {
         return impl_->body;
     }
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #endif // MEGOHTTP_REQUEST_IMPL_HPP_INCLUDED

@@ -3,7 +3,7 @@
 
 // Included at the end of response.hpp. Header-only: every definition is inline.
 
-namespace MegoHttp {
+namespace megohttp {
 
     class Response::Impl {
     public:
@@ -63,6 +63,6 @@ namespace MegoHttp {
         impl_->wire_length = wire_length;
     }
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #endif // MEGOHTTP_RESPONSE_IMPL_HPP_INCLUDED

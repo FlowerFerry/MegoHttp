@@ -20,7 +20,7 @@
 
 #include <memory>
 
-namespace MegoHttp {
+namespace megohttp {
 
     class SystemResolverImpl {
     public:
@@ -34,7 +34,7 @@ namespace MegoHttp {
         std::shared_ptr<Executor> executor_;
     };
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #include <megohttp/backend/resolver_asio_impl.hpp>
 

@@ -19,7 +19,7 @@
 #   include <asio/io_context.hpp>
 #endif
 
-namespace MegoHttp {
+namespace megohttp {
 
     // ---------------------------------------------------------------------------
     // AsyncByteStream: the single abstraction the protocol layer talks to.
@@ -160,7 +160,7 @@ namespace MegoHttp {
         const ConnectOptions& options,
         std::function<void(Result<std::shared_ptr<AsyncByteStream>>)> on_done);
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 // --- backend implementation -----------------------------------------------
 #if defined(MGHTTP_BACKEND_LIBUV)

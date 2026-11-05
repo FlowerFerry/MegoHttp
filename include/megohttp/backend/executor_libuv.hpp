@@ -14,7 +14,7 @@
 #include <mutex>
 #include <thread>
 
-namespace MegoHttp {
+namespace megohttp {
 namespace libuv_backend {
 
     // libuv-based executor.
@@ -170,7 +170,7 @@ namespace libuv_backend {
     };
 
 } // namespace libuv_backend
-} // namespace MegoHttp
+} // namespace megohttp
 
 #include <megohttp/backend/executor_libuv_impl.hpp>
 

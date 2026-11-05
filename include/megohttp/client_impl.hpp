@@ -20,9 +20,9 @@
 #include <mutex>
 #include <vector>
 
-namespace MegoHttp {
+namespace megohttp {
 
-    namespace Detail {
+    namespace detail {
 
         // Creates the default executor for the compiled backend.
         inline std::shared_ptr<Executor> make_default_executor() {
@@ -104,6 +104,8 @@ namespace MegoHttp {
 
             std::atomic<bool> finished{false};
             std::shared_ptr<Timer> total_timer;
+            std::shared_ptr<Timer> dns_timer;
+            CancelHandle dns_cancel;
 
             RequestPhase phase{RequestPhase::Idle};
 
@@ -117,6 +119,8 @@ namespace MegoHttp {
             void finish(Result<Response> result) {
                 if (finished.exchange(true)) return;
                 if (total_timer) total_timer->cancel();
+                if (dns_timer) dns_timer->cancel();
+                dns_cancel.cancel();   // stop a late DNS answer from firing the callback
                 auto cb = std::move(on_complete);
                 // Release the hold before the callback so a callback that
                 // re-enters does not resurrect this state. The stream is closed
@@ -159,9 +163,41 @@ namespace MegoHttp {
                 parser_ = std::move(p);
             }
 
+            // send_timeout covers the whole write of head + body: one deadline from
+            // the first byte to the last (S2.3-02).
+            void arm_send_timer() {
+                const auto d = state_->options.send_timeout;
+                if (d == Duration::zero()) return;
+                auto self = shared_from_this();
+                send_timer_ = state_->executor->schedule_after(d, [self] {
+                    self->fail(Error{ErrorCode::TimeoutSend, ErrorPhase::Send,
+                                     string("request send timed out")});
+                });
+            }
+
+            void disarm_send_timer() {
+                if (send_timer_) { send_timer_->cancel(); send_timer_.reset(); }
+            }
+
+            // recv_timeout covers the whole response (head + body), not each read.
+            void arm_recv_timer() {
+                const auto d = state_->options.recv_timeout;
+                if (d == Duration::zero()) return;
+                auto self = shared_from_this();
+                recv_timer_ = state_->executor->schedule_after(d, [self] {
+                    self->fail(Error{ErrorCode::TimeoutRecv, ErrorPhase::Receive,
+                                     string("response receive timed out")});
+                });
+            }
+
+            void disarm_recv_timer() {
+                if (recv_timer_) { recv_timer_->cancel(); recv_timer_.reset(); }
+            }
+
             // Start by sending the encoded head.
             void start(string head) {
-                state_->phase = Detail::RequestPhase::SendHead;
+                state_->phase = detail::RequestPhase::SendHead;
+                arm_send_timer();
                 auto self = shared_from_this();
                 auto stream = state_->stream;
                 stream->async_write(
@@ -174,10 +210,12 @@ namespace MegoHttp {
 
             // Send body if present, then start reading the response.
             void send_body() {
-                state_->phase = Detail::RequestPhase::SendBody;
+                state_->phase = detail::RequestPhase::SendBody;
                 auto self = shared_from_this();
                 auto stream = state_->stream;
                 if (!state_->request.has_body() || state_->request.body_bytes().empty()) {
+                    disarm_send_timer();
+                    arm_recv_timer();
                     read_more();
                     return;
                 }
@@ -185,6 +223,8 @@ namespace MegoHttp {
                 stream->async_write(body.data(), body.size(),
                     [self](Result<size_t> w) {
                         if (!w) { self->fail(w.error()); return; }
+                        self->disarm_send_timer();
+                        self->arm_recv_timer();
                         self->read_more();
                     });
             }
@@ -232,6 +272,7 @@ namespace MegoHttp {
 
             VoidResult on_complete() override {
                 complete_ = true;
+                disarm_recv_timer();
                 auto response = sink_ ? sink_->finish() : Response{};
                 state_->finish(std::move(response));
                 return VoidResult{};
@@ -260,7 +301,7 @@ namespace MegoHttp {
                             return;
                         }
 
-                        self->state_->phase = Detail::RequestPhase::Receive;
+                        self->state_->phase = detail::RequestPhase::Receive;
                         auto res = self->parser_->feed(self->buf_, n);
                         if (!res) { self->fail(res.error()); return; }
                         if (self->complete_) return;
@@ -269,11 +310,15 @@ namespace MegoHttp {
             }
 
             void fail(const Error& e) {
+                disarm_send_timer();
+                disarm_recv_timer();
                 state_->fail(e);
             }
 
             std::shared_ptr<RequestState> state_;
             std::unique_ptr<ResponseParser> parser_;
+            std::shared_ptr<Timer> send_timer_;
+            std::shared_ptr<Timer> recv_timer_;
             std::unique_ptr<BufferSink> sink_;
             bool complete_{false};
             uint8_t buf_[16 * 1024] = {0};
@@ -296,7 +341,7 @@ namespace MegoHttp {
                                        to_view(url.request_target()), headers);
         }
 
-    } // namespace Detail
+    } // namespace detail
 
     // ---------------------------------------------------------------------------
     // Client::Impl
@@ -304,9 +349,14 @@ namespace MegoHttp {
     class Client::Impl {
     public:
         explicit Impl(ClientOptions opts) : options(std::move(opts)) {
+            // A bad timeout is a programming error; surface it on the first request
+            // instead of letting an overflowing deadline fire at a random time.
+            auto valid = options.validate();
+            if (!valid) options_error = valid.error();
+
             executor = options.executor;
             owns_executor = (executor == nullptr);
-            if (!executor) executor = Detail::make_default_executor();
+            if (!executor) executor = detail::make_default_executor();
 
             resolver = options.resolver;
             if (!resolver && executor) {
@@ -319,14 +369,14 @@ namespace MegoHttp {
         void shutdown() {
             bool expected = false;
             if (!stopped.compare_exchange_strong(expected, true)) return;
-            if (owns_executor) Detail::shutdown_executor(executor);
+            if (owns_executor) detail::shutdown_executor(executor);
         }
 
         void submit(const Request& req,
                     Client::ResponseCallback on_complete,
                     const CancelHandle& handle,
                     std::shared_ptr<CancelState> cancel_state) {
-            auto st = std::make_shared<Detail::RequestState>();
+            auto st = std::make_shared<detail::RequestState>();
             st->self_hold = st;
             st->executor = executor;
             st->resolver = resolver;
@@ -345,7 +395,7 @@ namespace MegoHttp {
 
             // Total timeout covers the WHOLE logical request (spec 8.2).
             if (options.total_timeout != Duration::zero()) {
-                std::weak_ptr<Detail::RequestState> weak = st;
+                std::weak_ptr<detail::RequestState> weak = st;
                 st->total_timer = executor->schedule_after(options.total_timeout, [weak] {
                     auto s = weak.lock();
                     if (!s) return;
@@ -356,7 +406,7 @@ namespace MegoHttp {
 
             // Cancellation is observed at the executor: the request is retired on
             // the loop thread, never from the cancelling caller's thread.
-            std::weak_ptr<Detail::RequestState> weak = st;
+            std::weak_ptr<detail::RequestState> weak = st;
             cancel_state->on_cancel([this, weak] {
                 auto s = weak.lock();
                 if (!s) return;
@@ -373,10 +423,10 @@ namespace MegoHttp {
     private:
         // Static: it runs from a posted handler, so it must not depend on `this`
         // staying alive (a Client may be destroyed while a request is in flight).
-        static void begin(const std::shared_ptr<Detail::RequestState>& st) {
+        static void begin(const std::shared_ptr<detail::RequestState>& st) {
             if (st->finished.load()) return;
 
-            st->phase = Detail::RequestPhase::UrlParse;
+            st->phase = detail::RequestPhase::UrlParse;
             auto parsed = parse_url(st->request.url());
             if (!parsed) { st->finish(parsed.error()); return; }
             Url url = std::move(parsed.value());
@@ -391,18 +441,33 @@ namespace MegoHttp {
             }
             st->request.set_parsed_url(url);
 
-            st->phase = Detail::RequestPhase::BuildHead;
-            auto head = Detail::build_request_head(st->request, url);
+            st->phase = detail::RequestPhase::BuildHead;
+            auto head = detail::build_request_head(st->request, url);
             if (!head) { st->finish(head.error()); return; }
 
-            std::weak_ptr<Detail::RequestState> weak = st;
+            std::weak_ptr<detail::RequestState> weak = st;
             const string host = url.host;
             const uint16_t port = url.port;
-            st->phase = Detail::RequestPhase::Resolve;
-            st->resolver->resolve(host, port, [weak, head = std::move(head.value())](
+            st->phase = detail::RequestPhase::Resolve;
+
+            // DNS timeout: covers the resolve stage only. Cancelling the resolve
+            // handle tells the resolver to drop its late answer (S2.3-02).
+            if (st->options.dns_timeout != Duration::zero()) {
+                std::weak_ptr<detail::RequestState> tw = st;
+                st->dns_timer = st->executor->schedule_after(st->options.dns_timeout, [tw] {
+                    auto s = tw.lock();
+                    if (!s || s->finished.load()) return;
+                    s->dns_cancel.cancel();
+                    s->finish(Error{ErrorCode::TimeoutResolve, ErrorPhase::Resolve,
+                                    string("DNS resolution timed out")});
+                });
+            }
+
+            auto dns_handle = st->resolver->resolve(host, port, [weak, head = std::move(head.value())](
                                            Result<AddressList> resolved) mutable {
                 auto s = weak.lock();
                 if (!s || s->finished.load()) return;
+                if (s->dns_timer) { s->dns_timer->cancel(); s->dns_timer.reset(); }
 
                 if (!resolved) { s->finish(resolved.error()); return; }
                 if (resolved.value().empty()) {
@@ -411,12 +476,12 @@ namespace MegoHttp {
                     return;
                 }
 
-                s->phase = Detail::RequestPhase::Connect;
+                s->phase = detail::RequestPhase::Connect;
                 ConnectOptions copts;
                 copts.connect_timeout = s->options.connect_timeout;
                 auto addresses = std::move(resolved.value());
 
-                std::weak_ptr<Detail::RequestState> w2 = s;
+                std::weak_ptr<detail::RequestState> w2 = s;
                 connect_race(s->executor, std::move(addresses), copts,
                     [w2, head = std::move(head)](Result<std::shared_ptr<AsyncByteStream>> conn) mutable {
                         auto s2 = w2.lock();
@@ -431,15 +496,16 @@ namespace MegoHttp {
                         begin_exchange(s2, std::move(head));
                     });
             });
+            st->dns_cancel = dns_handle;
         }
 
         // Free of `this` so it can run from a detached async callback: the
         // request state carries everything the exchange needs.
-        static void begin_exchange(const std::shared_ptr<Detail::RequestState>& st, string head) {
+        static void begin_exchange(const std::shared_ptr<detail::RequestState>& st, string head) {
             // Order matters: the Exchange must exist before the parser (which
             // stores a reference to it), and the Exchange must keep itself alive
             // while the exchange is in flight. It does so via shared_from_this().
-            auto exchange = std::make_shared<Detail::Exchange>(st);
+            auto exchange = std::make_shared<detail::Exchange>(st);
             exchange->set_parser(std::make_unique<ResponseParser>(
                 *exchange, st->options.parser_limits));
             exchange->start(std::move(head));
@@ -447,6 +513,7 @@ namespace MegoHttp {
 
     public:
         ClientOptions options;
+        std::optional<Error> options_error;   // set when ClientOptions::validate() failed
         std::shared_ptr<Executor> executor;
         std::shared_ptr<Resolver> resolver;
         bool owns_executor{false};
@@ -469,6 +536,10 @@ namespace MegoHttp {
     inline CancelHandle Client::request(const Request& req, ResponseCallback on_complete) {
         auto state = std::make_shared<CancelState>(impl_->executor);
         CancelHandle handle(state);
+        if (impl_->options_error) {
+            if (on_complete) on_complete(Result<Response>(*impl_->options_error));
+            return handle;
+        }
         if (impl_->stopped.load()) {
             if (on_complete) {
                 on_complete(Error{ErrorCode::Cancelled, ErrorPhase::None,
@@ -489,6 +560,6 @@ namespace MegoHttp {
 
     inline const ClientOptions& Client::options() const noexcept { return impl_->options; }
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #endif // MEGOHTTP_CLIENT_IMPL_HPP_INCLUDED

@@ -28,8 +28,8 @@
 #   include <unistd.h>
 #endif
 
-using namespace MegoHttp;
-using namespace MegoHttp::libuv_backend;
+using namespace megohttp;
+using namespace megohttp::libuv_backend;
 
 
 template<typename F>

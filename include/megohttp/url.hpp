@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <optional>
 
-namespace MegoHttp {
+namespace megohttp {
 
     enum class Scheme {
         Unknown = 0,   // parse failure placeholder; never produced for a valid URL
@@ -71,7 +71,7 @@ namespace MegoHttp {
     // True when `text` is an IPv4 or IPv6 literal (no DNS needed).
     bool is_ip_literal(string_view host, bool* out_is_ipv6 = nullptr) noexcept;
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #include <megohttp/url_impl.hpp>
 

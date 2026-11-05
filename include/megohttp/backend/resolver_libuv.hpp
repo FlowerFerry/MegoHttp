@@ -10,7 +10,7 @@
 
 #include <uv.h>
 
-namespace MegoHttp {
+namespace megohttp {
 
     // The libuv implementation of the async lookup: uv_getaddrinfo runs the
     // platform resolver on libuv's thread pool, so the loop thread never blocks on
@@ -27,7 +27,7 @@ namespace MegoHttp {
         std::shared_ptr<Executor> executor_;
     };
 
-} // namespace MegoHttp
+} // namespace megohttp
 
 #include <megohttp/backend/resolver_libuv_impl.hpp>
 
