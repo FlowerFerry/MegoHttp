@@ -35,6 +35,11 @@ namespace megohttp {
         Duration recv_timeout{std::chrono::seconds(30)};     // 0 = disabled, whole body
         Duration total_timeout{std::chrono::seconds(0)};     // 0 = disabled, whole request
 
+        // Address-family preference for the connection race (S2.5-03).
+        // Unspecified lets the racing logic decide (IPv6 first when present);
+        // PreferIPv4 / PreferIPv6 pin which family is attempted first.
+        ConnectOptions::FamilyPreference family_preference{ConnectOptions::FamilyPreference::Unspecified};
+
         // Response body cap for buffered mode. 0 = unlimited.
         uint64_t max_response_body{64ULL * 1024 * 1024};
 
@@ -79,6 +84,8 @@ namespace megohttp {
         }
     };
 
+    class FutureRequest;
+
     // ---------------------------------------------------------------------------
     // Client
     // ---------------------------------------------------------------------------
@@ -106,9 +113,38 @@ namespace megohttp {
         // Convenience: plaintext GET of an absolute http:// URL.
         CancelHandle get(string_view url, ResponseCallback on_complete);
 
-        // Stop accepting new work and release resources. Idempotent. The executor
-        // is shut down only when the Client created it.
+        // Future-based submission (S2.7-01, S2.7-02). Returns an operation
+        // object holding both the future and the cancel handle, so a caller can
+        // always cancel a request it is blocked on.
+        //
+        // NOTE: FutureRequest::get() blocks the calling thread. Do not call it
+        // from the thread that drives this Client's executor.
+        FutureRequest request_future(const Request& request);
+
+        // Synchronous request (S2.7-03). Blocks the calling thread until the
+        // response arrives or an error occurs. Internally reuses the async core
+        // via request_future().get() — no second state machine.
+        //
+        // When the Client owns an internal loop and this method is called from
+        // the loop thread, it returns an InvalidArgument error instead of
+        // deadlocking (S2.7-04). For external executors the deadlock cannot be
+        // reliably detected; the caller must ensure the executor is driven from
+        // another thread.
+        Result<Response> request_sync(const Request& request);
+
+        // Convenience: synchronous GET.
+        Result<Response> get_sync(string_view url);
+
+        // Stop accepting new work and retire every in-flight request with
+        // ErrorCode::Cancelled. Idempotent. The executor is shut down only when
+        // the Client created it.
         void shutdown();
+
+        // Same, but invokes `on_drained` once every in-flight request has
+        // delivered its terminal callback. Runs immediately (on the calling
+        // thread) when nothing is in flight. This is the "shutdown finished"
+        // signal (S2.6-04).
+        void shutdown(std::function<void()> on_drained);
 
         const ClientOptions& options() const noexcept;
 
@@ -120,5 +156,7 @@ namespace megohttp {
 } // namespace megohttp
 
 #include <megohttp/client_impl.hpp>
+// future.hpp needs the complete Client (for request()), so it comes last.
+#include <megohttp/future.hpp>
 
 #endif // MEGOHTTP_CLIENT_HPP_INCLUDED

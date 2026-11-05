@@ -15,7 +15,9 @@
 namespace megohttp {
 
     // Monotonic clock, used for every timeout and backoff computation.
-    // Deliberately not steady_clock directly: tests need to inject a clock.
+    // Deliberately steady_clock, not system_clock: the wall clock can jump when
+    // NTP corrects it or the user changes the date, which would make a timeout
+    // fire early, late, or never.
     using Clock = std::chrono::steady_clock;
     using Duration = Clock::duration;
     using TimePoint = Clock::time_point;

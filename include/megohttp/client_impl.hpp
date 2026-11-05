@@ -115,6 +115,10 @@ namespace megohttp {
             // Self-hold until the terminal callback fires.
             std::shared_ptr<RequestState> self_hold;
 
+            // Called once from finish() so the owning Client can drop this request
+            // from its in-flight set and possibly fire a shutdown-drained callback.
+            std::function<void()> on_retired;
+
             // Fires the terminal callback exactly once.
             void finish(Result<Response> result) {
                 if (finished.exchange(true)) return;
@@ -122,11 +126,16 @@ namespace megohttp {
                 if (dns_timer) dns_timer->cancel();
                 dns_cancel.cancel();   // stop a late DNS answer from firing the callback
                 auto cb = std::move(on_complete);
+                auto retired = std::move(on_retired);
                 // Release the hold before the callback so a callback that
                 // re-enters does not resurrect this state. The stream is closed
                 // separately by async_close() and held alive by its own callback.
                 self_hold.reset();
+                // Fire the user callback FIRST, then the retirement notice.
+                // shutdown(cb) waits for all retired callbacks before firing its
+                // drained signal, so the user callback must complete first.
                 if (cb) cb(std::move(result));
+                if (retired) retired();
             }
 
             // Phase-aware error wrapper: fills in the ErrorPhase from the current
@@ -369,7 +378,29 @@ namespace megohttp {
         void shutdown() {
             bool expected = false;
             if (!stopped.compare_exchange_strong(expected, true)) return;
+
+            // Retire every in-flight request so its terminal callback fires.
+            std::vector<std::shared_ptr<detail::RequestState>> live;
+            {
+                std::lock_guard<std::mutex> lk(m_);
+                for (auto& w : in_flight_)
+                    if (auto sp = w.lock()) live.push_back(std::move(sp));
+                in_flight_.clear();
+            }
+            for (auto& st : live)
+                st->finish(Error{ErrorCode::Cancelled, ErrorPhase::None,
+                                 string("client is shutting down")});
+
             if (owns_executor) detail::shutdown_executor(executor);
+            maybe_notify_drained();
+        }
+
+        void shutdown(std::function<void()> on_drained) {
+            {
+                std::lock_guard<std::mutex> lk(m_);
+                if (!drained_cb) drained_cb = std::move(on_drained);
+            }
+            shutdown();
         }
 
         void submit(const Request& req,
@@ -383,6 +414,13 @@ namespace megohttp {
             st->options = options;
             st->request = req;
             st->on_complete = std::move(on_complete);
+
+            // Track in-flight so shutdown() can retire this request (S2.6-02/04).
+            {
+                std::lock_guard<std::mutex> lk(m_);
+                in_flight_.push_back(st);
+            }
+            st->on_retired = [this] { this->maybe_notify_drained(); };
 
             if (!executor || !resolver) {
                 st->self_hold.reset();
@@ -469,7 +507,7 @@ namespace megohttp {
                 if (!s || s->finished.load()) return;
                 if (s->dns_timer) { s->dns_timer->cancel(); s->dns_timer.reset(); }
 
-                if (!resolved) { s->finish(resolved.error()); return; }
+                if (!resolved) { s->fail(resolved.error()); return; }
                 if (resolved.value().empty()) {
                     s->finish(Error{ErrorCode::DnsNoData, ErrorPhase::Resolve,
                                     string("resolver returned no address")});
@@ -490,7 +528,7 @@ namespace megohttp {
                             if (conn && conn.value()) conn.value()->async_close(nullptr);
                             return;
                         }
-                        if (!conn) { s2->finish(conn.error()); return; }
+                        if (!conn) { s2->fail(conn.error()); return; }
 
                         s2->stream = conn.value();
                         begin_exchange(s2, std::move(head));
@@ -518,6 +556,22 @@ namespace megohttp {
         std::shared_ptr<Resolver> resolver;
         bool owns_executor{false};
         std::atomic<bool> stopped{false};
+
+        // In-flight request tracking for shutdown(S2.6-02/04).
+        std::mutex m_;
+        std::vector<std::weak_ptr<detail::RequestState>> in_flight_;
+        std::function<void()> drained_cb;
+
+        void maybe_notify_drained() {
+            std::function<void()> cb;
+            {
+                std::lock_guard<std::mutex> lk(m_);
+                bool empty = true;
+                for (auto& w : in_flight_) { if (w.lock()) { empty = false; break; } }
+                if (empty && drained_cb) { cb = std::move(drained_cb); drained_cb = nullptr; }
+            }
+            if (cb) cb();
+        }
     };
 
     // ---------------------------------------------------------------------------
@@ -557,6 +611,10 @@ namespace megohttp {
     }
 
     inline void Client::shutdown() { impl_->shutdown(); }
+
+    inline void Client::shutdown(std::function<void()> on_drained) {
+        impl_->shutdown(std::move(on_drained));
+    }
 
     inline const ClientOptions& Client::options() const noexcept { return impl_->options; }
 

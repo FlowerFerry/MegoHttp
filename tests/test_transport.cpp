@@ -9,6 +9,7 @@
 #include <megohttp/config.hpp>
 #include <megohttp/format.hpp>
 #include <megohttp/resolver.hpp>
+#include <megohttp/resolver_caching.hpp>
 #include <megohttp/transport.hpp>
 
 #include <atomic>
@@ -558,4 +559,302 @@ TEST_CASE("race closes loser", "[transport]") {
     ex->shutdown();
     srvA.stop();
     srvB.stop();
+}
+
+
+// ---------------------------------------------------------------------------
+// Address-family preference in the connection race (S2.5-03)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+ResolvedAddress mk_v4(uint8_t last) {
+    ResolvedAddress a;
+    a.family = ResolvedAddress::Family::IPv4;
+    a.bytes = {127, 0, 0, last};
+    a.port = 80;
+    return a;
+}
+
+ResolvedAddress mk_v6(uint8_t last) {
+    ResolvedAddress a;
+    a.family = ResolvedAddress::Family::IPv6;
+    a.bytes = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, last};
+    a.port = 80;
+    return a;
+}
+
+} // namespace
+
+TEST_CASE("family preference orders the attempt list", "[transport][family]") {
+    using FP = ConnectOptions::FamilyPreference;
+
+    AddressList in{mk_v4(1), mk_v4(2), mk_v6(1), mk_v6(2)};
+
+    SECTION("PreferIPv4 starts with IPv4") {
+        auto out = detail::interleave_by_family(in, FP::PreferIPv4);
+        REQUIRE(out.size() == 4);
+        REQUIRE(out[0].family == ResolvedAddress::Family::IPv4);
+        REQUIRE(out[1].family == ResolvedAddress::Family::IPv6);
+    }
+
+    SECTION("PreferIPv6 starts with IPv6") {
+        auto out = detail::interleave_by_family(in, FP::PreferIPv6);
+        REQUIRE(out.size() == 4);
+        REQUIRE(out[0].family == ResolvedAddress::Family::IPv6);
+        REQUIRE(out[1].family == ResolvedAddress::Family::IPv4);
+    }
+
+    SECTION("Unspecified prefers IPv6 when present") {
+        auto out = detail::interleave_by_family(in, FP::Unspecified);
+        REQUIRE(out.size() == 4);
+        REQUIRE(out[0].family == ResolvedAddress::Family::IPv6);
+    }
+
+    SECTION("families alternate, no family is starved") {
+        auto out = detail::interleave_by_family(in, FP::PreferIPv4);
+        size_t v4 = 0, v6 = 0;
+        for (const auto& a : out) {
+            if (a.family == ResolvedAddress::Family::IPv4) ++v4; else ++v6;
+        }
+        REQUIRE(v4 == 2);
+        REQUIRE(v6 == 2);
+    }
+
+    SECTION("every address survives reordering") {
+        auto out = detail::interleave_by_family(in, FP::PreferIPv6);
+        AddressList sorted_in = in, sorted_out = out;
+        auto by_bytes = [](const ResolvedAddress& x, const ResolvedAddress& y) {
+            return x.bytes < y.bytes;
+        };
+        std::sort(sorted_in.begin(), sorted_in.end(), by_bytes);
+        std::sort(sorted_out.begin(), sorted_out.end(), by_bytes);
+        REQUIRE(sorted_in.size() == sorted_out.size());
+        for (size_t i = 0; i < sorted_in.size(); ++i) {
+            REQUIRE(sorted_in[i].family == sorted_out[i].family);
+            REQUIRE(sorted_in[i].bytes == sorted_out[i].bytes);
+        }
+    }
+
+    SECTION("single address is returned unchanged") {
+        AddressList one{mk_v6(9)};
+        auto out = detail::interleave_by_family(one, FP::PreferIPv4);
+        REQUIRE(out.size() == 1);
+        REQUIRE(out[0].family == ResolvedAddress::Family::IPv6);
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// CachingResolver: concurrency cap + coalescing (S2.4-03, S2.4-04)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A resolver that records each distinct call and only answers when told to.
+class ManualResolver final : public Resolver {
+public:
+    const char* name() const noexcept override { return "manual"; }
+
+    CancelHandle resolve(string host, uint16_t port, Callback cb) override {
+        std::lock_guard<std::mutex> lk(m_);
+        auto state = std::make_shared<CancelState>();
+        Entry e;
+        e.host.assign(host.data(), host.size());
+        e.port = port;
+        e.cb = std::move(cb);
+        e.state = state;
+        entries_.push_back(std::move(e));
+        return CancelHandle(state);
+    }
+
+    size_t call_count() const {
+        std::lock_guard<std::mutex> lk(m_);
+        return entries_.size();
+    }
+
+    std::vector<std::string> hosts() const {
+        std::lock_guard<std::mutex> lk(m_);
+        std::vector<std::string> out;
+        for (auto& e : entries_) out.push_back(e.host);
+        return out;
+    }
+
+    // Answer entry `i` with a single IPv4 loopback address.
+    void answer(size_t i) {
+        Callback cb;
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            if (i >= entries_.size()) return;
+            if (entries_[i].state && entries_[i].state->is_cancelled()) return;
+            cb = entries_[i].cb;
+        }
+        if (!cb) return;
+        AddressList list;
+        ResolvedAddress a;
+        a.family = ResolvedAddress::Family::IPv4;
+        a.bytes = {127, 0, 0, 1};
+        a.port = 80;
+        list.push_back(a);
+        cb(Result<AddressList>(std::move(list)));
+    }
+
+    void answer_all() {
+        size_t n = call_count();
+        for (size_t i = 0; i < n; ++i) answer(i);
+    }
+
+private:
+    struct Entry {
+        std::string host;
+        uint16_t port{0};
+        Callback cb;
+        std::shared_ptr<CancelState> state;
+    };
+    mutable std::mutex m_;
+    std::vector<Entry> entries_;
+};
+
+} // namespace
+
+TEST_CASE("CachingResolver coalesces identical lookups", "[resolver][caching]") {
+    auto ex = UvExecutor::create_internal();
+    REQUIRE(ex != nullptr);
+
+    auto manual = std::make_shared<ManualResolver>();
+    CachingResolver::Options opts;
+    opts.cache_ttl = Duration::zero();   // caching off: pure coalescing test
+    auto caching = std::make_shared<CachingResolver>(ex, manual, opts);
+
+    std::atomic<int> answered{0};
+    for (int i = 0; i < 3; ++i) {
+        caching->resolve("example.test", 80, [&](Result<AddressList> r) {
+            if (r) answered.fetch_add(1);
+        });
+    }
+
+    // Three callers, but only ONE upstream lookup.
+    REQUIRE(manual->call_count() == 1);
+
+    manual->answer(0);
+    REQUIRE(wait_until([&] { return answered.load() == 3; }));
+
+    ex->shutdown();
+}
+
+TEST_CASE("CachingResolver caches a successful answer", "[resolver][caching]") {
+    auto ex = UvExecutor::create_internal();
+    REQUIRE(ex != nullptr);
+
+    auto manual = std::make_shared<ManualResolver>();
+    CachingResolver::Options opts;
+    opts.cache_ttl = std::chrono::seconds(60);
+    auto caching = std::make_shared<CachingResolver>(ex, manual, opts);
+
+    std::atomic<int> answered{0};
+    caching->resolve("cache.test", 80, [&](Result<AddressList> r) {
+        if (r) answered.fetch_add(1);
+    });
+    REQUIRE(manual->call_count() == 1);
+    manual->answer(0);
+    REQUIRE(wait_until([&] { return answered.load() == 1; }));
+
+    // Second lookup for the same host:port must be a cache hit.
+    caching->resolve("cache.test", 80, [&](Result<AddressList> r) {
+        if (r) answered.fetch_add(1);
+    });
+    REQUIRE(wait_until([&] { return answered.load() == 2; }));
+    REQUIRE(manual->call_count() == 1);   // still one upstream call
+
+    ex->shutdown();
+}
+
+TEST_CASE("CachingResolver does not cache across ports or hosts", "[resolver][caching]") {
+    auto ex = UvExecutor::create_internal();
+    REQUIRE(ex != nullptr);
+
+    auto manual = std::make_shared<ManualResolver>();
+    CachingResolver::Options opts;
+    opts.cache_ttl = std::chrono::seconds(60);
+    auto caching = std::make_shared<CachingResolver>(ex, manual, opts);
+
+    std::atomic<int> answered{0};
+    auto cb = [&](Result<AddressList> r) { if (r) answered.fetch_add(1); };
+
+    caching->resolve("a.test", 80, cb);
+    manual->answer(0);
+    REQUIRE(wait_until([&] { return answered.load() == 1; }));
+
+    caching->resolve("a.test", 443, cb);   // different port
+    REQUIRE(manual->call_count() == 2);
+    manual->answer(1);
+    REQUIRE(wait_until([&] { return answered.load() == 2; }));
+
+    caching->resolve("b.test", 80, cb);    // different host
+    REQUIRE(manual->call_count() == 3);
+
+    ex->shutdown();
+}
+
+TEST_CASE("CachingResolver caps concurrent upstream lookups", "[resolver][caching]") {
+    auto ex = UvExecutor::create_internal();
+    REQUIRE(ex != nullptr);
+
+    auto manual = std::make_shared<ManualResolver>();
+    CachingResolver::Options opts;
+    opts.cache_ttl = Duration::zero();
+    opts.max_in_flight = 2;
+    auto caching = std::make_shared<CachingResolver>(ex, manual, opts);
+
+    std::atomic<int> answered{0};
+    auto cb = [&](Result<AddressList> r) { if (r) answered.fetch_add(1); };
+
+    // Four distinct hosts, cap of 2.
+    caching->resolve("h1.test", 80, cb);
+    caching->resolve("h2.test", 80, cb);
+    caching->resolve("h3.test", 80, cb);
+    caching->resolve("h4.test", 80, cb);
+
+    REQUIRE(manual->call_count() == 2);      // only 2 went upstream
+    REQUIRE(caching->queued_count() == 2);   // the other 2 wait
+
+    // Freeing one slot lets exactly one queued lookup start.
+    manual->answer(0);
+    REQUIRE(wait_until([&] { return manual->call_count() == 3; }));
+    REQUIRE(caching->queued_count() == 1);
+
+    manual->answer(1);
+    REQUIRE(wait_until([&] { return manual->call_count() == 4; }));
+    REQUIRE(caching->queued_count() == 0);
+
+    manual->answer(2);
+    manual->answer(3);
+    REQUIRE(wait_until([&] { return answered.load() == 4; }));
+
+    ex->shutdown();
+}
+
+TEST_CASE("CachingResolver drops a cancelled coalesced waiter", "[resolver][caching]") {
+    auto ex = UvExecutor::create_internal();
+    REQUIRE(ex != nullptr);
+
+    auto manual = std::make_shared<ManualResolver>();
+    CachingResolver::Options opts;
+    opts.cache_ttl = Duration::zero();
+    auto caching = std::make_shared<CachingResolver>(ex, manual, opts);
+
+    std::atomic<int> fired{0};
+    auto h1 = caching->resolve("c.test", 80, [&](Result<AddressList>) { fired.fetch_add(1); });
+    auto h2 = caching->resolve("c.test", 80, [&](Result<AddressList>) { fired.fetch_add(1); });
+
+    REQUIRE(manual->call_count() == 1);
+
+    h2.cancel();   // only the second caller gives up
+
+    manual->answer(0);
+    REQUIRE(wait_until([&] { return fired.load() == 1; }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    REQUIRE(fired.load() == 1);   // the cancelled one never fired
+
+    ex->shutdown();
 }
