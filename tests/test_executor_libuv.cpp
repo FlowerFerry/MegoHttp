@@ -1,5 +1,5 @@
 // libuv executor tests: cross-thread post, timers, cancel, internal/external loop.
-#include <catch_amalgamated.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <megohttp/backend/executor_libuv.hpp>
 

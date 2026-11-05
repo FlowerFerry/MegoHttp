@@ -1,7 +1,7 @@
 // Client tests: end-to-end HTTP request with the minimal Client.
 // Uses a local HTTP server on the same executor so no public network is needed.
 // The server is deliberately NOT built from any MegoHttp code.
-#include <catch_amalgamated.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <megohttp/client.hpp>
 #include <megohttp/transport.hpp>

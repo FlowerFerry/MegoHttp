@@ -3,7 +3,7 @@
 //
 // Same shape as test_executor_libuv.cpp / test_transport.cpp so the two backends
 // are held to the same behaviour. No public network access is required.
-#include <catch_amalgamated.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <megohttp/config.hpp>
 

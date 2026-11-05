@@ -1,15 +1,21 @@
-# Tests use Catch2 v3 amalgamated (deps/Catch2/):
-#   catch_amalgamated.hpp  - headers (included by every test_*.cpp)
-#   catch_amalgamated.cpp  - implementation, compiled once into catch2_impl
-# catch_amalgamated.cpp provides main(); the test files contain only TEST_CASEs.
+# Catch2 v3, same policy as the other dependencies: prefer the in-tree source
+# checkout, fall back to FetchContent when it is absent.
+set(CATCH2_ROOT "${MGHTTP_DEPS_DIR}/Catch2-v3.7.1")
 
-add_library(catch2_impl OBJECT
-    ${CMAKE_SOURCE_DIR}/deps/Catch2/catch_amalgamated.cpp
-)
-target_include_directories(catch2_impl PUBLIC
-    ${CMAKE_SOURCE_DIR}/deps/Catch2
-)
-add_library(Catch2::Catch2 ALIAS catch2_impl)
+if(EXISTS "${CATCH2_ROOT}/src/catch2/catch_all.hpp")
+    message(STATUS "Catch2: in-tree ${CATCH2_ROOT}")
+    add_subdirectory(${CATCH2_ROOT} EXCLUDE_FROM_ALL)
+else()
+    message(STATUS "Catch2: not in-tree, using FetchContent (needs network)")
+    include(FetchContent)
+    FetchContent_Declare(
+        Catch2
+        GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+        GIT_TAG        v3.7.1
+        SYSTEM
+    )
+    FetchContent_MakeAvailable(Catch2)
+endif()
 
 set(MGHTTP_TEST_SOURCES
     test_core.cpp
@@ -33,7 +39,8 @@ endif()
 foreach(test_src IN LISTS MGHTTP_TEST_SOURCES)
     get_filename_component(test_name ${test_src} NAME_WE)
     add_executable(${test_name} ${test_src})
-    target_link_libraries(${test_name} PRIVATE MegoHttp::megohttp Catch2::Catch2)
+    # Catch2WithMain supplies main(); the test files contain only TEST_CASEs.
+    target_link_libraries(${test_name} PRIVATE MegoHttp::megohttp Catch2::Catch2WithMain)
     target_compile_definitions(${test_name} PRIVATE MGHTTP_INTERNAL_TESTING=1)
     mghttp_copy_runtime_dll(${test_name})
     add_test(NAME ${test_name} COMMAND ${test_name})

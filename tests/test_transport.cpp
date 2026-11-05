@@ -4,7 +4,7 @@
 // Threading contract exercised here: AsyncByteStream is NOT thread-safe, so every
 // stream call is issued from the loop thread (the documented pattern for the
 // higher layers too).
-#include <catch_amalgamated.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <megohttp/config.hpp>
 #include <megohttp/format.hpp>

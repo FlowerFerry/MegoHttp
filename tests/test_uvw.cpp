@@ -1,7 +1,7 @@
 // uvw availability test: the C++ wrapper over libuv must actually compile and
 // run against the same libuv the raw backend uses. A build-time flag is not
 // evidence; this schedules real work on a uvw loop.
-#include <catch_amalgamated.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <megohttp/config.hpp>
 

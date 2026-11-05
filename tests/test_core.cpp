@@ -5,7 +5,7 @@
 //   g++ -std=c++17 -DMGHTTP_USE_MEMESTRING -DMGHTTP_BACKEND_LIBUV \
 //       -I../include -I../../MemeString/include test_core.cpp \
 //       ../../MemeString/liblibmeme_string.dll -o test_core_memepp
-#include <catch_amalgamated.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <megohttp/url.hpp>
 #include <megohttp/headers.hpp>

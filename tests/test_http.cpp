@@ -1,5 +1,5 @@
 // ResponseParser tests: framing, chunked, trailers, 1xx, limits, byte-splitting.
-#include <catch_amalgamated.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <megohttp/http.hpp>
 
