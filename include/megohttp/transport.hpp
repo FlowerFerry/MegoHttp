@@ -31,7 +31,19 @@ namespace megohttp {
     // ---------------------------------------------------------------------------
     class AsyncByteStream {
     public:
-        using ReadCallback = std::function<void(Result<size_t>)>;   // bytes, 0 = EOF
+        // Bytes are delivered as a view into a buffer the STREAM owns. The view is
+        // valid only for the duration of the callback: the stream may reuse the
+        // same storage for the next read. Copy anything you need to keep.
+        //
+        // Owning the buffer inside the stream is what makes the lifetimes safe on
+        // both backends. libuv requires the uv_alloc_cb buffer to stay valid until
+        // uv_read_cb runs ("each buffer is used only once and the user is
+        // responsible for freeing it in the read callback"), and Asio requires
+        // "ownership of the underlying memory blocks is retained by the caller,
+        // which must guarantee that they remain valid until the completion handler
+        // is called". Handing the stream a caller-owned buffer made that guarantee
+        // depend on the caller's object staying alive, which it did not.
+        using ReadCallback = std::function<void(Result<string_view>)>;  // empty view = EOF
         using WriteCallback = std::function<void(Result<size_t>)>;
         using CloseCallback = std::function<void()>;
 
@@ -45,9 +57,9 @@ namespace megohttp {
         // Fires on the loop thread once the stream is usable.
         virtual void start(ReadyCallback on_ready) = 0;
 
-        // Read up to `size` bytes into `buf`. Only one read may be outstanding.
-        // Result is the byte count; 0 means clean EOF.
-        virtual void async_read_some(uint8_t* buf, size_t size, ReadCallback cb) = 0;
+        // Read whatever arrives next. Only one read may be outstanding. The view
+        // in the callback points into stream-owned storage and dies with the call.
+        virtual void async_read_some(ReadCallback cb) = 0;
 
         // Write the whole buffer; partial writes are resumed internally.
         virtual void async_write(const uint8_t* data, size_t size, WriteCallback cb) = 0;
@@ -74,7 +86,7 @@ namespace megohttp {
         ~TcpStream() override;
 
         void start(ReadyCallback on_ready) override;
-        void async_read_some(uint8_t* buf, size_t size, ReadCallback cb) override;
+        void async_read_some(ReadCallback cb) override;
         void async_write(const uint8_t* data, size_t size, WriteCallback cb) override;
         void async_close(CloseCallback cb) override;
         bool is_open() const noexcept override;
@@ -84,6 +96,32 @@ namespace megohttp {
 
     private:
 #if defined(MGHTTP_BACKEND_LIBUV)
+        // libuv keeps pointers into the uv_tcp_t handle and into every request
+        // (uv_connect_t / uv_write_t / uv_shutdown_t) it is given, and touches
+        // them after our calls return:
+        //   - uv_close docs: "the memory can only be released in close_cb or
+        //     after it has returned";
+        //   - uv_close cancels in-progress requests and delivers their callbacks
+        //     later with UV_ECANCELED;
+        //   - uv_read's alloc buffer is handed back through uv_read_cb.
+        // Embedding those structs in TcpStream therefore violated every one of
+        // those rules: ~TcpStream freed them while libuv still held them, which
+        // is what the loop thread crashed on inside uv__process_tcp_read_req.
+        // They now live in a Node that owns itself until on_closed returns.
+        struct Node {
+            uv_tcp_t      handle{};
+            uv_connect_t  connect_req{};
+            uv_shutdown_t shutdown_req{};
+            uv_write_t    write_req{};
+            // libuv fills this buffer inside uv__process_tcp_read_req; it must
+            // outlive the read callback, so it belongs to the Node, not to the
+            // caller and not to TcpStream.
+            uint8_t read_stage[16 * 1024];
+            std::weak_ptr<TcpStream> owner;   // non-owning: no reference cycle
+            std::shared_ptr<Node>    self;    // released only from on_closed
+        };
+        std::shared_ptr<Node> node_;
+
         static void on_connect(uv_connect_t* req, int status);
         static void on_alloc(uv_handle_t* h, size_t suggested, uv_buf_t* buf);
         static void on_read(uv_stream_t* s, ssize_t nread, const uv_buf_t* buf);
@@ -91,10 +129,13 @@ namespace megohttp {
         static void on_shutdown(uv_shutdown_t* req, int status);
         static void on_closed(uv_handle_t* h);
 
+        // Closes the handle from the loop thread (uv_close is not thread-safe).
+        static void close_on_loop(std::shared_ptr<Node> node);
+        static void do_close(Node* node);
+
+        ReadCallback read_cb_;   // one outstanding read at a time
+
         uv_loop_t* loop_{nullptr};
-        uv_tcp_t tcp_{};
-        uv_connect_t connect_req_{};
-        uv_shutdown_t shutdown_req_{};
         bool connecting_{false};
 #elif defined(MGHTTP_BACKEND_ASIO)
         static void on_connect(std::shared_ptr<TcpStream> self,
@@ -108,6 +149,12 @@ namespace megohttp {
         // Asio 1.38's basic_stream_socket has NO default constructor, so the
         // socket is created when the target endpoint is known.
         std::unique_ptr<asio::ip::tcp::socket> socket_;
+
+        ReadCallback read_cb_;   // one outstanding read at a time
+        // Read buffer owned by the stream: Asio requires it to stay valid until
+        // the completion handler runs, and this object is kept alive by the
+        // handler's captured shared_ptr.
+        std::array<uint8_t, 16 * 1024> read_stage_{};
 #endif
 
         // Shared resume for a partially written buffer (both backends).
@@ -120,18 +167,14 @@ namespace megohttp {
         bool close_notified_{false};
         ReadyCallback ready_cb_;
 
-        // One outstanding read at a time.
-        uint8_t* read_dst_{nullptr};
-        size_t read_cap_{0};
-        ReadCallback read_cb_;
-
         struct PendingWrite {
             std::shared_ptr<std::vector<uint8_t>> bytes;
             size_t total{0};
             size_t written{0};
             WriteCallback cb;
 #if defined(MGHTTP_BACKEND_LIBUV)
-            uv_write_t req{};
+            // The uv_write_t itself lives in Node: libuv keeps it until the write
+            // callback fires, which can be after TcpStream is gone.
             uv_buf_t buf{};
 #endif
         };

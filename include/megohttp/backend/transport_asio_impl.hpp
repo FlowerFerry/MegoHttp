@@ -95,7 +95,7 @@ namespace megohttp {
         cb(VoidResult{});
     }
 
-    inline void TcpStream::async_read_some(uint8_t* buf, size_t size, ReadCallback cb) {
+    inline void TcpStream::async_read_some(ReadCallback cb) {
         if (!open_ || closing_) {
             if (cb) cb(Error{ErrorCode::ConnectionClosed, ErrorPhase::Receive,
                              string("read on a closed stream")});
@@ -106,12 +106,14 @@ namespace megohttp {
                              string("another read is already outstanding")});
             return;
         }
-        read_dst_ = buf;
-        read_cap_ = size;
         read_cb_ = std::move(cb);
 
-        // Capture self so the socket outlives the async op.
-        asio::mutable_buffer mb(buf, size);
+        // read_stage_ is a member, and the handler below captures `self`, so the
+        // buffer is guaranteed valid until the completion handler runs: that is
+        // exactly what Asio requires ("ownership of the underlying memory blocks
+        // is retained by the caller, which must guarantee that they remain valid
+        // until the completion handler is called").
+        asio::mutable_buffer mb(read_stage_.data(), read_stage_.size());
         socket_->async_read_some(mb,
             [self = shared_from_this()](const asio::error_code& ec, size_t n) {
                 on_read(std::move(self), ec, n);
@@ -120,15 +122,13 @@ namespace megohttp {
 
     inline void TcpStream::on_read(std::shared_ptr<TcpStream> self,
                                    const asio::error_code& ec, size_t n) {
-        self->read_dst_ = nullptr;
-        self->read_cap_ = 0;
         auto cb = std::move(self->read_cb_);
         self->read_cb_ = nullptr;
 
         if (ec) {
             if (ec == asio::error::eof || ec == asio::error::connection_reset) {
                 self->open_ = false;
-                if (cb) cb(0);   // 0 bytes = clean EOF
+                if (cb) cb(string_view{});   // empty view = clean EOF
             } else {
                 self->open_ = false;
                 if (cb) {
@@ -138,7 +138,10 @@ namespace megohttp {
             }
             return;
         }
-        if (cb) cb(n);
+        size_t len = n;
+        if (len > self->read_stage_.size()) len = self->read_stage_.size();
+        // The view points into read_stage_ and is valid only for this callback.
+        if (cb) cb(string_view(reinterpret_cast<const char*>(self->read_stage_.data()), len));
     }
 
     inline void TcpStream::async_write(const uint8_t* data, size_t size, WriteCallback cb) {

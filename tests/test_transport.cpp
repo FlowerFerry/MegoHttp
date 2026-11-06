@@ -255,8 +255,8 @@ TEST_CASE("tcp connect and echo", "[transport]") {
     std::atomic<size_t> written{0};
     std::atomic<bool> read_done{false};
     std::atomic<size_t> got{0};
+    std::atomic<bool> echo_ok{false};
     std::atomic<bool> closed{false};
-    uint8_t buf[64] = {0};
     static const char* kMsg = "hello tcp";
     const size_t kLen = std::strlen(kMsg);
 
@@ -273,8 +273,12 @@ TEST_CASE("tcp connect and echo", "[transport]") {
                 write_done.store(true);
                 if (!w) return;
 
-                stream->async_read_some(buf, sizeof buf, [&, stream](Result<size_t> rd) {
-                    got.store(rd ? rd.value() : 0);
+                stream->async_read_some([&, stream](Result<string_view> rd) {
+                    if (rd) {
+                        got.store(rd.value().size());
+                        echo_ok.store(std::memcmp(rd.value().data(), kMsg,
+                                                  rd.value().size()) == 0);
+                    }
                     read_done.store(true);
                     stream->async_close([&] { closed.store(true); });
                 });
@@ -288,7 +292,7 @@ TEST_CASE("tcp connect and echo", "[transport]") {
     CHECK(written.load() == kLen);
     CHECK(wait_until([&] { return read_done.load(); }));
     CHECK(got.load() == kLen);
-    CHECK(std::memcmp(buf, kMsg, got.load()) == 0);
+    CHECK(echo_ok.load());
     CHECK(wait_until([&] { return closed.load(); }));
 
     ex->shutdown();
@@ -419,9 +423,9 @@ TEST_CASE("race one winner usable", "[transport]") {
             s->async_write(reinterpret_cast<const uint8_t*>(kMsg), kLen,
                 [&, s](Result<size_t> w) {
                     if (!w) return;
-                    s->async_read_some(buf, sizeof buf, [&, s](Result<size_t> rd) {
-                        if (rd && rd.value() == kLen &&
-                            std::memcmp(buf, kMsg, kLen) == 0) {
+                    s->async_read_some([&, s](Result<string_view> rd) {
+                        if (rd && rd.value().size() == kLen &&
+                            std::memcmp(rd.value().data(), kMsg, kLen) == 0) {
                             echo_ok.store(true);
                         }
                         s->async_close(nullptr);

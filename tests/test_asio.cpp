@@ -288,7 +288,7 @@ TEST_CASE("tcp echo", "[asio]") {
     std::atomic<bool> read_done{false};
     std::atomic<size_t> got{0};
     std::atomic<bool> closed{false};
-    uint8_t buf[64] = {0};
+    std::atomic<bool> echo_ok{false};
     static const char* kMsg = "hello asio tcp";
     const size_t kLen = std::strlen(kMsg);
 
@@ -304,8 +304,10 @@ TEST_CASE("tcp echo", "[asio]") {
                 write_done.store(true);
                 if (!w) return;
 
-                stream->async_read_some(buf, sizeof buf, [&, stream](Result<size_t> rd) {
-                    got.store(rd ? rd.value() : 0);
+                stream->async_read_some([&, stream](Result<string_view> rd) {
+                    got.store(rd ? static_cast<int>(rd.value().size()) : 0);
+                    if (rd && rd.value().size() == kLen)
+                        echo_ok.store(std::memcmp(rd.value().data(), kMsg, kLen) == 0);
                     read_done.store(true);
                     stream->async_close([&] { closed.store(true); });
                 });
@@ -319,7 +321,7 @@ TEST_CASE("tcp echo", "[asio]") {
     CHECK(written.load() == kLen);
     CHECK(wait_until([&] { return read_done.load(); }));
     CHECK(got.load() == kLen);
-    CHECK(std::memcmp(buf, kMsg, got.load()) == 0);
+    CHECK(echo_ok.load());
     CHECK(wait_until([&] { return closed.load(); }));
 
     ex->shutdown();

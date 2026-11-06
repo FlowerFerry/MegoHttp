@@ -48,26 +48,46 @@ namespace detail {
     }
 
     inline TcpStream::~TcpStream() {
-        if (loop_ != nullptr && !closing_) {
-            closing_ = true;
-            // Stop reading before closing. uv_close alone does not cancel a read
-            // that was started by uv_read_start, so libuv can still deliver data
-            // into a buffer whose owning object is being destroyed. That is the
-            // root cause of the intermittent heap corruption: the loop thread was
-            // inside uv__process_tcp_read_req while ~TcpStream tore the handle
-            // down from another path.
-            if (open_) {
-                open_ = false;
-                read_dst_ = nullptr;
-                read_cap_ = 0;
-                read_cb_ = nullptr;
-                uv_read_stop(reinterpret_cast<uv_stream_t*>(&tcp_));
-            }
-            tcp_.data = nullptr;
-            if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&tcp_))) {
-                uv_close(reinterpret_cast<uv_handle_t*>(&tcp_), nullptr);
-            }
+        if (loop_ == nullptr) return;
+        closing_ = true;
+        open_ = false;
+        read_cb_ = nullptr;
+
+        auto node = std::move(node_);
+        if (!node) return;
+        node->owner.reset();
+        node->handle.data = node.get();
+
+        auto uv_ex = std::dynamic_pointer_cast<libuv_backend::UvExecutor>(executor_);
+        if (uv_ex && !uv_ex->is_in_loop_thread()) {
+            // uv_close/uv_read_stop are not thread-safe; hand the close to the
+            // loop. The lambda owns the Node so it cannot die in transit.
+            uv_ex->post([node = std::move(node)]() mutable {
+                do_close(node.get());
+                // `node` (and its self-hold) drops here, after do_close returned.
+            });
+        } else {
+            do_close(node.get());
+            // If do_close queued an async close, node->self keeps it alive; if the
+            // handle was already closing, the Node dies here, which is fine.
         }
+    }
+
+    // Runs on the loop thread. Never frees the Node: on_closed owns that.
+    inline void TcpStream::do_close(Node* node) {
+        if (node == nullptr) return;
+        auto* handle = reinterpret_cast<uv_handle_t*>(&node->handle);
+        if (uv_is_closing(handle)) return;
+        // Stop reading first: uv_close alone does not cancel an outstanding
+        // uv_read_start, and libuv would still deliver data through on_read.
+        uv_read_stop(reinterpret_cast<uv_stream_t*>(&node->handle));
+        node->handle.data = node;
+        uv_close(handle, &TcpStream::on_closed);
+    }
+
+    inline void TcpStream::close_on_loop(std::shared_ptr<Node> node) {
+        if (!node) return;
+        do_close(node.get());
     }
 
     inline void TcpStream::start(ReadyCallback on_ready) {
@@ -80,9 +100,6 @@ namespace detail {
             return;
         }
 
-        uv_tcp_init(loop_, &tcp_);
-        tcp_.data = this;
-
         sockaddr_storage ss{};
         if (detail::to_sockaddr(address_, &ss) == 0) {
             if (auto cb = std::move(ready_cb_)) {
@@ -92,9 +109,16 @@ namespace detail {
             return;
         }
 
-        connect_req_.data = this;
+        node_ = std::make_shared<Node>();
+        node_->self = node_;              // keeps the Node alive until on_closed
+        node_->owner = weak_from_this();
+        node_->handle.data = node_.get();
+
+        uv_tcp_init(loop_, &node_->handle);
+
+        node_->connect_req.data = node_.get();
         connecting_ = true;
-        const int rc = uv_tcp_connect(&connect_req_, &tcp_,
+        const int rc = uv_tcp_connect(&node_->connect_req, &node_->handle,
                                       reinterpret_cast<const sockaddr*>(&ss),
                                       &TcpStream::on_connect);
         if (rc < 0) {
@@ -107,22 +131,24 @@ namespace detail {
     }
 
     inline void TcpStream::on_connect(uv_connect_t* req, int status) {
-        auto* self = static_cast<TcpStream*>(req->data);
-        if (self == nullptr) return;
-        self->connecting_ = false;
-        auto cb = std::move(self->ready_cb_);
+        auto* node = static_cast<Node*>(req->data);
+        if (node == nullptr) return;
+        auto owner = node->owner.lock();
+        if (!owner) return;
+        owner->connecting_ = false;
+        auto cb = std::move(owner->ready_cb_);
         if (!cb) return;   // already consumed: ignore a duplicate callback
 
         if (status < 0) {
-            self->open_ = false;
+            owner->open_ = false;
             cb(VoidResult{Error{ErrorCode::ConnectFailed, ErrorPhase::TcpConnect,
                                 format("connect failed: {}", uv_strerror(status))}});
             return;
         }
-        self->open_ = true;
+        owner->open_ = true;
         cb(VoidResult{});
     }
-    inline void TcpStream::async_read_some(uint8_t* buf, size_t size, ReadCallback cb) {
+    inline void TcpStream::async_read_some(ReadCallback cb) {
         if (!open_ || closing_) {
             if (cb) {
                 cb(Error{ErrorCode::ConnectionClosed, ErrorPhase::Receive,
@@ -137,44 +163,49 @@ namespace detail {
             }
             return;
         }
-        read_dst_ = buf;
-        read_cap_ = size;
         read_cb_ = std::move(cb);
 
-        // libuv supplies the buffer through on_alloc; on_read copies the bytes into
-        // read_dst_ and stops reading again, keeping "one outstanding read" true.
-        uv_read_start(reinterpret_cast<uv_stream_t*>(&tcp_),
+        // The buffer comes from on_alloc (the Node's staging area), so libuv never
+        // touches caller-owned memory.
+        uv_read_start(reinterpret_cast<uv_stream_t*>(&node_->handle),
                       &TcpStream::on_alloc, &TcpStream::on_read);
     }
 
     inline void TcpStream::on_alloc(uv_handle_t* h, size_t, uv_buf_t* buf) {
-        auto* self = static_cast<TcpStream*>(h->data);
-        if (self == nullptr || self->read_dst_ == nullptr) {
+        auto* node = static_cast<Node*>(h->data);
+        if (node == nullptr) {
             buf->base = nullptr;
             buf->len = 0;
             return;
         }
-        // Read directly into the caller's buffer: no intermediate copy, and the
-        // caller's buffer is guaranteed valid because the read is one-shot.
-        buf->base = reinterpret_cast<char*>(self->read_dst_);
-        buf->len = static_cast<unsigned int>(self->read_cap_);
+        // Never hand libuv the caller's buffer. libuv fills this inside
+        // uv__process_tcp_read_req, which can run after the owner released the
+        // caller's destination (or after the owner is gone entirely). Staging in
+        // the Node keeps the memory valid for as long as libuv needs it.
+        buf->base = reinterpret_cast<char*>(node->read_stage);
+        buf->len = static_cast<unsigned int>(sizeof node->read_stage);
     }
 
     inline void TcpStream::on_read(uv_stream_t* s, ssize_t nread, const uv_buf_t* buf) {
-        auto* self = static_cast<TcpStream*>(s->data);
-        if (self == nullptr) return;
+        auto* node = static_cast<Node*>(s->data);
+        if (node == nullptr) return;
 
         uv_read_stop(s);
-        self->read_dst_ = nullptr;
-        self->read_cap_ = 0;
-        auto cb = std::move(self->read_cb_);
-        self->read_cb_ = nullptr;
+        auto owner = node->owner.lock();
+        if (!owner) {
+            // TcpStream is gone; drop the data. The Node still frees itself in
+            // on_closed, so nothing leaks and nothing is touched here.
+            return;
+        }
+
+        auto cb = std::move(owner->read_cb_);
+        owner->read_cb_ = nullptr;
 
         if (nread < 0) {
-            self->open_ = false;
+            owner->open_ = false;
             if (cb) {
                 if (nread == UV_EOF) {
-                    cb(size_t{0});
+                    cb(string_view{});          // empty view = clean EOF
                 } else {
                     cb(Error{ErrorCode::ConnectionReset, ErrorPhase::Receive,
                              format("read failed: {}", uv_strerror(static_cast<int>(nread)))});
@@ -182,12 +213,11 @@ namespace detail {
             }
             return;
         }
-        if (nread == 0 && buf != nullptr && buf->base != nullptr) {
-            // Spurious wakeup with no data: report 0 and let the caller re-arm.
-            if (cb) cb(size_t{0});
-            return;
-        }
-        if (cb) cb(static_cast<size_t>(nread));
+        size_t n = static_cast<size_t>(nread);
+        if (n > sizeof node->read_stage) n = sizeof node->read_stage;
+        // The view points into the Node's staging buffer and is valid only for the
+        // duration of this callback.
+        if (cb) cb(string_view(reinterpret_cast<const char*>(node->read_stage), n));
     }
 
     inline void TcpStream::async_write(const uint8_t* data, size_t size, WriteCallback cb) {
@@ -209,19 +239,22 @@ namespace detail {
         pending->bytes = std::make_shared<std::vector<uint8_t>>(data, data + size);
         pending->total = size;
         pending->cb = std::move(cb);
-        pending->req.data = this;
         write_ = std::move(pending);
+        if (node_) node_->write_req.data = node_.get();
         resume_write();
     }
 
     inline void TcpStream::resume_write() {
-        if (!write_) return;
+        if (!write_ || !node_) return;
         // Point the uv_buf at the not-yet-written tail so a resumed write continues
         // where the previous one stopped.
         write_->buf = uv_buf_init(
             reinterpret_cast<char*>(write_->bytes->data() + write_->written),
             static_cast<unsigned int>(write_->total - write_->written));
-        const int rc = uv_write(&write_->req, reinterpret_cast<uv_stream_t*>(&tcp_),
+        // The uv_write_t lives in the Node: libuv keeps it until the callback runs,
+        // which can be after TcpStream is destroyed.
+        const int rc = uv_write(&node_->write_req,
+                                reinterpret_cast<uv_stream_t*>(&node_->handle),
                                 &write_->buf, 1, &TcpStream::on_write);
         if (rc < 0) {
             auto pending = std::move(write_);
@@ -235,9 +268,11 @@ namespace detail {
     }
 
     inline void TcpStream::on_write(uv_write_t* req, int status) {
-        auto* self = static_cast<TcpStream*>(req->data);
-        if (self == nullptr) return;
-        auto pending = std::move(self->write_);
+        auto* node = static_cast<Node*>(req->data);
+        if (node == nullptr) return;
+        auto owner = node->owner.lock();
+        if (!owner) return;
+        auto pending = std::move(owner->write_);
         if (!pending) return;
         if (status < 0) {
             if (pending->cb) {
@@ -251,54 +286,68 @@ namespace detail {
 
     inline void TcpStream::async_close(CloseCallback cb) {
         close_cb_ = std::move(cb);
-        if (loop_ == nullptr || closing_) {
+        if (loop_ == nullptr || closing_ || !node_) {
             if (close_cb_) { auto c = std::move(close_cb_); c(); }
             return;
         }
         open_ = false;
         closing_ = true;
-        tcp_.data = this;   // on_closed needs us to deliver close_cb_
+        node_->owner = weak_from_this();      // on_closed still needs to notify us
+        node_->handle.data = node_.get();
 
-        uv_read_stop(reinterpret_cast<uv_stream_t*>(&tcp_));
-        if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&tcp_))) {
-            uv_close(reinterpret_cast<uv_handle_t*>(&tcp_), &TcpStream::on_closed);
+        auto uv_ex = std::dynamic_pointer_cast<libuv_backend::UvExecutor>(executor_);
+        if (uv_ex && !uv_ex->is_in_loop_thread()) {
+            auto node = node_;
+            uv_ex->post([node] { do_close(node.get()); });
+        } else {
+            do_close(node_.get());
         }
     }
 
     inline void TcpStream::on_closed(uv_handle_t* h) {
-        auto* self = static_cast<TcpStream*>(h->data);
-        if (self == nullptr) return;
+        auto* node = static_cast<Node*>(h->data);
+        if (node == nullptr) return;
         h->data = nullptr;
-        self->close_notified_ = true;
-        // Pending read/write must be resolved, not left hanging.
-        if (self->read_cb_) {
-            auto rd = std::move(self->read_cb_);
-            rd(Error{ErrorCode::ConnectionClosed, ErrorPhase::Receive,
-                     string("stream closed")});
-        }
-        if (self->write_ && self->write_->cb) {
-            auto wr = std::move(self->write_);
-            wr->cb(Error{ErrorCode::ConnectionClosed, ErrorPhase::Send,
+
+        // Deliver pending read/write/close notifications while the owner can still
+        // be reached; libuv already cancelled any outstanding requests.
+        if (auto owner = node->owner.lock()) {
+            owner->close_notified_ = true;
+            if (owner->read_cb_) {
+                auto rd = std::move(owner->read_cb_);
+                rd(Error{ErrorCode::ConnectionClosed, ErrorPhase::Receive,
                          string("stream closed")});
+            }
+            if (owner->write_ && owner->write_->cb) {
+                auto wr = std::move(owner->write_);
+                wr->cb(Error{ErrorCode::ConnectionClosed, ErrorPhase::Send,
+                             string("stream closed")});
+            }
+            if (owner->close_cb_) {
+                auto c = std::move(owner->close_cb_);
+                c();
+            }
         }
-        if (self->close_cb_) {
-            auto c = std::move(self->close_cb_);
-            c();
-        }
+
+        // node->self is the Node's last owner. Moving it into a local defers the
+        // destruction until after this frame returns, which is exactly what
+        // uv_close requires ("memory can only be released in close_cb or after
+        // it has returned").
+        auto keep = std::move(node->self);
     }
 
     inline bool TcpStream::is_open() const noexcept { return open_ && !closing_; }
 
     inline void TcpStream::set_keep_alive(bool enable, Duration idle) {
-        if (loop_ == nullptr) return;
+        if (loop_ == nullptr || !node_) return;
         const unsigned secs = static_cast<unsigned>(
             std::chrono::duration_cast<std::chrono::seconds>(idle).count());
-        uv_tcp_keepalive(&tcp_, enable ? 1 : 0, secs);
+        uv_tcp_keepalive(&node_->handle, enable ? 1 : 0, secs);
     }
 
     inline void TcpStream::set_no_delay(bool enable) {
-        if (loop_ == nullptr) return;
-        uv_tcp_nodelay(&tcp_, enable ? 1 : 0);
+        if (loop_ == nullptr || !node_) return;
+        uv_tcp_nodelay(&node_->handle, enable ? 1 : 0);
     }
 
     // ---------------------------------------------------------------------------

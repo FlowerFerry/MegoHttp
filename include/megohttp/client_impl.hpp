@@ -290,12 +290,12 @@ namespace megohttp {
             void read_more() {
                 auto self = shared_from_this();
                 auto stream = state_->stream;
-                stream->async_read_some(buf_, sizeof buf_,
-                    [self](Result<size_t> r) {
+                stream->async_read_some(
+                    [self](Result<string_view> r) {
                         if (!r) { self->fail(r.error()); return; }
 
-                        const size_t n = r.value();
-                        if (n == 0) {
+                        const string_view sv = r.value();
+                        if (sv.empty()) {
                             // Transport EOF: the parser decides whether that is a
                             // legal end (until-close framing) or a truncation. On
                             // success it has already fired on_complete().
@@ -311,7 +311,8 @@ namespace megohttp {
                         }
 
                         self->state_->phase = detail::RequestPhase::Receive;
-                        auto res = self->parser_->feed(self->buf_, n);
+                        auto res = self->parser_->feed(
+                            reinterpret_cast<const uint8_t*>(sv.data()), sv.size());
                         if (!res) { self->fail(res.error()); return; }
                         if (self->complete_) return;
                         self->read_more();
@@ -330,7 +331,6 @@ namespace megohttp {
             std::shared_ptr<Timer> recv_timer_;
             std::unique_ptr<BufferSink> sink_;
             bool complete_{false};
-            uint8_t buf_[16 * 1024] = {0};
         };
 
         // Builds the request head for a direct (non-proxy) HTTP request.
