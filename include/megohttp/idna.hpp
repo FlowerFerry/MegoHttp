@@ -42,11 +42,9 @@ namespace megohttp {
 
         // Decode one UTF-8 code point starting at `i`; advances `i`.
         // Returns false on an invalid or truncated sequence.
+        // Uses byte-range guards (overlong / surrogate checks are done inline)
+        // so the caller gets a single call-site with no post-loop value tests.
         bool utf8_next(const char* p, size_t n, size_t& i, uint32_t& cp) noexcept;
-
-        // Encode one code point as UTF-8 into `out` (which must have room for 4).
-        // Returns the number of bytes written.
-        size_t utf8_encode(uint32_t cp, char* out) noexcept;
 
     } // namespace detail
 

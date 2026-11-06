@@ -113,13 +113,17 @@ namespace megohttp {
         // Convenience: plaintext GET of an absolute http:// URL.
         CancelHandle get(string_view url, ResponseCallback on_complete);
 
-        // Future-based submission (S2.7-01, S2.7-02). Returns an operation
-        // object holding both the future and the cancel handle, so a caller can
-        // always cancel a request it is blocked on.
+        // Future-based submission (S2.7-01, S2.7-02). Overload of request()
+        // distinguished by arity: no callback means "give me a future instead".
+        // Returns an operation object holding both the future and the cancel
+        // handle, so a caller can always cancel a request it is blocked on.
         //
         // NOTE: FutureRequest::get() blocks the calling thread. Do not call it
         // from the thread that drives this Client's executor.
-        FutureRequest request_future(const Request& request);
+        FutureRequest request(const Request& request);
+
+        // Convenience: future-based GET.
+        FutureRequest get(string_view url);
 
         // Synchronous request (S2.7-03). Blocks the calling thread until the
         // response arrives or an error occurs. Internally reuses the async core

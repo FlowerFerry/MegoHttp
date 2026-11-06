@@ -29,6 +29,16 @@ static bool s_eq(const string& a, const char* b) {
         && std::memcmp(a.data(), b, std::strlen(b)) == 0;
 }
 
+// to_string(const char*) must compile in both modes and not be ambiguous
+// (regression test: memepp mode used to see both string_view and string_span
+// overloads as equally viable user-defined conversions from const char[N]).
+TEST_CASE("to_string literal disambiguation", "[string_adapter]") {
+    // This exact syntax (literal, no explicit size) is the one that broke
+    // in memepp mode before the dedicated const char* overload.
+    const string s = to_string("literal");
+    CHECK(s_eq(s, "literal"));
+}
+
 TEST_CASE("url basic", "[core]") {
     // Simple http URL
     {
@@ -519,4 +529,169 @@ TEST_CASE("idna", "[core]") {
     }
     CHECK(is_ascii("example.com"));
     CHECK(!is_ascii("\xE4\xB8\xAD"));
+}
+
+
+// ---------------------------------------------------------------------------
+// UTF-8 validation across every code point that accepts it.
+//
+// Every function that consumes UTF-8 is exercised with malformed input at the
+// beginning, in the middle, and at the end of the string. This catches the
+// classic off-by-one and "only check first byte" bugs.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("punycode_encode rejects malformed UTF-8 at every position", "[idna]") {
+    SECTION("invalid start byte") {
+        CHECK(punycode_encode("\xFF\xFE").has_error());              // \xFF is never valid
+    }
+    SECTION("truncated 2-byte sequence (end)") {
+        CHECK(punycode_encode("\xC2").has_error());                  // C2 expects continuation
+    }
+    SECTION("truncated 3-byte sequence (end)") {
+        CHECK(punycode_encode("\xE4\xB8").has_error());
+    }
+    SECTION("truncated 4-byte sequence (end)") {
+        CHECK(punycode_encode("\xF0\x9F\x98").has_error());
+    }
+    SECTION("bad continuation byte (middle)") {
+        CHECK(punycode_encode("\xC2\xFF").has_error());              // \xFF is not a continuation byte
+    }
+    SECTION("bad continuation after valid prefix (middle)") {
+        CHECK(punycode_encode("ab\xC2\xFF cd").has_error());
+    }
+    SECTION("bad continuation at end of otherwise valid label") {
+        CHECK(punycode_encode("\xE4\xB8\xAD\xFF").has_error());      // 中 + invalid lead
+    }
+    SECTION("overlong encoding (2-byte form of U+002F)") {
+        CHECK(punycode_encode("\xC0\xAF").has_error());
+    }
+    SECTION("surrogate half (U+D800)") {
+        CHECK(punycode_encode("\xED\xA0\x80").has_error());
+    }
+    SECTION("mixed: valid prefix, bad tail") {
+        CHECK(punycode_encode("\xE4\xB8\xAD\xE4\xB8").has_error());  // 中 + truncated
+    }
+    SECTION("empty string") {
+        CHECK(punycode_encode("").has_error());
+    }
+    SECTION("pure ASCII is always accepted") {
+        auto r = punycode_encode("hello");
+        REQUIRE(r.has_value());
+        REQUIRE(s_eq(r.value(), "hello"));
+    }
+}
+
+TEST_CASE("idna_encode rejects malformed UTF-8 in each label", "[idna]") {
+    SECTION("bad start byte") {
+        CHECK(idna_encode("\xFF\xFE.com").has_error());
+    }
+    SECTION("truncated sequence at end of label") {
+        CHECK(idna_encode("\xE4\xB8").has_error());
+    }
+    SECTION("bad continuation in middle of label") {
+        CHECK(idna_encode("a\xC2\xFF b").has_error());
+    }
+    SECTION("empty string") {
+        CHECK(idna_encode("").has_error());
+    }
+    SECTION("empty label (double dot)") {
+        CHECK(idna_encode("a..b").has_error());
+    }
+    SECTION("valid multi-label passes through") {
+        auto r = idna_encode("\xE4\xB8\xAD\xE6\x96\x87.example.com");
+        REQUIRE(r.has_value());
+        REQUIRE(s_eq(r.value(), "xn--fiq228c.example.com"));
+    }
+}
+
+TEST_CASE("parse_url rejects malformed UTF-8 in host", "[url]") {
+    SECTION("invalid lead byte") {
+        CHECK(parse_url("http://\xFF\xFE.com/").has_error());
+    }
+    SECTION("truncated 3-byte at end") {
+        CHECK(parse_url("http://\xE4\xB8.com/").has_error());
+    }
+    SECTION("bad continuation (middle)") {
+        CHECK(parse_url("http://ab\xC2\xFF.cd/").has_error());
+    }
+    SECTION("valid + invalid tail") {
+        CHECK(parse_url("http://\xE4\xB8\xAD\xFF.com/").has_error());  // 中 + \xFF
+    }
+    SECTION("valid UTF-8 is accepted") {
+        auto r = parse_url("http://\xE4\xB8\xAD\xE6\x96\x87.com/");
+        REQUIRE(r.has_value());
+        REQUIRE(s_eq(r.value().host, "xn--fiq228c.com"));
+    }
+    SECTION("mixed label: valid then bad") {
+        CHECK(parse_url("http://\xE4\xB8\xAD\xE4\xB8.com/").has_error());  // 中 + truncated
+    }
+}
+
+TEST_CASE("parse_url: malformed UTF-8 in path is copied through (no validation)", "[url]") {
+    // The path is stored as-is; it is not subject to UTF-8 validation.
+    // The only requirement is that it must not contain control characters
+    // (CR, LF, or unescaped spaces).
+    auto r = parse_url("http://example.com/\xE4\xB8\xAD\xFF");
+    REQUIRE(r.has_value());
+    // The raw bytes survive: 中 + \xFF
+    REQUIRE(r.value().path.size() >= 3);
+}
+
+TEST_CASE("parse_url: malformed UTF-8 in query is copied through (no validation)", "[url]") {
+    auto r = parse_url("http://example.com/?\xE4\xB8\xAD\xFF");
+    REQUIRE(r.has_value());
+    REQUIRE(r.value().has_query);
+    REQUIRE(r.value().query.size() >= 3);
+}
+
+
+TEST_CASE("is_valid_ascii_host follows the label grammar", "[url]") {
+    SECTION("ordinary names") {
+        CHECK(is_valid_ascii_host("example.com"));
+        CHECK(is_valid_ascii_host("a"));
+        CHECK(is_valid_ascii_host("a-b.c-d.e"));
+        CHECK(is_valid_ascii_host("123.456"));
+        CHECK(is_valid_ascii_host("xn--fiq228c.com"));
+    }
+    SECTION("label must not start or end with '-'") {
+        CHECK(!is_valid_ascii_host("-example.com"));
+        CHECK(!is_valid_ascii_host("example-.com"));
+        CHECK(!is_valid_ascii_host("a.-b.c"));
+        CHECK(!is_valid_ascii_host("a.b-.c"));
+    }
+    SECTION("empty labels are rejected") {
+        CHECK(!is_valid_ascii_host(".a"));
+        CHECK(!is_valid_ascii_host("a."));
+        CHECK(!is_valid_ascii_host("a..b"));
+        CHECK(!is_valid_ascii_host(""));
+    }
+    SECTION("length limits") {
+        const std::string ok63(63, 'a');           // exactly 63: allowed
+        CHECK(is_valid_ascii_host(ok63.c_str()));
+        const std::string bad64(64, 'a');          // 64: rejected
+        CHECK(!is_valid_ascii_host(bad64.c_str()));
+        // Total length: 253 allowed, 254 rejected.
+        std::string s253;
+        while (s253.size() + 63 + 1 <= 253) { s253.append(63, 'a'); s253.push_back('.'); }
+        if (s253.size() < 253) s253.append(253 - s253.size(), 'a');
+        CHECK(s253.size() == 253);
+        CHECK(is_valid_ascii_host(s253.c_str()));
+        std::string s254 = s253;
+        s254.push_back('b');
+        CHECK(s254.size() == 254);
+        CHECK(!is_valid_ascii_host(s254.c_str()));
+    }
+    SECTION("only alnum, hyphen and dot are allowed") {
+        CHECK(!is_valid_ascii_host("exa mple.com"));    // space
+        CHECK(!is_valid_ascii_host("example_com"));     // underscore
+        CHECK(!is_valid_ascii_host("example!.com"));    // punctuation
+        CHECK(!is_valid_ascii_host("exam\tple.com"));   // tab
+        // NUL byte inside the view: construct the view with an explicit length.
+        CHECK(!is_valid_ascii_host(string_view("a\0b", 3)));
+        CHECK(!is_valid_ascii_host("\xE4\xB8\xAD.com")); // non-ASCII
+    }
+    SECTION("trailing dot is rejected") {
+        CHECK(!is_valid_ascii_host("example.com."));
+        CHECK(!is_valid_ascii_host("a."));
+    }
 }

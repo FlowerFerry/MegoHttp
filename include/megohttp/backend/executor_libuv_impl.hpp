@@ -100,11 +100,13 @@ namespace libuv_backend {
         real_ = real;
         if (cancelled_.load() && real_) { real_->cancel(); self_.reset(); return; }
 
-        auto self = shared_from_this();
+        auto self = weak_from_this();
         if (auto* uv_t = dynamic_cast<UvTimer*>(real.get())) {
             uv_t->set_on_fired([self]() mutable {
-                std::lock_guard<std::mutex> lk2(self->m_);
-                self->self_.reset();
+                if (auto s = self.lock()) {
+                    std::lock_guard<std::mutex> lk2(s->m_);
+                    s->self_.reset();
+                }
             });
         }
     }

@@ -4,7 +4,7 @@ set(CATCH2_ROOT "${MGHTTP_DEPS_DIR}/Catch2-v3.7.1")
 
 if(EXISTS "${CATCH2_ROOT}/src/catch2/catch_all.hpp")
     message(STATUS "Catch2: in-tree ${CATCH2_ROOT}")
-    add_subdirectory(${CATCH2_ROOT} EXCLUDE_FROM_ALL)
+    add_subdirectory(${CATCH2_ROOT} ${CMAKE_BINARY_DIR}/_deps/catch2-build EXCLUDE_FROM_ALL)
 else()
     message(STATUS "Catch2: not in-tree, using FetchContent (needs network)")
     include(FetchContent)

@@ -122,11 +122,22 @@ set(MEMESTRING_BIN_DIR "${MEMESTRING_ROOT}")
 # lives wherever the MemeString project was built. Override with
 # -DMEMESTRING_RUNTIME=<path to liblibmeme_string.dll> when the layout differs.
 if(NOT MEMESTRING_RUNTIME)
-    set(_mm_candidates
-        "${MEMESTRING_ROOT}/liblibmeme_string.dll"
-        "${MEMESTRING_ROOT}/../MemeString/liblibmeme_string.dll"
-        "D:/_mego_openlib/MemeString/liblibmeme_string.dll"
-        "D:/_mego_openlib/MemeString/build_verify/liblibmeme_string.dll")
+    if(MSVC)
+        # Prefer the MSVC-built runtime: a MinGW-built MemeString DLL faults at
+        # process exit under this machine's sandboxed environment, and its C++
+        # ABI does not match an MSVC consumer anyway.
+        set(_mm_candidates
+            "${MEMESTRING_ROOT}/../MemeString/build/Release/libmeme_string.dll"
+            "D:/_mego_openlib/MemeString/build/Release/libmeme_string.dll"
+            "${MEMESTRING_ROOT}/liblibmeme_string.dll"
+            "D:/_mego_openlib/MemeString/liblibmeme_string.dll")
+    else()
+        set(_mm_candidates
+            "${MEMESTRING_ROOT}/liblibmeme_string.dll"
+            "${MEMESTRING_ROOT}/../MemeString/liblibmeme_string.dll"
+            "D:/_mego_openlib/MemeString/liblibmeme_string.dll"
+            "D:/_mego_openlib/MemeString/build_verify/liblibmeme_string.dll")
+    endif()
     foreach(candidate IN LISTS _mm_candidates)
         if(EXISTS "${candidate}")
             set(MEMESTRING_RUNTIME "${candidate}")
@@ -145,11 +156,32 @@ endif()
 
 set(MGHTTP_DEPS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/deps")
 
+# The prebuilt dependency trees are per-toolchain. MSVC objects cannot be linked
+# into a MinGW image (and vice versa) -- different name mangling, different CRT,
+# different struct layouts. Pick the tree matching the active compiler.
+if(MSVC)
+    set(MGHTTP_DEP_BUILD "build_msvc")
+else()
+    set(MGHTTP_DEP_BUILD "build_mingw")
+endif()
+message(STATUS "Dependency build tree: ${MGHTTP_DEP_BUILD}")
+
+# fmt's Unicode support requires /utf-8 on MSVC, and the sources are UTF-8
+# without BOM, so the default code page (936 here) would misread them.
+if(MSVC)
+    add_compile_options(/utf-8)
+endif()
+
 # fmt is the only formatter used anywhere in the library.
 set(FMT_ROOT "${MGHTTP_DEPS_DIR}/fmt-12.2.0")
-if(WIN32 AND EXISTS "${FMT_ROOT}/build_mingw/libfmt.a")
+if(MSVC)
+    set(FMT_LIB "${FMT_ROOT}/${MGHTTP_DEP_BUILD}/Release/fmt.lib")
+else()
+    set(FMT_LIB "${FMT_ROOT}/${MGHTTP_DEP_BUILD}/libfmt.a")
+endif()
+if(EXISTS "${FMT_LIB}")
     set(MGHTTP_FMT_AVAILABLE ON)
-    message(STATUS "fmt: in-tree ${FMT_ROOT}/build_mingw/libfmt.a")
+    message(STATUS "fmt: in-tree ${FMT_LIB}")
 else()
     find_package(fmt CONFIG QUIET)
     set(MGHTTP_FMT_AVAILABLE ${fmt_FOUND})
@@ -173,10 +205,12 @@ if(MGHTTP_BACKEND_LIBUV)
     # In-tree libuv (1.53.0) built as a static library.
     set(LIBUV_ROOT "${MGHTTP_DEPS_DIR}/libuv-1.53.0")
     if(EXISTS "${LIBUV_ROOT}/include/uv.h")
-        if(WIN32)
-            set(LIBUV_LIB "${LIBUV_ROOT}/build_mingw/libuv.a")
+        if(MSVC)
+            set(LIBUV_LIB "${LIBUV_ROOT}/${MGHTTP_DEP_BUILD}/Release/libuv.lib")
+        elseif(WIN32)
+            set(LIBUV_LIB "${LIBUV_ROOT}/${MGHTTP_DEP_BUILD}/libuv.a")
         else()
-            set(LIBUV_LIB "${LIBUV_ROOT}/build_mingw/libuv_a.a")
+            set(LIBUV_LIB "${LIBUV_ROOT}/${MGHTTP_DEP_BUILD}/libuv_a.a")
         endif()
         if(EXISTS "${LIBUV_LIB}")
             set(MGHTTP_LIBUV_AVAILABLE ON)
@@ -228,9 +262,16 @@ endif()
 # independently and both being off must not link it.
 if(MGHTTP_ENABLE_GZIP OR MGHTTP_ENABLE_WEBSOCKET_DEFLATE)
     set(ZLIB_ROOT "${MGHTTP_DEPS_DIR}/zlib-1.3.1")
-    if(WIN32 AND EXISTS "${ZLIB_ROOT}/build_mingw/libzlibstatic.a")
+    if(MSVC)
+        set(ZLIB_LIB "${ZLIB_ROOT}/${MGHTTP_DEP_BUILD}/Release/zlibstatic.lib")
+    elseif(WIN32)
+        set(ZLIB_LIB "${ZLIB_ROOT}/${MGHTTP_DEP_BUILD}/libzlibstatic.a")
+    else()
+        set(ZLIB_LIB "${ZLIB_ROOT}/${MGHTTP_DEP_BUILD}/libzlibstatic.a")
+    endif()
+    if(EXISTS "${ZLIB_LIB}")
         set(MGHTTP_ZLIB_AVAILABLE ON)
-        message(STATUS "zlib: in-tree ${ZLIB_ROOT}/build_mingw/libzlibstatic.a")
+        message(STATUS "zlib: in-tree ${ZLIB_LIB}")
     else()
         find_package(ZLIB QUIET)
         set(MGHTTP_ZLIB_AVAILABLE ${ZLIB_FOUND})
@@ -396,7 +437,7 @@ if(TARGET fmt::fmt)
 else()
     target_include_directories(megohttp INTERFACE
         $<BUILD_INTERFACE:${FMT_ROOT}/include>)
-    target_link_libraries(megohttp INTERFACE "$<BUILD_INTERFACE:${FMT_ROOT}/build_mingw/libfmt.a>")
+    target_link_libraries(megohttp INTERFACE "$<BUILD_INTERFACE:${FMT_LIB}>")
 endif()
 
 if(MGHTTP_USE_UVW AND MGHTTP_UVW_AVAILABLE)
@@ -408,7 +449,21 @@ endif()
 # MemeString is linked ONLY in MemeString mode: error.hpp and config.hpp no longer
 # pull in any MemeString header, so the std::string build needs nothing from it.
 if(MGHTTP_USE_MEMESTRING)
-    if(WIN32)
+    if(MSVC)
+        # MSVC's linker needs an import library, not the DLL itself.
+        get_filename_component(MEMESTRING_RUNTIME_DIR "${MEMESTRING_RUNTIME}" DIRECTORY)
+        get_filename_component(MEMESTRING_RUNTIME_NAME "${MEMESTRING_RUNTIME}" NAME_WE)
+        set(MEMESTRING_IMPLIB "${MEMESTRING_RUNTIME_DIR}/${MEMESTRING_RUNTIME_NAME}.lib")
+        if(NOT EXISTS "${MEMESTRING_IMPLIB}")
+            message(FATAL_ERROR
+                "MemeString import library not found: ${MEMESTRING_IMPLIB} "
+                "(expected next to ${MEMESTRING_RUNTIME})")
+        endif()
+        message(STATUS "MemeString runtime: ${MEMESTRING_RUNTIME}")
+        message(STATUS "MemeString implib:  ${MEMESTRING_IMPLIB}")
+        target_link_libraries(megohttp INTERFACE "$<BUILD_INTERFACE:${MEMESTRING_IMPLIB}>")
+        target_compile_definitions(megohttp INTERFACE MGHTTP_MEMESTRING_DIR="${MEMESTRING_RUNTIME_DIR}")
+    elseif(WIN32)
         # Link the DLL directly. Its import library in deps/MemeString/build_verify
         # was produced by a different toolchain build and resolves some symbols to a
         # stale `__imp_` form, which fails at link time even though the DLL exports
@@ -448,8 +503,8 @@ if((MGHTTP_ENABLE_GZIP OR MGHTTP_ENABLE_WEBSOCKET_DEFLATE) AND MGHTTP_ZLIB_AVAIL
     else()
         target_include_directories(megohttp INTERFACE
             $<BUILD_INTERFACE:${ZLIB_ROOT}>
-            $<BUILD_INTERFACE:${ZLIB_ROOT}/build_mingw>)
-        target_link_libraries(megohttp INTERFACE "${ZLIB_ROOT}/build_mingw/libzlibstatic.a")
+            $<BUILD_INTERFACE:${ZLIB_ROOT}/${MGHTTP_DEP_BUILD}>)
+        target_link_libraries(megohttp INTERFACE "${ZLIB_LIB}")
     endif()
 endif()
 

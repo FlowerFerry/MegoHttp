@@ -7,6 +7,7 @@
 #   include <memepp/string.hpp>
 #   include <memepp/string_view.hpp>
 #   include <memepp/string_span.hpp>
+#   include <memepp/convert/std/string.hpp>   // memepp::from(std::string&&)
 #else
 #   include <string>
 #   include <string_view>
@@ -16,6 +17,9 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+
+#include <fmt/compile.h>
+#include <fmt/format.h>
 
 namespace megohttp {
 
@@ -98,6 +102,27 @@ namespace megohttp {
         // Terminate a builder into an owning string.
         inline string sb_release(string_builder& b) {
             return b.release();
+        }
+
+        // Terminate an fmt::memory_buffer into the library's owning string.
+        //
+        // fmt::to_string always returns std::string. In MemeString mode the
+        // result goes through memepp::from, which takes over the heap buffer
+        // for a large payload instead of copying it.
+        inline string sb_release(fmt::memory_buffer& buf) {
+#if MEGOHTTP_HAS_MEMESTRING
+            return memepp::from(fmt::to_string(buf));
+#else
+            return fmt::to_string(buf);
+#endif
+        }
+
+        // Append raw bytes into an fmt buffer without a format string.
+        // Both string modes expose data()/size(), so this stays uniform.
+        inline void buf_append(fmt::memory_buffer& buf, string_view v) {
+            const char* p = v.data();
+            const size_t n = static_cast<size_t>(v.size());
+            if (n != 0) buf.append(p, p + n);
         }
 
         inline string sb_generate(const string_builder& b) {

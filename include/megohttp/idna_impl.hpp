@@ -11,55 +11,55 @@ namespace detail {
 
     inline bool utf8_next(const char* p, size_t n, size_t& i, uint32_t& cp) noexcept {
         if (i >= n) return false;
-        const unsigned char b0 = static_cast<unsigned char>(p[i]);
+        const uint8_t* s = reinterpret_cast<const uint8_t*>(p) + i;
+        const size_t avail = n - i;
+        const uint8_t b0 = s[0];
+
+        // ASCII: the overwhelmingly common case for a DNS label.
         if (b0 < 0x80) { cp = b0; ++i; return true; }
 
-        size_t len = 0;
-        uint32_t value = 0;
-        if ((b0 & 0xE0) == 0xC0)      { len = 2; value = b0 & 0x1Fu; }
-        else if ((b0 & 0xF0) == 0xE0) { len = 3; value = b0 & 0x0Fu; }
-        else if ((b0 & 0xF8) == 0xF0) { len = 4; value = b0 & 0x07u; }
-        else return false;                         // continuation byte or invalid lead
-
-        if (i + len > n) return false;             // truncated sequence
-        for (size_t k = 1; k < len; ++k) {
-            const unsigned char bk = static_cast<unsigned char>(p[i + k]);
-            if ((bk & 0xC0) != 0x80) return false; // not a continuation byte
-            value = (value << 6) | (bk & 0x3Fu);
+        // 2-byte. 0xC0 and 0xC1 can only produce overlongs, so rejecting
+        // b0 < 0xC2 removes that check from the value path.
+        if (b0 < 0xE0) {
+            if (b0 < 0xC2 || avail < 2) return false;
+            const uint8_t b1 = s[1];
+            if ((b1 & 0xC0) != 0x80) return false;
+            cp = (uint32_t(b0 & 0x1F) << 6) | (b1 & 0x3F);
+            i += 2;
+            return true;
         }
-        // Reject overlong encodings and values outside the Unicode range.
-        if (len == 2 && value < 0x80) return false;
-        if (len == 3 && value < 0x800) return false;
-        if (len == 4 && value < 0x10000) return false;
-        if (value > 0x10FFFF) return false;
-        if (value >= 0xD800 && value <= 0xDFFF) return false;   // surrogate half
 
-        cp = value;
-        i += len;
+        // 3-byte. The overlong guard (U+0800) and the surrogate guard (U+D800..
+        // U+DFFF) both reduce to a range test on b1 alone.
+        if (b0 < 0xF0) {
+            if (avail < 3) return false;
+            const uint8_t b1 = s[1];
+            const uint8_t b2 = s[2];
+            uint8_t lo = 0x80, hi = 0xBF;
+            if (b0 == 0xE0)      lo = 0xA0;   // reject overlong
+            else if (b0 == 0xED) hi = 0x9F;   // reject surrogate halves
+            if (b1 < lo || b1 > hi) return false;
+            if ((b2 & 0xC0) != 0x80) return false;
+            cp = (uint32_t(b0 & 0x0F) << 12) | (uint32_t(b1 & 0x3F) << 6) | (b2 & 0x3F);
+            i += 3;
+            return true;
+        }
+
+        // 4-byte. 0xF5..0xFF exceed U+10FFFF outright; 0xF0 and 0xF4 need the
+        // overlong / range guards on b1.
+        if (b0 > 0xF4 || avail < 4) return false;
+        const uint8_t b1 = s[1];
+        const uint8_t b2 = s[2];
+        const uint8_t b3 = s[3];
+        uint8_t lo = 0x80, hi = 0xBF;
+        if (b0 == 0xF0)      lo = 0x90;       // reject overlong
+        else if (b0 == 0xF4) hi = 0x8F;       // reject > U+10FFFF
+        if (b1 < lo || b1 > hi) return false;
+        if ((b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80) return false;
+        cp = (uint32_t(b0 & 0x07) << 18) | (uint32_t(b1 & 0x3F) << 12)
+           | (uint32_t(b2 & 0x3F) << 6) | (b3 & 0x3F);
+        i += 4;
         return true;
-    }
-
-    inline size_t utf8_encode(uint32_t cp, char* out) noexcept {
-        if (cp < 0x80) {
-            out[0] = static_cast<char>(cp);
-            return 1;
-        }
-        if (cp < 0x800) {
-            out[0] = static_cast<char>(0xC0 | (cp >> 6));
-            out[1] = static_cast<char>(0x80 | (cp & 0x3F));
-            return 2;
-        }
-        if (cp < 0x10000) {
-            out[0] = static_cast<char>(0xE0 | (cp >> 12));
-            out[1] = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-            out[2] = static_cast<char>(0x80 | (cp & 0x3F));
-            return 3;
-        }
-        out[0] = static_cast<char>(0xF0 | (cp >> 18));
-        out[1] = static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
-        out[2] = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-        out[3] = static_cast<char>(0x80 | (cp & 0x3F));
-        return 4;
     }
 
 } // namespace detail
@@ -122,11 +122,11 @@ namespace detail {
             cps.push_back(cp);
         }
 
-        string_builder out;
+        fmt::memory_buffer out;
 
         // Basic code points are copied through verbatim.
         for (uint32_t cp : cps) {
-            if (cp < 0x80) detail::sb_append(out, static_cast<char>(cp));
+            if (cp < 0x80) out.push_back(static_cast<char>(cp));
         }
         size_t handled = out.size();
         const size_t basic_count = handled;
@@ -135,7 +135,7 @@ namespace detail {
         // part to follow. A label that is entirely ASCII encodes to itself with no
         // trailing '-', which is what makes idna_encode idempotent.
         if (basic_count > 0 && basic_count < cps.size()) {
-            detail::sb_append(out, '-');
+            out.push_back('-');
         }
 
         uint32_t n_val = detail::kInitialN;
@@ -174,11 +174,11 @@ namespace detail {
                                         : (k >= bias + detail::kTMax ? detail::kTMax
                                                                      : k - bias);
                         if (q < t) break;
-                        detail::sb_append(out, detail::encode_digit(
+                        out.push_back(detail::encode_digit(
                             t + (q - t) % (detail::kBase - t)));
                         q = (q - t) / (detail::kBase - t);
                     }
-                    detail::sb_append(out, detail::encode_digit(q));
+                    out.push_back(detail::encode_digit(q));
                     bias = detail::adapt(delta, static_cast<uint32_t>(handled + 1),
                                          handled == basic_count);
                     delta = 0;
@@ -189,7 +189,7 @@ namespace detail {
             ++n_val;
         }
 
-        return out.release();
+        return detail::sb_release(out);
     }
 
     inline Result<string> idna_encode(const string_view& host) {
@@ -218,7 +218,7 @@ namespace detail {
         }
 
         // Split on '.', convert each non-ASCII label, keep ASCII labels as-is.
-        string_builder out;
+        fmt::memory_buffer out;
         const char* p = host.data();
         size_t label_start = 0;
         bool first = true;
@@ -232,22 +232,22 @@ namespace detail {
             }
             const string_view label(p + label_start,
                                     static_cast<string_view::size_type>(len));
-            if (!first) detail::sb_append(out, '.');
+            if (!first) out.push_back('.');
 
             if (is_ascii(label)) {
-                detail::sb_append(out, label);
+                detail::buf_append(out, label);
             } else {
                 auto encoded = punycode_encode(label);
                 if (!encoded) return encoded.error();
-                detail::sb_append(out, "xn--");
-                detail::sb_append(out, to_view(encoded.value()));
+                out.push_back('x'); out.push_back('n'); out.push_back('-'); out.push_back('-');
+                detail::buf_append(out, to_view(encoded.value()));
             }
 
             first = false;
             label_start = i + 1;
         }
 
-        string result = out.release();
+        string result = detail::sb_release(out);
         // Validate the encoded total length, then each label's own limit.
         if (result.size() > 253) {
             return Error{ErrorCode::InvalidArgument, "encoded host exceeds 253 bytes"};

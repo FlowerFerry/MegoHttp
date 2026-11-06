@@ -50,6 +50,19 @@ namespace detail {
     inline TcpStream::~TcpStream() {
         if (loop_ != nullptr && !closing_) {
             closing_ = true;
+            // Stop reading before closing. uv_close alone does not cancel a read
+            // that was started by uv_read_start, so libuv can still deliver data
+            // into a buffer whose owning object is being destroyed. That is the
+            // root cause of the intermittent heap corruption: the loop thread was
+            // inside uv__process_tcp_read_req while ~TcpStream tore the handle
+            // down from another path.
+            if (open_) {
+                open_ = false;
+                read_dst_ = nullptr;
+                read_cap_ = 0;
+                read_cb_ = nullptr;
+                uv_read_stop(reinterpret_cast<uv_stream_t*>(&tcp_));
+            }
             tcp_.data = nullptr;
             if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&tcp_))) {
                 uv_close(reinterpret_cast<uv_handle_t*>(&tcp_), nullptr);

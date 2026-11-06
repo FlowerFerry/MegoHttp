@@ -14,20 +14,31 @@ namespace megohttp {
     //
     // The symbol set is fixed and short, so a constexpr lookup beats the hand-
     // written boolean chain in readability and is just as fast at -O2.
-    inline bool is_valid_header_name(string_view name) noexcept {
-        constexpr std::string_view symbols = "!#$%&'*+-.^_`|~";
-        const size_t n = static_cast<size_t>(name.size());
-        if (n == 0) return false;
-        const char* p = name.data();
-        for (size_t i = 0; i < n; ++i) {
-            const unsigned char c = static_cast<unsigned char>(p[i]);
-            const bool is_alnum =
-                (c >= 'a' && c <= 'z') ||
-                (c >= 'A' && c <= 'Z') ||
-                (c >= '0' && c <= '9');
-            if (!is_alnum && symbols.find(static_cast<char>(c)) == std::string_view::npos) {
-                return false;
+    // RFC 7230 tchar lookup table: built at compile time, checked at run time
+    // with one array access instead of is_alnum + string_view::find.
+    namespace detail {
+
+        struct TcharTable {
+            bool v[256]{};
+            constexpr TcharTable() {
+                for (int c = '0'; c <= '9'; ++c) v[c] = true;
+                for (int c = 'a'; c <= 'z'; ++c) v[c] = true;
+                for (int c = 'A'; c <= 'Z'; ++c) v[c] = true;
+                constexpr std::string_view symbols = "!#$%&'*+-.^_`|~";
+                for (char c : symbols) v[static_cast<unsigned char>(c)] = true;
             }
+            constexpr bool operator[](unsigned char c) const noexcept { return v[c]; }
+        };
+
+    } // namespace detail
+
+    inline bool is_valid_header_name(string_view name) noexcept {
+        // Function-local static: zero-initialised once, available to the whole
+        // program, and no header-level definition to collide across TUs.
+        static constexpr detail::TcharTable kTchar{};
+        if (name.empty()) return false;
+        for (unsigned char c : name) {
+            if (!kTchar[c]) return false;
         }
         return true;
     }

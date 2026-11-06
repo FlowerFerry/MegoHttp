@@ -51,14 +51,6 @@ namespace detail {
         return true;
     }
 
-    // Decimal into a builder. Formatting goes through fmt, never a hand-rolled
-    // digit loop and never snprintf: fmt is locale-independent and cannot
-    // overflow a fixed stack buffer.
-    inline void append_int(string_builder& b, uint32_t v) {
-        const string text = format_string("{}", v);
-        sb_append(b, text);
-    }
-
 } // namespace detail
 
     inline uint16_t Url::default_port(Scheme s) noexcept {
@@ -111,23 +103,69 @@ namespace detail {
         return groups == 4;
     }
 
+    namespace detail {
+
+        // Character classes for an ASCII host name. Every non-classified byte
+        // (non-ASCII, control, space, any other punctuation) stays kBad, so the
+        // table is both the whitelist and the reject list.
+        enum HostCharClass : unsigned char {
+            kBad    = 0,
+            kAlnum  = 1,   // a-z A-Z 0-9
+            kHyphen = 2,   // '-'
+            kDot    = 3,   // '.'
+        };
+
+        struct HostClassTable {
+            unsigned char v[256]{};
+            constexpr HostClassTable() {
+                for (int c = '0'; c <= '9'; ++c) v[c] = kAlnum;
+                for (int c = 'a'; c <= 'z'; ++c) v[c] = kAlnum;
+                for (int c = 'A'; c <= 'Z'; ++c) v[c] = kAlnum;
+                v[static_cast<unsigned char>('-')] = kHyphen;
+                v[static_cast<unsigned char>('.')] = kDot;
+            }
+            constexpr unsigned char operator[](unsigned char c) const noexcept { return v[c]; }
+        };
+
+    } // namespace detail
+
     inline bool is_valid_ascii_host(string_view host) noexcept {
-        const size_t n = static_cast<size_t>((host).size());
+        using namespace detail;
+        // Function-local static: initialised once on first use.
+        static constexpr HostClassTable kHostClass{};
+
+        const size_t n = static_cast<size_t>(host.size());
         if (n == 0 || n > 253) return false;
-        const char* p = (host).data();
-        bool prev_dot = true;   // a label must not start with '.'
-        for (size_t i = 0; i < n; ++i) {
-            const unsigned char c = static_cast<unsigned char>(p[i]);
-            if (c >= 0x80) return false;                 // ASCII only; IDNA must pre-encode
-            if (c <= 0x20 || c == 0x7F) return false;    // no spaces / controls
-            const bool ok =
-                (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                (c >= '0' && c <= '9') || c == '-' || c == '.';
-            if (!ok) return false;
-            if (c == '.' && prev_dot) return false;      // empty label
-            prev_dot = (c == '.');
+
+        // A trailing dot is rejected: this validates a Host header / connect
+        // target, where "example.com." would not match the certificate name or
+        // the DNS answer the caller already holds.
+        size_t label_len = 0;
+        unsigned char prev = kDot;
+
+        for (unsigned char ch : host) {
+            const unsigned char cls = kHostClass[ch];
+            switch (cls) {
+            case kAlnum:
+                ++label_len;
+                break;
+            case kHyphen:
+                if (label_len == 0) return false;    // label starts with '-'
+                ++label_len;
+                break;
+            case kDot:
+                if (label_len == 0) return false;    // empty label ("a..b" or ".a")
+                if (prev == kHyphen) return false;   // label ends with '-'
+                label_len = 0;
+                break;
+            default:
+                return false;                        // non-ASCII / control / other
+            }
+            if (label_len > 63) return false;        // label too long
+            prev = cls;
         }
-        return !prev_dot;                                 // no trailing dot
+        // The last label must be non-empty and must not end with '-'.
+        return label_len != 0 && prev != kHyphen;
     }
 
     inline Result<Url> parse_url(string_view text) {
@@ -308,46 +346,50 @@ namespace detail {
     }
 
     inline string Url::host_port_header() const {
-        string_builder b;
-        if (is_ipv6_literal) { detail::sb_append(b, '['); detail::sb_append(b, host); detail::sb_append(b, ']'); }
-        else { detail::sb_append(b, host); }
+        fmt::memory_buffer buf;
+        if (is_ipv6_literal) buf.push_back('[');
+        detail::buf_append(buf, host);
+        if (is_ipv6_literal) buf.push_back(']');
 
-        // Omit the port only when it equals the scheme default (RFC 7230 Host rules).
         if (port != default_port(scheme)) {
-            detail::sb_append(b, ':');
-            detail::append_int(b, static_cast<uint32_t>(port));
+            fmt::format_to(fmt::appender(buf), FMT_COMPILE(":{}"),
+                           static_cast<uint32_t>(port));
         }
-        return b.release();
+        return detail::sb_release(buf);
     }
 
     inline string Url::origin() const {
-        string_builder b;
+        fmt::memory_buffer buf;
+        auto out = fmt::appender(buf);
         switch (scheme) {
-        case Scheme::Http:  detail::sb_append(b, "http");  break;
-        case Scheme::Https: detail::sb_append(b, "https"); break;
-        case Scheme::Ws:    detail::sb_append(b, "ws");    break;
-        case Scheme::Wss:   detail::sb_append(b, "wss");   break;
-        case Scheme::Unknown: break;   // no scheme text for an unparsed URL
+        case Scheme::Http:  fmt::format_to(out, FMT_COMPILE("http"));  break;
+        case Scheme::Https: fmt::format_to(out, FMT_COMPILE("https")); break;
+        case Scheme::Ws:    fmt::format_to(out, FMT_COMPILE("ws"));    break;
+        case Scheme::Wss:   fmt::format_to(out, FMT_COMPILE("wss"));   break;
+        case Scheme::Unknown: break;
         }
-        detail::sb_append(b, "://");
-        detail::sb_append(b, host_port_header());
-        return b.release();
+        fmt::format_to(out, FMT_COMPILE("://"));
+        detail::buf_append(buf, host_port_header());
+        return detail::sb_release(buf);
     }
 
     inline string Url::request_target() const {
-        string_builder b;
-        if (path.empty()) detail::sb_append(b, '/'); else detail::sb_append(b, path);
-        if (has_query) { detail::sb_append(b, '?'); detail::sb_append(b, query); }
-        return b.release();
+        fmt::memory_buffer buf;
+        if (path.empty()) buf.push_back('/'); else detail::buf_append(buf, path);
+        if (has_query) {
+            buf.push_back('?');
+            detail::buf_append(buf, query);
+        }
+        return detail::sb_release(buf);
     }
 
     inline string Url::absolute_form_target() const {
-        // absolute-form is only defined for http (a plain forward proxy).
-        string_builder b;
-        detail::sb_append(b, "http://");
-        detail::sb_append(b, host_port_header());
-        detail::sb_append(b, request_target());
-        return b.release();
+        fmt::memory_buffer buf;
+        auto out = fmt::appender(buf);
+        fmt::format_to(out, FMT_COMPILE("http://"));
+        detail::buf_append(buf, host_port_header());
+        detail::buf_append(buf, request_target());
+        return detail::sb_release(buf);
     }
 
 } // namespace megohttp

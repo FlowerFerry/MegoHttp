@@ -158,7 +158,9 @@ namespace megohttp {
             return Error{ErrorCode::InvalidArgument, "request target contains CR/LF/NUL"};
         }
 
-        string_builder b;
+        fmt::memory_buffer buf;
+        auto out = fmt::appender(buf);
+
         if (method == Method::Custom) {
             if (static_cast<size_t>((custom_method).size()) == 0) {
                 return Error{ErrorCode::InvalidArgument, "custom method name is empty"};
@@ -166,22 +168,17 @@ namespace megohttp {
             if (!is_valid_header_name(custom_method)) {   // same token grammar
                 return Error{ErrorCode::InvalidArgument, "invalid custom method name"};
             }
-            detail::sb_append(b, custom_method);
+            fmt::format_to(out, "{} {} HTTP/1.1\r\n", custom_method, request_target);
         } else {
-            detail::sb_append(b, to_string(method));
+            fmt::format_to(out, "{} {} HTTP/1.1\r\n", to_string(method), request_target);
         }
-        detail::sb_append(b, ' ');
-        detail::sb_append(b, request_target);
-        detail::sb_append(b, " HTTP/1.1\r\n");
 
         for (const auto& f : headers) {
-            detail::sb_append(b, to_view(f.first));
-            detail::sb_append(b, ": ");
-            detail::sb_append(b, to_view(f.second));
-            detail::sb_append(b, "\r\n");
+            fmt::format_to(out, "{}: {}\r\n", f.first, f.second);
         }
-        detail::sb_append(b, "\r\n");
-        return b.release();
+        buf.push_back('\r');
+        buf.push_back('\n');
+        return detail::sb_release(buf);
     }
 
     inline Result<string> encode_response_head(int status_code,
@@ -200,21 +197,17 @@ namespace megohttp {
             }
         }
 
-        string_builder b;
-        detail::sb_append(b, "HTTP/1.1 ");
-        detail::append_int(b, static_cast<uint32_t>(status_code));
-        detail::sb_append(b, ' ');
-        if (!reason.empty()) detail::sb_append(b, reason);
-        detail::sb_append(b, "\r\n");
+        fmt::memory_buffer buf;
+        auto out = fmt::appender(buf);
+
+        fmt::format_to(out, "HTTP/1.1 {} {}\r\n", status_code, reason);
 
         for (const auto& f : headers) {
-            detail::sb_append(b, to_view(f.first));
-            detail::sb_append(b, ": ");
-            detail::sb_append(b, to_view(f.second));
-            detail::sb_append(b, "\r\n");
+            fmt::format_to(out, "{}: {}\r\n", f.first, f.second);
         }
-        detail::sb_append(b, "\r\n");
-        return b.release();
+        buf.push_back('\r');
+        buf.push_back('\n');
+        return detail::sb_release(buf);
     }
 
     // ---------------------------------------------------------------------------
@@ -223,33 +216,35 @@ namespace megohttp {
     namespace chunked {
 
         inline string encode_chunk(const uint8_t* data, size_t size) {
-            string_builder b;
+            fmt::memory_buffer buf;
+            auto out = fmt::appender(buf);
             // Lowercase hex, no padding and no leading zeros (the canonical and
             // shortest form). fmt handles it; a hand-rolled nibble loop would be
             // another place to get the ordering wrong.
-            detail::sb_append(b, detail::format_string("{:x}", size));
-            detail::sb_append(b, "\r\n");
+            fmt::format_to(out, FMT_COMPILE("{:x}\r\n"), size);
             if (size != 0) {
-                b += string(reinterpret_cast<const char*>(data),
-                            static_cast<string::size_type>(size));
+                const char* p = reinterpret_cast<const char*>(data);
+                buf.append(p, p + size);
             }
-            detail::sb_append(b, "\r\n");
-            return b.release();
+            buf.push_back('\r');
+            buf.push_back('\n');
+            return detail::sb_release(buf);
         }
 
         inline string encode_last_chunk(const Headers* trailers) {
-            string_builder b;
-            detail::sb_append(b, "0\r\n");
+            fmt::memory_buffer buf;
+            auto out = fmt::appender(buf);
+            buf.push_back('0');
+            buf.push_back('\r');
+            buf.push_back('\n');
             if (trailers != nullptr) {
                 for (const auto& f : *trailers) {
-                    detail::sb_append(b, to_view(f.first));
-                    detail::sb_append(b, ": ");
-                    detail::sb_append(b, to_view(f.second));
-                    detail::sb_append(b, "\r\n");
+                    fmt::format_to(out, "{}: {}\r\n", f.first, f.second);
                 }
             }
-            detail::sb_append(b, "\r\n");
-            return b.release();
+            buf.push_back('\r');
+            buf.push_back('\n');
+            return detail::sb_release(buf);
         }
 
         inline Result<uint64_t> parse_chunk_size(string_view line) {
@@ -774,12 +769,12 @@ namespace megohttp {
 
             if (!te_all.empty()) {
                 // Combines all TE header values into one ordered token list.
-                string_builder te_b;
+                fmt::memory_buffer te_buf;
                 for (size_t k = 0; k < te_all.size(); ++k) {
-                    if (k > 0) detail::sb_append(te_b, ',');
-                    detail::sb_append(te_b, te_all[k]);
+                    if (k > 0) te_buf.push_back(',');
+                    detail::buf_append(te_buf, te_all[k]);
                 }
-                string te = te_b.release();
+                string te = detail::sb_release(te_buf);
                 auto tokens = http_detail::split_list(to_view(te));
                 if (tokens.empty()) {
                     return VoidResult{Error{ErrorCode::HttpAmbiguousFraming,

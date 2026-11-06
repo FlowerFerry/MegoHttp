@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <thread>
 
 #if defined(_WIN32)
@@ -730,7 +731,7 @@ TEST_CASE("future request returns the response", "[client][future]") {
     Client client;
     const string url = string("http://127.0.0.1:") + format("{}", srv.port()) + "/";
 
-    auto op = client.request_future(Request(Method::Get, url));
+    auto op = client.request(Request(Method::Get, url));
     REQUIRE(op.valid());
 
     // The client owns an internal loop thread, so blocking here is safe.
@@ -749,7 +750,7 @@ TEST_CASE("future request can be cancelled", "[client][future]") {
     o.resolver = res;
     Client client(o);
 
-    auto op = client.request_future(Request(Method::Get, "http://example.test/"));
+    auto op = client.request(Request(Method::Get, "http://example.test/"));
     REQUIRE(wait_until([&] { return res->count() == 1; }));
 
     op.cancel();
@@ -767,7 +768,7 @@ TEST_CASE("future wait_for reports not-ready then ready", "[client][future]") {
     o.resolver = res;
     Client client(o);
 
-    auto op = client.request_future(Request(Method::Get, "http://example.test/"));
+    auto op = client.request(Request(Method::Get, "http://example.test/"));
     REQUIRE(wait_until([&] { return res->count() == 1; }));
 
     // Nothing has completed yet: the lookup is parked in the resolver.
@@ -784,6 +785,190 @@ TEST_CASE("future wait_for reports not-ready then ready", "[client][future]") {
     REQUIRE((*got).error().code() == ErrorCode::Cancelled);
 }
 
+
+TEST_CASE("PROBE 1 future", "[probe]") {
+    TinyHttpServer srv;
+    REQUIRE(srv.start());
+    Client client;
+    const string url = string("http://127.0.0.1:") + format("{}", srv.port()) + "/";
+    auto a = client.request(Request(Method::Get, url));
+    auto ra = a.get();
+    REQUIRE(ra.has_value());
+    client.shutdown();
+    srv.stop();
+}
+
+TEST_CASE("PROBE 3 futures no get", "[probe]") {
+    TinyHttpServer srv;
+    REQUIRE(srv.start());
+    Client client;
+    const string url = string("http://127.0.0.1:") + format("{}", srv.port()) + "/";
+    auto a = client.request(Request(Method::Get, url));
+    auto b = client.request(Request(Method::Get, url));
+    auto c = client.request(Request(Method::Get, url));
+    (void)a; (void)b; (void)c;
+    client.shutdown();
+    srv.stop();
+}
+
+TEST_CASE("PROBE 3 futures get", "[probe]") {
+    TinyHttpServer srv;
+    REQUIRE(srv.start());
+    Client client;
+    const string url = string("http://127.0.0.1:") + format("{}", srv.port()) + "/";
+    auto a = client.request(Request(Method::Get, url));
+    auto b = client.request(Request(Method::Get, url));
+    auto c = client.request(Request(Method::Get, url));
+    auto ra = a.get(); auto rb = b.get(); auto rc = c.get();
+    REQUIRE(ra.has_value()); REQUIRE(rb.has_value()); REQUIRE(rc.has_value());
+    client.shutdown();
+    srv.stop();
+}
+
+TEST_CASE("PROBE 3 callbacks", "[probe]") {
+    TinyHttpServer srv;
+    REQUIRE(srv.start());
+    Client client;
+    const string url = string("http://127.0.0.1:") + format("{}", srv.port()) + "/";
+    std::atomic<int> n{0};
+    for (int i = 0; i < 3; ++i)
+        client.get(url, [&](Result<Response>) { n.fetch_add(1); });
+    for (int i = 0; i < 500 && n.load() < 3; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    REQUIRE(n.load() == 3);
+    client.shutdown();
+    srv.stop();
+}
+
+
+TEST_CASE("PROBE 2 futures get", "[probe]") {
+    TinyHttpServer srv;
+    REQUIRE(srv.start());
+    Client client;
+    const string url = string("http://127.0.0.1:") + format("{}", srv.port()) + "/";
+    auto a = client.request(Request(Method::Get, url));
+    auto b = client.request(Request(Method::Get, url));
+    auto ra = a.get(); auto rb = b.get();
+    REQUIRE(ra.has_value()); REQUIRE(rb.has_value());
+    client.shutdown();
+    srv.stop();
+}
+
+TEST_CASE("PROBE 3 futures get then sleep", "[probe]") {
+    TinyHttpServer srv;
+    REQUIRE(srv.start());
+    Client client;
+    const string url = string("http://127.0.0.1:") + format("{}", srv.port()) + "/";
+    auto a = client.request(Request(Method::Get, url));
+    auto b = client.request(Request(Method::Get, url));
+    auto c = client.request(Request(Method::Get, url));
+    auto ra = a.get(); auto rb = b.get(); auto rc = c.get();
+    REQUIRE(ra.has_value()); REQUIRE(rb.has_value()); REQUIRE(rc.has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    client.shutdown();
+    srv.stop();
+}
+
+TEST_CASE("PROBE 3 futures get no shutdown", "[probe]") {
+    TinyHttpServer srv;
+    REQUIRE(srv.start());
+    {
+        Client client;
+        const string url = string("http://127.0.0.1:") + format("{}", srv.port()) + "/";
+        auto a = client.request(Request(Method::Get, url));
+        auto b = client.request(Request(Method::Get, url));
+        auto c = client.request(Request(Method::Get, url));
+        auto ra = a.get(); auto rb = b.get(); auto rc = c.get();
+        REQUIRE(ra.has_value()); REQUIRE(rb.has_value()); REQUIRE(rc.has_value());
+    }
+    srv.stop();
+}
+
+
+TEST_CASE("PROBE 3 futures raw get only", "[probe]") {
+    TinyHttpServer srv;
+    REQUIRE(srv.start());
+    Client client;
+    const string url = string("http://127.0.0.1:") + format("{}", srv.port()) + "/";
+    auto a = client.request(Request(Method::Get, url));
+    auto b = client.request(Request(Method::Get, url));
+    auto c = client.request(Request(Method::Get, url));
+    { auto r = a.get(); REQUIRE(r.has_value()); }
+    { auto r = b.get(); REQUIRE(r.has_value()); }
+    { auto r = c.get(); REQUIRE(r.has_value()); }
+    client.shutdown();
+    srv.stop();
+}
+
+TEST_CASE("PROBE 3 sync requests", "[probe]") {
+    TinyHttpServer srv;
+    REQUIRE(srv.start());
+    Client client;
+    const string url = string("http://127.0.0.1:") + format("{}", srv.port()) + "/";
+    auto ra = client.get_sync(url);
+    auto rb = client.get_sync(url);
+    auto rc = client.get_sync(url);
+    REQUIRE(ra.has_value()); REQUIRE(rb.has_value()); REQUIRE(rc.has_value());
+    client.shutdown();
+    srv.stop();
+}
+
+TEST_CASE("PROBE 3 futures wait_for", "[probe]") {
+    TinyHttpServer srv;
+    REQUIRE(srv.start());
+    Client client;
+    const string url = string("http://127.0.0.1:") + format("{}", srv.port()) + "/";
+    auto a = client.request(Request(Method::Get, url));
+    auto b = client.request(Request(Method::Get, url));
+    auto c = client.request(Request(Method::Get, url));
+    auto ra = a.wait_for(std::chrono::seconds(10));
+    auto rb = b.wait_for(std::chrono::seconds(10));
+    auto rc = c.wait_for(std::chrono::seconds(10));
+    REQUIRE(ra.has_value()); REQUIRE(rb.has_value()); REQUIRE(rc.has_value());
+    client.shutdown();
+    srv.stop();
+}
+
+
+TEST_CASE("PROBE 3 futures no wait at all", "[probe]") {
+    TinyHttpServer srv;
+    REQUIRE(srv.start());
+    Client client;
+    const string url = string("http://127.0.0.1:") + format("{}", srv.port()) + "/";
+    auto a = client.request(Request(Method::Get, url));
+    auto b = client.request(Request(Method::Get, url));
+    auto c = client.request(Request(Method::Get, url));
+    // Give the loop time to complete all three, but never block on them.
+    for (int i = 0; i < 400; ++i) {
+        if (a.is_ready() && b.is_ready() && c.is_ready()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    REQUIRE(a.is_ready()); REQUIRE(b.is_ready()); REQUIRE(c.is_ready());
+    client.shutdown();
+    srv.stop();
+}
+
+TEST_CASE("PROBE 3 futures poll only", "[probe]") {
+    TinyHttpServer srv;
+    REQUIRE(srv.start());
+    Client client;
+    const string url = string("http://127.0.0.1:") + format("{}", srv.port()) + "/";
+    auto a = client.request(Request(Method::Get, url));
+    auto b = client.request(Request(Method::Get, url));
+    auto c = client.request(Request(Method::Get, url));
+    for (int i = 0; i < 400; ++i) {
+        if (a.is_ready() && b.is_ready() && c.is_ready()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    REQUIRE(a.is_ready());
+    auto ra = a.get();
+    auto rb = b.get();
+    auto rc = c.get();
+    REQUIRE(ra.has_value()); REQUIRE(rb.has_value()); REQUIRE(rc.has_value());
+    client.shutdown();
+    srv.stop();
+}
+
 TEST_CASE("multiple futures run independently", "[client][future]") {
     TinyHttpServer srv;
     REQUIRE(srv.start());
@@ -791,9 +976,9 @@ TEST_CASE("multiple futures run independently", "[client][future]") {
     Client client;
     const string url = string("http://127.0.0.1:") + format("{}", srv.port()) + "/";
 
-    auto a = client.request_future(Request(Method::Get, url));
-    auto b = client.request_future(Request(Method::Get, url));
-    auto c = client.request_future(Request(Method::Get, url));
+    auto a = client.request(Request(Method::Get, url));
+    auto b = client.request(Request(Method::Get, url));
+    auto c = client.request(Request(Method::Get, url));
 
     auto ra = a.get();
     auto rb = b.get();
@@ -1073,3 +1258,158 @@ TEST_CASE("no request callback fires after the Client is destroyed", "[client][s
 
     REQUIRE(fired.load() == 1);
 }
+
+// ---------------------------------------------------------------------------
+// Client on a CALLER-OWNED event loop (ClientOptions::executor injection).
+//
+// The executor layer has external-loop tests, but the Client layer had none:
+// the injected-executor path was declared in ClientOptions and never exercised.
+// These cover it, and assert the ownership contract -- the Client must never
+// stop or close somebody else's loop, and must not shut down an executor it
+// did not create.
+// ---------------------------------------------------------------------------
+
+#if defined(MGHTTP_BACKEND_LIBUV)
+TEST_CASE("client runs on a caller-owned libuv loop", "[client][external]") {
+    TinyHttpServer srv;
+    if (!srv.start()) {
+        std::printf("SKIP: could not start the local HTTP server\n");
+        return;
+    }
+
+    // The caller owns the loop and drives it by hand, so the Client can never
+    // be the one that stops it.
+    uv_loop_t loop;
+    REQUIRE(uv_loop_init(&loop) == 0);
+
+    auto ex = libuv_backend::UvExecutor::create_external(&loop);
+    REQUIRE(ex != nullptr);
+
+    // Contract: the wake handle is installed by the caller, on the driving
+    // thread. Until it exists, posts stay queued rather than being dropped.
+    ex->initialize_external_wake_handle();
+
+    // Pump helper: NOWAIT drains whatever is pending, then checks the predicate.
+    auto pump_until = [&](const std::function<bool()>& pred) {
+        for (int i = 0; i < 2500; ++i) {
+            uv_run(&loop, UV_RUN_NOWAIT);
+            if (pred()) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        uv_run(&loop, UV_RUN_NOWAIT);
+        return pred();
+    };
+
+    ClientOptions o;
+    o.executor = ex;                 // injected: the Client must not own it
+    Client client(o);
+
+    std::atomic<bool> done{false}, ok{false};
+    int status = 0;
+
+    const string url = string("http://127.0.0.1:") + format("{}", srv.port()) + "/";
+    client.get(url, [&](Result<Response> r) {
+        if (r) { ok.store(true); status = r.value().head().status_code; }
+        done.store(true);
+    });
+
+    CHECK(pump_until([&] { return done.load(); }));
+    CHECK(ok.load());
+    CHECK(status == 200);
+
+    // External mode never claims to know which thread drives the loop.
+    CHECK(ex->is_in_loop_thread() == false);
+
+    // Every handle the request created (DNS timer, send timer, recv timer, the
+    // TCP stream) must be released once the request reaches its terminal state.
+    // In external mode the executor never drains the loop itself, so the caller
+    // pumping is what lets the asynchronous uv_close callbacks run.
+    // Regression guard: DeferredTimer used to hold a strong self-reference inside
+    // the UvTimer's on_fired callback, forming a cycle that kept the timer -- and
+    // therefore its uv_timer_t -- alive forever, so the caller's loop could never
+    // be closed (uv_loop_close returned UV_EBUSY indefinitely).
+    auto count_handles = [](uv_loop_t* l) {
+        int total = 0;
+        uv_walk(l, [](uv_handle_t* h, void* arg) { (*static_cast<int*>(arg))++; }, &total);
+        return total;
+    };
+
+    for (int i = 0; i < 50; ++i) uv_run(&loop, UV_RUN_NOWAIT);
+    CHECK(count_handles(&loop) == 1);   // only the executor's own wake handle
+
+    client.shutdown();
+    for (int i = 0; i < 50; ++i) uv_run(&loop, UV_RUN_NOWAIT);
+    CHECK(count_handles(&loop) == 1);   // shutdown must not leak either
+
+    // The caller closes what the caller opened: the executor releases its own
+    // handle, then the caller's loop must become closable.
+    ex->shutdown();
+    for (int i = 0; i < 50; ++i) uv_run(&loop, UV_RUN_NOWAIT);
+    CHECK(count_handles(&loop) == 0);
+
+    int rc = UV_EBUSY;
+    for (int i = 0; i < 200; ++i) {
+        rc = uv_loop_close(&loop);
+        if (rc != UV_EBUSY) break;
+        uv_run(&loop, UV_RUN_NOWAIT);
+    }
+    CHECK(rc == 0);
+
+    srv.stop();
+}
+#endif
+
+#if defined(MGHTTP_BACKEND_ASIO)
+TEST_CASE("client runs on a caller-owned io_context", "[client][external][asio]") {
+    TinyHttpServer srv;
+    if (!srv.start()) {
+        std::printf("SKIP: could not start the local HTTP server\n");
+        return;
+    }
+
+    asio::io_context ioc;
+    auto ex = asio_backend::AsioExecutor::create_external(ioc);
+    REQUIRE(ex != nullptr);
+
+    // The executor's work guard keeps run() from returning while work is
+    // outstanding; the caller owns the driving thread.
+    std::thread driver([&] { ioc.run(); });
+
+    ClientOptions o;
+    o.executor = ex;                 // injected: the Client must not own it
+    Client client(o);
+
+    std::atomic<bool> done{false}, ok{false};
+    int status = 0;
+
+    const string url = string("http://127.0.0.1:") + format("{}", srv.port()) + "/";
+    client.get(url, [&](Result<Response> r) {
+        if (r) { ok.store(true); status = r.value().head().status_code; }
+        done.store(true);
+    });
+
+    CHECK(wait_until([&] { return done.load(); }));
+    CHECK(ok.load());
+    CHECK(status == 200);
+
+    // External mode cannot honestly answer "am I the loop thread", so it says no.
+    CHECK(ex->is_in_loop_thread() == false);
+
+    client.shutdown();
+
+    // The Client must not stop somebody else's io_context.
+    CHECK(ioc.stopped() == false);
+
+    std::atomic<int> after{0};
+    ex->post([&] { after.fetch_add(1); });
+    CHECK(wait_until([&] { return after.load() == 1; }));   // context still live
+
+    // Releasing the guard is what lets the caller's run() return.
+    ex->shutdown();
+    CHECK(wait_until([&] { return ioc.stopped(); }, 2000));
+    driver.join();
+
+    srv.stop();
+}
+#endif
+

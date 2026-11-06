@@ -8,7 +8,7 @@
 // requires.
 //
 // Usage:
-//     auto op = client.request_future(req);
+//     auto op = client.request(req);            // future overload
 //     // ... can call op.cancel() from any thread ...
 //     Result<Response> r = op.get();          // blocks until the terminal callback
 //
@@ -32,7 +32,7 @@
 namespace megohttp {
 
     // ---------------------------------------------------------------------------
-    // FutureRequest: the operation object returned by Client::request_future().
+    // FutureRequest: the operation object returned by Client::request(req).
     //
     // Carries BOTH the future and the cancel handle, so a caller never ends up
     // holding one without the other (spec 6.1).
@@ -82,13 +82,13 @@ namespace megohttp {
 // FutureRequest implementation (inline, needs the full Client)
 // ---------------------------------------------------------------------------
 
-inline FutureRequest Client::request_future(const Request& request) {
+inline FutureRequest Client::request(const Request& req) {
     // std::promise is move-only and std::function (the callback carrier) requires
     // a copyable target, so the promise lives in a shared_ptr captured by value.
     auto promise = std::make_shared<std::promise<Result<Response>>>();
     auto shared = promise->get_future().share();
 
-    auto handle = this->request(request,
+    auto handle = this->request(req,
         [promise](Result<Response> r) {
             // The completion callback runs exactly once, so set_value cannot throw
             // with future_error here; guard anyway so a stray second call can
@@ -99,7 +99,12 @@ inline FutureRequest Client::request_future(const Request& request) {
     return FutureRequest(std::move(shared), std::move(handle));
 }
 
-inline Result<Response> Client::request_sync(const Request& request) {
+inline FutureRequest Client::get(string_view url) {
+    Request req(Method::Get, url);
+    return request(req);
+}
+
+inline Result<Response> Client::request_sync(const Request& req) {
     // S2.7-04: detect the "caller == loop thread" deadlock.
     // Only reliable when the Client owns an internal loop (libuv).
     // For Asio or external executors the caller must ensure another thread
@@ -114,7 +119,7 @@ inline Result<Response> Client::request_sync(const Request& request) {
         }
     }
 #endif
-    return request_future(request).get();
+    return request(req).get();
 }
 
 inline Result<Response> Client::get_sync(string_view url) {
