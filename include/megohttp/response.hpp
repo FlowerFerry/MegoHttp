@@ -35,6 +35,10 @@ namespace megohttp {
         // 1xx codes received before the final response. The head itself describes
         // the FINAL response.
         std::vector<int> informational_status_codes;
+
+        // Chunked trailers, delivered after the body. Empty when the response was
+        // not chunked or carried no trailers.
+        Headers trailers;
     };
 
     // ---------------------------------------------------------------------------

@@ -44,6 +44,12 @@ namespace asio_backend {
         std::shared_ptr<Timer> schedule_after(Duration d, std::function<void()> fn) override;
         TimePoint now() const noexcept override;
 
+        // Like post(), but reports whether the work item was accepted. post()
+        // silently drops it once the executor is shut down, which is fine for
+        // best-effort wakeups but not for work that must still happen (closing a
+        // socket). Callers that need a fallback use this instead.
+        bool try_post(std::function<void()> fn);
+
         // Release the work guard so a caller-driven loop can drain and return,
         // and (internal mode) stop + join the driver thread. Idempotent.
         void shutdown();

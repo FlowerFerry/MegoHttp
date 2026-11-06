@@ -103,6 +103,14 @@ namespace megohttp {
             // Returning an error aborts parsing.
             virtual VoidResult on_head(const ParsedResponse& head) = 0;
 
+            // Called for each informational (1xx) response received before the
+            // final one, in arrival order. Default: ignore. A client that sent
+            // Expect: 100-continue uses this to learn it may send the body.
+            virtual VoidResult on_informational(int status_code) {
+                (void)status_code;
+                return VoidResult{};
+            }
+
             // Body bytes, already de-chunked when applicable. The pointer is valid
             // only for the duration of the call.
             virtual VoidResult on_body_data(const uint8_t* data, size_t size) = 0;

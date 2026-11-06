@@ -113,6 +113,13 @@ namespace asio_backend {
         asio::post(strand_, std::move(fn));
     }
 
+    inline bool AsioExecutor::try_post(std::function<void()> fn) {
+        if (!fn) return false;
+        if (stopped_.load()) return false;
+        asio::post(strand_, std::move(fn));
+        return true;
+    }
+
     inline bool AsioExecutor::is_in_loop_thread() const noexcept {
         // An external io_context may be driven by several threads through the
         // strand, so there is no single loop thread to compare against. Reporting

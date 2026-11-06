@@ -460,4 +460,100 @@ TEST_CASE("race closes loser", "[asio]") {
     srvB.stop();
 }
 
+// ---------------------------------------------------------------------------
+// S1.12-04: destroying a TcpStream from a foreign thread must not close the
+// socket there. basic_stream_socket's thread-safety clause says "Shared objects:
+// Unsafe ... Other synchronous operations, such as open or close, are not thread
+// safe", so the destructor routes the close onto the strand and hands the socket
+// to the work item.
+// ---------------------------------------------------------------------------
+TEST_CASE("destructor closes the socket on the strand, not the caller thread",
+          "[asio][transport]") {
+    AsioEchoServer server;
+    if (!server.start()) {
+        std::printf("SKIP: could not start the local echo server\n");
+        return;
+    }
+
+    auto ex = AsioExecutor::create_internal();
+    CHECK(ex != nullptr);
+    if (!ex) { server.stop(); return; }
+
+    const auto posted_before = TcpStream::closes_posted_to_strand().load();
+    const auto inline_before = TcpStream::closes_inline_no_executor().load();
+
+    ResolvedAddress target;
+    target.family = ResolvedAddress::Family::IPv4;
+    target.text = "127.0.0.1";
+    target.bytes = {127, 0, 0, 1};
+    target.port = server.port();
+
+    auto stream = std::make_shared<TcpStream>(ex, target);
+
+    std::atomic<bool> ready{false}, ok{false};
+    ex->post([&, stream] {
+        stream->start([&](VoidResult r) { ok.store(r.has_value()); ready.store(true); });
+    });
+    CHECK(wait_until([&] { return ready.load(); }));
+    CHECK(ok.load());
+
+    // The point of this test: NO outstanding operation when the last reference is
+    // dropped, so nothing on the loop is holding the stream alive. The destructor
+    // therefore really does run on this thread -- which is exactly the situation
+    // where calling socket_->close() here violates basic_stream_socket's
+    // "Shared objects: Unsafe ... close is not thread safe".
+    CHECK(stream.use_count() == 1);
+    stream.reset();          // destructor runs here, on the test thread
+
+    // The close must have been handed to the strand instead of running inline.
+    CHECK(wait_until([&] {
+        return TcpStream::closes_posted_to_strand().load() > posted_before;
+    }));
+    CHECK(TcpStream::closes_posted_to_strand().load() == posted_before + 1);
+    CHECK(TcpStream::closes_inline_no_executor().load() == inline_before);
+
+    // And the strand must actually run it, so the peer goes away.
+    CHECK(wait_until([&] { return server.closed() >= 1; }, 5000));
+
+    ex->shutdown();
+    server.stop();
+}
+
+TEST_CASE("destructor after executor shutdown still closes the socket",
+          "[asio][transport]") {
+    AsioEchoServer server;
+    if (!server.start()) {
+        std::printf("SKIP: could not start the local echo server\n");
+        return;
+    }
+
+    auto ex = AsioExecutor::create_internal();
+    CHECK(ex != nullptr);
+    if (!ex) { server.stop(); return; }
+
+    const auto inline_before = TcpStream::closes_inline_no_executor().load();
+
+    ResolvedAddress target;
+    target.family = ResolvedAddress::Family::IPv4;
+    target.text = "127.0.0.1";
+    target.bytes = {127, 0, 0, 1};
+    target.port = server.port();
+
+    auto stream = std::make_shared<TcpStream>(ex, target);
+    std::atomic<bool> ready{false}, ok{false};
+    ex->post([&, stream] {
+        stream->start([&](VoidResult r) { ok.store(r.has_value()); ready.store(true); });
+    });
+    CHECK(wait_until([&] { return ready.load(); }));
+    CHECK(ok.load());
+
+    ex->shutdown();          // loop is gone; nothing can be posted any more
+    stream.reset();          // destructor must fall back to closing inline
+
+    CHECK(TcpStream::closes_inline_no_executor().load() == inline_before + 1);
+
+    server.stop();
+}
+
 #endif
+

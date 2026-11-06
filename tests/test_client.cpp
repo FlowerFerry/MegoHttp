@@ -249,6 +249,352 @@ private:
     std::thread thread_;
 };
 
+// Connection handle type for the raw-socket test servers in this file.
+#if defined(_WIN32)
+using probe_conn_t = SOCKET;
+#else
+using probe_conn_t = int;
+#endif
+
+// Expect: 100-continue server (S3.1-09).
+//
+// mode 0: answer 100 Continue, then read the body, then answer 200.
+// mode 1: answer 417 Expectation Failed immediately, never reading the body.
+//
+// It records whether the body arrived in the SAME recv as the request head. A
+// client that correctly holds the body back cannot have sent it yet, so that
+// flag must be false; a client that ignores Expect would pipeline head+body and
+// make it true. That is the observable difference this test relies on.
+class TinyExpectServer {
+public:
+    // mode 0: answer 100 Continue, take the body, answer 200.
+    // mode 1: answer 417 immediately, never take the body.
+    bool start(int mode) {
+        mode_ = mode;
+#if defined(_WIN32)
+        WSADATA wsa{};
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+        sock_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (sock_ == INVALID_SOCKET) return false;
+        int one = 1;
+        setsockopt(sock_, SOL_SOCKET, SO_REUSEADDR,
+                   reinterpret_cast<const char*>(&one), sizeof one);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        if (::bind(sock_, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0) return false;
+        if (::listen(sock_, 8) != 0) return false;
+        socklen_t len = sizeof addr;
+        if (::getsockname(sock_, reinterpret_cast<sockaddr*>(&addr), &len) != 0) return false;
+        port_ = ntohs(addr.sin_port);
+        thread_ = std::thread([this] { serve(); });
+        return true;
+    }
+
+    uint16_t port() const noexcept { return port_; }
+    bool saw_expect_header() const { return expect_header_.load(); }
+    bool body_in_first_recv() const { return body_in_first_recv_.load(); }
+    bool got_body() const { return got_body_.load(); }
+    std::string body() const { return body_; }
+
+    void stop() {
+        if (stop_.exchange(true)) return;
+        if (sock_ != INVALID_SOCKET) {
+#if defined(_WIN32)
+            ::closesocket(sock_);
+#else
+            ::close(sock_);
+#endif
+            sock_ = INVALID_SOCKET;
+        }
+        if (thread_.joinable()) thread_.join();
+    }
+
+    ~TinyExpectServer() { stop(); }
+
+private:
+    static void set_recv_timeout(probe_conn_t c, int ms) {
+#if defined(_WIN32)
+        DWORD t = static_cast<DWORD>(ms);
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char*>(&t), sizeof t);
+#else
+        timeval tv{};
+        tv.tv_sec = ms / 1000;
+        tv.tv_usec = (ms % 1000) * 1000;
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char*>(&tv), sizeof tv);
+#endif
+    }
+
+    void serve() {
+        for (;;) {
+            if (stop_.load()) return;
+            sockaddr_in peer{};
+            socklen_t plen = sizeof peer;
+            auto c = ::accept(sock_, reinterpret_cast<sockaddr*>(&peer), &plen);
+            if (c == INVALID_SOCKET) return;
+            // Every recv on this connection is bounded, so the thread can never
+            // block past stop()/join().
+            set_recv_timeout(c, 2000);
+
+            char buf[8192];
+            const int n = ::recv(c, buf, sizeof buf, 0);
+            if (n <= 0) {
+#if defined(_WIN32)
+                closesocket(c);
+#else
+                ::close(c);
+#endif
+                return;
+            }
+            std::string head(buf, static_cast<size_t>(n));
+            size_t content_length = 0;
+            const size_t he = head.find("\r\n\r\n");
+            if (he != std::string::npos) {
+                std::string lower;
+                lower.reserve(he);
+                for (size_t k = 0; k < he; ++k) {
+                    lower.push_back(static_cast<char>(
+                        std::tolower(static_cast<unsigned char>(head[k]))));
+                }
+                expect_header_.store(lower.find("expect: 100-continue") != std::string::npos);
+                body_in_first_recv_.store(head.size() > he + 4);
+                size_t cl = lower.find("content-length:");
+                if (cl != std::string::npos) {
+                    const char* q = lower.data() + cl + 15;
+                    while (*q == ' ' || *q == '\t') ++q;
+                    content_length = static_cast<size_t>(strtoul(q, nullptr, 10));
+                }
+            }
+            std::string body = (he == std::string::npos)
+                                   ? std::string()
+                                   : head.substr(he + 4);
+
+            if (mode_ == 1) {
+                const char* resp =
+                    "HTTP/1.1 417 Expectation Failed\r\n"
+                    "Content-Length: 3\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                    "no!";
+                ::send(c, resp, static_cast<int>(std::strlen(resp)), 0);
+            } else {
+                const char* cont = "HTTP/1.1 100 Continue\r\n\r\n";
+                ::send(c, cont, static_cast<int>(std::strlen(cont)), 0);
+                // Only read again if the body has not already arrived: a client
+                // that did not send Expect pipelines head+body into one read.
+                while (body.size() < content_length) {
+                    const int m = ::recv(c, buf, sizeof buf, 0);
+                    if (m <= 0) break;
+                    body.append(buf, static_cast<size_t>(m));
+                }
+                if (!body.empty()) {
+                    body_ = body;
+                    got_body_.store(true);
+                }
+                const char* resp =
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Length: 2\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                    "ok";
+                ::send(c, resp, static_cast<int>(std::strlen(resp)), 0);
+            }
+#if defined(_WIN32)
+            closesocket(c);
+#else
+            ::close(c);
+#endif
+            return;
+        }
+    }
+
+#if defined(_WIN32)
+    SOCKET sock_{INVALID_SOCKET};
+#else
+    int sock_{-1};
+#endif
+    uint16_t port_{0};
+    int mode_{0};
+    std::atomic<bool> stop_{false};
+    std::thread thread_;
+    std::atomic<bool> expect_header_{false};
+    std::atomic<bool> body_in_first_recv_{false};
+    std::atomic<bool> got_body_{false};
+    std::string body_;
+};
+
+class TinyHeadServer {
+public:
+    bool start() {
+#if defined(_WIN32)
+        WSADATA wsa{};
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+        sock_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (sock_ == INVALID_SOCKET) return false;
+        int one = 1;
+        setsockopt(sock_, SOL_SOCKET, SO_REUSEADDR,
+                   reinterpret_cast<const char*>(&one), sizeof one);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        if (::bind(sock_, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0) return false;
+        if (::listen(sock_, 8) != 0) return false;
+        socklen_t len = sizeof addr;
+        if (::getsockname(sock_, reinterpret_cast<sockaddr*>(&addr), &len) != 0) return false;
+        port_ = ntohs(addr.sin_port);
+        thread_ = std::thread([this] { serve(); });
+        return true;
+    }
+
+    uint16_t port() const noexcept { return port_; }
+    std::string request_line() const { return request_line_; }
+
+    void stop() {
+        if (stop_.exchange(true)) return;
+        if (sock_ != INVALID_SOCKET) {
+#if defined(_WIN32)
+            ::closesocket(sock_);
+#else
+            ::close(sock_);
+#endif
+            sock_ = INVALID_SOCKET;
+        }
+        if (thread_.joinable()) thread_.join();
+    }
+
+    ~TinyHeadServer() { stop(); }
+
+private:
+    void serve() {
+        for (;;) {
+            if (stop_.load()) return;
+            sockaddr_in peer{};
+            socklen_t plen = sizeof peer;
+            auto c = ::accept(sock_, reinterpret_cast<sockaddr*>(&peer), &plen);
+            if (c == INVALID_SOCKET) return;
+            char buf[4096] = {0};
+            const int n = ::recv(c, buf, sizeof buf - 1, 0);
+            if (n > 0) {
+                std::string req(buf, static_cast<size_t>(n));
+                const size_t eol = req.find("\r\n");
+                request_line_ = (eol == std::string::npos) ? req : req.substr(0, eol);
+            }
+            // Content-Length advertises 5 bytes; no body follows. Correct for HEAD.
+            const char* resp =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Length: 5\r\n"
+                "\r\n";
+            ::send(c, resp, static_cast<int>(std::strlen(resp)), 0);
+#if defined(_WIN32)
+            closesocket(c);
+#else
+            ::close(c);
+#endif
+            return;
+        }
+    }
+
+#if defined(_WIN32)
+    SOCKET sock_{INVALID_SOCKET};
+#else
+    int sock_{-1};
+#endif
+    uint16_t port_{0};
+    std::atomic<bool> stop_{false};
+    std::thread thread_;
+    std::string request_line_;
+};
+
+// Serves a chunked response with two trailers, so the test can assert the
+// trailers survive the parser and reach the caller.
+class TinyChunkedServer {
+public:
+    bool start() {
+#if defined(_WIN32)
+        WSADATA wsa{};
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+        sock_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (sock_ == INVALID_SOCKET) return false;
+        int one = 1;
+        setsockopt(sock_, SOL_SOCKET, SO_REUSEADDR,
+                   reinterpret_cast<const char*>(&one), sizeof one);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        if (::bind(sock_, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0) return false;
+        if (::listen(sock_, 8) != 0) return false;
+        socklen_t len = sizeof addr;
+        if (::getsockname(sock_, reinterpret_cast<sockaddr*>(&addr), &len) != 0) return false;
+        port_ = ntohs(addr.sin_port);
+        thread_ = std::thread([this] { serve(); });
+        return true;
+    }
+
+    uint16_t port() const noexcept { return port_; }
+
+    void stop() {
+        if (stop_.exchange(true)) return;
+        if (sock_ != INVALID_SOCKET) {
+#if defined(_WIN32)
+            ::closesocket(sock_);
+#else
+            ::close(sock_);
+#endif
+            sock_ = INVALID_SOCKET;
+        }
+        if (thread_.joinable()) thread_.join();
+    }
+
+    ~TinyChunkedServer() { stop(); }
+
+private:
+    void serve() {
+        for (;;) {
+            if (stop_.load()) return;
+            sockaddr_in peer{};
+            socklen_t plen = sizeof peer;
+            auto c = ::accept(sock_, reinterpret_cast<sockaddr*>(&peer), &plen);
+            if (c == INVALID_SOCKET) return;
+            char buf[4096];
+            ::recv(c, buf, sizeof buf, 0);
+            const char* resp =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/plain\r\n"
+                "Transfer-Encoding: chunked\r\n"
+                "\r\n"
+                "2\r\nab\r\n"
+                "0\r\n"
+                "X-Checksum: abc123\r\n"
+                "X-Parts: 1\r\n"
+                "\r\n";
+            ::send(c, resp, static_cast<int>(std::strlen(resp)), 0);
+#if defined(_WIN32)
+            closesocket(c);
+#else
+            ::close(c);
+#endif
+            return;
+        }
+    }
+
+#if defined(_WIN32)
+    SOCKET sock_{INVALID_SOCKET};
+#else
+    int sock_{-1};
+#endif
+    uint16_t port_{0};
+    std::atomic<bool> stop_{false};
+    std::thread thread_;
+};
+
 // --- tests ---
 
 TEST_CASE("get ok", "[client]") {
@@ -1060,6 +1406,230 @@ TEST_CASE("no request callback fires after the Client is destroyed", "[client][s
 // stop or close somebody else's loop, and must not shut down an executor it
 // did not create.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// S3.1-02: a response to HEAD must not be waited on for a body, even when it
+// advertises Content-Length (RFC 7230 3.3.3). This needs the Client to tell the
+// parser which method it sent; ResponseParser defaults to Get.
+// ---------------------------------------------------------------------------
+TEST_CASE("HEAD response with Content-Length completes without a body",
+          "[client][method]") {
+    TinyHeadServer srv;
+    if (!srv.start()) {
+        std::printf("SKIP: could not start the local HEAD server\n");
+        return;
+    }
+
+    // A short recv timeout: if the Client waited for the advertised 5 bytes this
+    // test would end in TimeoutReceive rather than a response.
+    ClientOptions o;
+    o.recv_timeout = std::chrono::seconds(5);
+    Client client(o);
+
+    Request req;
+    req.set_method(Method::Head);
+    req.set_url(string("http://127.0.0.1:") + format("{}", srv.port()) + "/");
+
+    std::atomic<bool> done{false};
+    bool ok = false;
+    int status = 0;
+    size_t body_len = 999;
+    std::string err;
+
+    client.request(req, [&](Result<Response> r) {
+        if (r) {
+            ok = true;
+            status = r.value().head().status_code;
+            body_len = r.value().body_bytes().size();
+        } else {
+            err = to_string(r.error().code());
+        }
+        done.store(true);
+    });
+
+    CHECK(wait_until([&] { return done.load(); }));
+    CHECK(ok);
+    CHECK(status == 200);
+    CHECK(body_len == 0);
+    CHECK(err.empty());
+
+    // The server must actually have seen a HEAD, not a GET.
+    CHECK(wait_until([&] { return !srv.request_line().empty(); }));
+    CHECK(srv.request_line().compare(0, 5, "HEAD ") == 0);
+
+    client.shutdown();
+    srv.stop();
+}
+
+// ---------------------------------------------------------------------------
+// S3.1-08: chunked trailers are parsed AND surfaced to the caller. The parser
+// always parsed them; the Client used to drop them on the floor.
+// ---------------------------------------------------------------------------
+TEST_CASE("chunked trailers reach the caller", "[client][trailer]") {
+    TinyChunkedServer srv;
+    if (!srv.start()) {
+        std::printf("SKIP: could not start the local chunked server\n");
+        return;
+    }
+
+    Client client;
+    std::atomic<bool> done{false};
+    bool ok = false;
+    std::string body;
+    size_t trailer_count = 0;
+    std::string trailer_value;
+    std::string err;
+
+    client.get(string("http://127.0.0.1:") + format("{}", srv.port()) + "/",
+               [&](Result<Response> r) {
+        if (r) {
+            ok = true;
+            const ResponseHead& h = r.value().head();
+            body.assign(r.value().body_text().data(), r.value().body_text().size());
+            trailer_count = h.trailers.size();
+            if (auto v = h.trailers.get("x-checksum")) {
+                trailer_value.assign(v->data(), v->size());
+            }
+        } else {
+            err = to_string(r.error().code());
+        }
+        done.store(true);
+    });
+
+    CHECK(wait_until([&] { return done.load(); }));
+    CHECK(ok);
+    CHECK(body == "ab");
+    CHECK(err.empty());
+    CHECK(trailer_count == 2);
+    CHECK(trailer_value == "abc123");
+
+    client.shutdown();
+    srv.stop();
+}
+
+// ---------------------------------------------------------------------------
+// S3.1-09: Expect: 100-continue. The body must be held back until the server
+// answers 100, and a 417 must stop the body from being sent at all.
+// ---------------------------------------------------------------------------
+TEST_CASE("expect continue holds the body until 100 Continue", "[client][expect]") {
+    TinyExpectServer srv;
+    if (!srv.start(0)) {
+        std::printf("SKIP: could not start the local expect server\n");
+        return;
+    }
+
+    ClientOptions o;
+    o.expect_continue = true;
+    Client client(o);
+
+    Request req;
+    req.set_method(Method::Post);
+    req.set_url(string("http://127.0.0.1:") + format("{}", srv.port()) + "/upload");
+    req.set_body(to_string("payload-12345"));
+
+    std::atomic<bool> done{false};
+    bool ok = false;
+    int status = 0;
+    std::string err;
+    client.request(req, [&](Result<Response> r) {
+        if (r) { ok = true; status = r.value().head().status_code; }
+        else err = to_string(r.error().code());
+        done.store(true);
+    });
+
+    CHECK(wait_until([&] { return done.load(); }));
+    CHECK(err.empty());
+    CHECK(ok);
+    CHECK(status == 200);
+
+    // The header must have been sent...
+    CHECK(srv.saw_expect_header());
+    // ...and the body must NOT have been pipelined with the head.
+    CHECK(!srv.body_in_first_recv());
+    // ...and it must have arrived only after the 100 answer.
+    CHECK(wait_until([&] { return srv.got_body(); }));
+    CHECK(srv.body() == "payload-12345");
+
+    client.shutdown();
+    srv.stop();
+}
+
+TEST_CASE("expect continue with 417 does not send the body", "[client][expect]") {
+    TinyExpectServer srv;
+    if (!srv.start(1)) {
+        std::printf("SKIP: could not start the local expect server\n");
+        return;
+    }
+
+    ClientOptions o;
+    o.expect_continue = true;
+    Client client(o);
+
+    Request req;
+    req.set_method(Method::Post);
+    req.set_url(string("http://127.0.0.1:") + format("{}", srv.port()) + "/upload");
+    req.set_body(to_string("payload-12345"));
+
+    std::atomic<bool> done{false};
+    bool ok = false;
+    int status = 0;
+    std::string body;
+    std::string err;
+    client.request(req, [&](Result<Response> r) {
+        if (r) {
+            ok = true;
+            status = r.value().head().status_code;
+            body.assign(r.value().body_text().data(), r.value().body_text().size());
+        } else err = to_string(r.error().code());
+        done.store(true);
+    });
+
+    CHECK(wait_until([&] { return done.load(); }));
+    // 417 is a valid HTTP response, not a transport failure.
+    CHECK(err.empty());
+    CHECK(ok);
+    CHECK(status == 417);
+    CHECK(body == "no!");
+    CHECK(srv.saw_expect_header());
+    CHECK(!srv.body_in_first_recv());
+    CHECK(!srv.got_body());
+
+    client.shutdown();
+    srv.stop();
+}
+
+// Default off: a body-carrying request must not gain an Expect header.
+TEST_CASE("expect continue is off by default", "[client][expect]") {
+    TinyExpectServer srv;
+    if (!srv.start(0)) {
+        std::printf("SKIP: could not start the local expect server\n");
+        return;
+    }
+
+    Client client;                       // default options
+    Request req;
+    req.set_method(Method::Post);
+    req.set_url(string("http://127.0.0.1:") + format("{}", srv.port()) + "/upload");
+    req.set_body(to_string("payload-12345"));
+
+    std::atomic<bool> done{false};
+    bool ok = false;
+    client.request(req, [&](Result<Response> r) {
+        ok = static_cast<bool>(r);
+        done.store(true);
+    });
+
+    CHECK(wait_until([&] { return done.load(); }));
+    CHECK(ok);
+    CHECK(!srv.saw_expect_header());
+    // Without Expect the body is pipelined into the very first write, so it is
+    // already present when the server reads the head.
+    CHECK(srv.body_in_first_recv());
+    CHECK(srv.body() == "payload-12345");
+
+    client.shutdown();
+    srv.stop();
+}
 
 #if defined(MGHTTP_BACKEND_LIBUV)
 TEST_CASE("client runs on a caller-owned libuv loop", "[client][external]") {

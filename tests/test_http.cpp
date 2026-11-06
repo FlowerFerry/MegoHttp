@@ -33,6 +33,13 @@ struct Collector : ResponseParser::Callbacks {
         got_trailers = true; trailers = t; return VoidResult{};
     }
     VoidResult on_complete() override { ++complete_count; return VoidResult{}; }
+
+    // S3.1-09: informational notifications must reach the callbacks, in order.
+    std::vector<int> informational_seen;
+    VoidResult on_informational(int code) override {
+        informational_seen.push_back(code);
+        return VoidResult{};
+    }
 };
 
 // Feeds `raw` in chunks of `step` bytes (step==0 means one shot).
@@ -480,3 +487,40 @@ TEST_CASE("token helpers", "[http]") {
     CHECK(!http_detail::status_reason(200).empty());
     CHECK(http_detail::status_reason(299).empty());   // never invent a phrase
 }
+
+
+TEST_CASE("informational callback fires before the final head", "[http]") {
+    // S3.1-09: the client learns about 100 Continue as it arrives, not only from
+    // the final head, so it can release a held request body.
+    const std::string raw =
+        "HTTP/1.1 100 Continue\r\n\r\n"
+        "HTTP/1.1 100 Continue\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    Collector c; ResponseParser p(c);
+    auto r = p.feed(reinterpret_cast<const uint8_t*>(raw.data()), raw.size());
+    CHECK(r.has_value());
+    CHECK(c.informational_seen.size() == 2);
+    CHECK(c.informational_seen[0] == 100);
+    CHECK(c.informational_seen[1] == 100);
+    CHECK(c.got_head);
+    CHECK(c.head.status_code == 200);
+    CHECK(c.body == "ok");
+    CHECK(c.complete_count == 1);
+}
+
+TEST_CASE("informational callback error aborts parsing", "[http]") {
+    struct Failing : Collector {
+        VoidResult on_informational(int) override {
+            return Error{ErrorCode::HttpProtocolViolation, ErrorPhase::Receive,
+                         string("sink refused the 1xx")};
+        }
+    };
+    const std::string raw =
+        "HTTP/1.1 100 Continue\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    Failing c; ResponseParser p(c);
+    auto r = p.feed(reinterpret_cast<const uint8_t*>(raw.data()), raw.size());
+    CHECK(r.has_error());
+    CHECK(!c.got_head);
+}
+

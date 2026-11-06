@@ -31,16 +31,62 @@ namespace megohttp {
         : address_(address) {
         executor_ = std::move(executor);
         auto asio_exec = std::dynamic_pointer_cast<asio_backend::AsioExecutor>(executor_);
-        if (asio_exec != nullptr) ioc_ = asio_exec->context();
+        if (asio_exec != nullptr) {
+            ioc_ = asio_exec->context();
+            asio_executor_ = asio_exec;
+        }
         (void)connect_timeout;   // enforced by connect_race's shared deadline
     }
 
-    inline TcpStream::~TcpStream() {
-        if (ioc_ != nullptr && !closing_ && socket_ && socket_->is_open()) {
-            closing_ = true;
-            asio::error_code ec;
-            socket_->close(ec);
+#if defined(MGHTTP_INTERNAL_TESTING)
+    inline std::atomic<uint64_t>& TcpStream::closes_posted_to_strand() {
+        static std::atomic<uint64_t> n{0};
+        return n;
+    }
+    inline std::atomic<uint64_t>& TcpStream::closes_inline_no_executor() {
+        static std::atomic<uint64_t> n{0};
+        return n;
+    }
+#endif
+
+    // Closing on the strand is what makes ~TcpStream safe from any thread.
+    // basic_stream_socket's thread-safety clause says "Shared objects: Unsafe ...
+    // Other synchronous operations, such as open or close, are not thread safe",
+    // so the close must run where the socket was used. The socket is captured by
+    // the work item, which therefore also destroys it there.
+    inline void TcpStream::close_socket_on_strand() {
+        auto sock = std::move(socket_);
+        if (!sock) return;
+        if (!sock->is_open()) return;
+
+        auto ex = std::dynamic_pointer_cast<asio_backend::AsioExecutor>(asio_executor_);
+        if (ex) {
+            // try_post, not post: post() silently drops work once the executor is
+            // shut down, and a dropped close would leak the descriptor.
+            if (ex->try_post([sock]() mutable {
+                    asio::error_code ec;
+                    sock->close(ec);
+                })) {
+#if defined(MGHTTP_INTERNAL_TESTING)
+                closes_posted_to_strand().fetch_add(1, std::memory_order_relaxed);
+#endif
+                return;   // socket now owned (and destroyed) by the strand
+            }
         }
+        // No usable executor: the loop can no longer run, so nothing else can be
+        // touching this socket. Close it here.
+#if defined(MGHTTP_INTERNAL_TESTING)
+        closes_inline_no_executor().fetch_add(1, std::memory_order_relaxed);
+#endif
+        asio::error_code ec;
+        sock->close(ec);
+    }
+
+    inline TcpStream::~TcpStream() {
+        if (closing_ || !socket_) return;
+        closing_ = true;
+        open_ = false;
+        close_socket_on_strand();
     }
 
     inline void TcpStream::start(ReadyCallback on_ready) {
@@ -72,7 +118,7 @@ namespace megohttp {
             return;
         }
 
-        socket_ = std::make_unique<asio::ip::tcp::socket>(*ioc_);
+        socket_ = std::make_shared<asio::ip::tcp::socket>(*ioc_);
         socket_->open(ep.protocol());
         socket_->async_connect(ep,
             [self = shared_from_this()](const asio::error_code& ec) {
@@ -200,11 +246,8 @@ namespace megohttp {
     inline void TcpStream::async_close(CloseCallback cb) {
         closing_ = true;
         close_cb_ = std::move(cb);
-        if (socket_ && socket_->is_open()) {
-            asio::error_code ec;
-            socket_->close(ec);
-        }
         open_ = false;
+        close_socket_on_strand();
         if (close_cb_) close_cb_();
     }
 

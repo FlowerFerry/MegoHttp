@@ -7,6 +7,7 @@
 #include <megohttp/resolver.hpp>
 #include <megohttp/string_adapter.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -146,9 +147,32 @@ namespace megohttp {
                              const asio::error_code& ec, size_t n);
 
         asio::io_context* ioc_{nullptr};
+        std::shared_ptr<Executor> asio_executor_;
+
+        // Closes the socket on the strand, or right here if the executor can no
+        // longer accept work. Always destroys the socket object it was given.
+        void close_socket_on_strand();
+
+#if defined(MGHTTP_INTERNAL_TESTING)
+    public:
+        // Observability for tests: how many closes were handed to the strand vs
+        // performed inline because no executor was available. Lets a test prove
+        // the destructor no longer closes on the caller's thread.
+        static std::atomic<uint64_t>& closes_posted_to_strand();
+        static std::atomic<uint64_t>& closes_inline_no_executor();
+
+    private:
+#endif
         // Asio 1.38's basic_stream_socket has NO default constructor, so the
         // socket is created when the target endpoint is known.
-        std::unique_ptr<asio::ip::tcp::socket> socket_;
+        //
+        // Held by shared_ptr, not unique_ptr, because closing must happen on the
+        // strand: the close work item captures the socket to keep it alive and
+        // destroys it there. basic_stream_socket says "Shared objects: Unsafe ...
+        // Other synchronous operations, such as open or close, are not thread
+        // safe", so close() from a destructor running on an arbitrary thread is
+        // a contract violation.
+        std::shared_ptr<asio::ip::tcp::socket> socket_;
 
         ReadCallback read_cb_;   // one outstanding read at a time
         // Read buffer owned by the stream: Asio requires it to stay valid until

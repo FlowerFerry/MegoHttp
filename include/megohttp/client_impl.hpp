@@ -66,6 +66,10 @@ namespace megohttp {
                 return true;
             }
 
+            // Trailers arrive after the last body byte and before on_complete, so
+            // they are recorded on the head the response will carry.
+            void set_trailers(const Headers& tr) { head_.trailers = tr; }
+
             Response finish() {
                 Response r(std::move(head_), std::move(body_));
                 return r;
@@ -108,6 +112,10 @@ namespace megohttp {
             CancelHandle dns_cancel;
 
             RequestPhase phase{RequestPhase::Idle};
+
+            // True when the request head carried Expect: 100-continue and the body
+            // must wait for a 100 answer (S3.1-09).
+            bool expect_continue_sent{false};
 
             // Held while the exchange is live so the stream outlives its callbacks.
             std::shared_ptr<AsyncByteStream> stream;
@@ -204,8 +212,14 @@ namespace megohttp {
             }
 
             // Start by sending the encoded head.
-            void start(string head) {
+            //
+            // When `hold_body_for_continue` is set the request carries a body and
+            // we sent Expect: 100-continue, so the body waits for a 1xx answer
+            // (RFC 7231 5.1.1: a client MUST NOT send the body before receiving
+            // 100, and MAY send it if the server did not answer within a timeout).
+            void start(string head, bool hold_body_for_continue) {
                 state_->phase = detail::RequestPhase::SendHead;
+                expect_continue_pending_ = hold_body_for_continue;
                 arm_send_timer();
                 auto self = shared_from_this();
                 auto stream = state_->stream;
@@ -213,13 +227,41 @@ namespace megohttp {
                     reinterpret_cast<const uint8_t*>(head.data()), head.size(),
                     [self](Result<size_t> w) {
                         if (!w) { self->fail(w.error()); return; }
+                        if (self->expect_continue_pending_) {
+                            // Head is out; the body waits for 100 Continue. Keep
+                            // send_timer_ armed: it bounds the wait, so a server
+                            // that never answers fails with TimeoutSend instead of
+                            // hanging. Reading is what delivers that answer.
+                            self->state_->phase = detail::RequestPhase::Receive;
+                            self->read_more();
+                            return;
+                        }
                         self->send_body();
+                    });
+            }
+
+            // Send the body after 100 Continue, or after a final status that is not
+            // 417 (RFC 7231 lets the client send anyway; the response is already
+            // being read, so this is best-effort and its write errors are ignored).
+            void send_body_now() {
+                if (body_sent_) return;
+                body_sent_ = true;
+                expect_continue_pending_ = false;
+                const auto& body = state_->request.body_bytes();
+                if (body.empty()) return;
+                auto self = shared_from_this();
+                auto stream = state_->stream;
+                stream->async_write(body.data(), body.size(),
+                    [](Result<size_t>) {
+                        // The server may already have answered and closed; a failed
+                        // body write must not overwrite the response it sent.
                     });
             }
 
             // Send body if present, then start reading the response.
             void send_body() {
                 state_->phase = detail::RequestPhase::SendBody;
+                body_sent_ = true;
                 auto self = shared_from_this();
                 auto stream = state_->stream;
                 if (!state_->request.has_body() || state_->request.body_bytes().empty()) {
@@ -239,7 +281,26 @@ namespace megohttp {
             }
 
             // --- ResponseParser::Callbacks ---
+            // 100 Continue releases the held body (S3.1-09).
+            VoidResult on_informational(int status_code) override {
+                if (expect_continue_pending_ && status_code == 100) {
+                    disarm_send_timer();
+                    send_body_now();
+                    arm_recv_timer();
+                }
+                return VoidResult{};
+            }
+
             VoidResult on_head(const ParsedResponse& head) override {
+                // If we were still holding the body for a 100 answer and the server
+                // went straight to a final status: 417 means it refuses the Expect,
+                // so do not send; any other status means it may have consumed the
+                // request already, so send best-effort.
+                if (expect_continue_pending_) {
+                    disarm_send_timer();
+                    if (head.status_code != 417) send_body_now();
+                    else { expect_continue_pending_ = false; body_sent_ = true; }
+                }
                 ResponseHead rh;
                 rh.status_code = head.status_code;
                 rh.status_text = head.reason;
@@ -277,7 +338,10 @@ namespace megohttp {
                 return VoidResult{};
             }
 
-            VoidResult on_trailers(const Headers&) override { return VoidResult{}; }
+            VoidResult on_trailers(const Headers& tr) override {
+                if (sink_) sink_->set_trailers(tr);
+                return VoidResult{};
+            }
 
             VoidResult on_complete() override {
                 complete_ = true;
@@ -331,10 +395,17 @@ namespace megohttp {
             std::shared_ptr<Timer> recv_timer_;
             std::unique_ptr<BufferSink> sink_;
             bool complete_{false};
+            // Expect: 100-continue bookkeeping (S3.1-09).
+            bool expect_continue_pending_{false};
+            bool body_sent_{false};
         };
 
         // Builds the request head for a direct (non-proxy) HTTP request.
-        inline Result<string> build_request_head(const Request& req, const Url& url) {
+        // `expect_continue` adds the Expect header; the caller decides whether the
+        // request qualifies (it must actually carry a body) and records the same
+        // decision so the exchange holds the body accordingly.
+        inline Result<string> build_request_head(const Request& req, const Url& url,
+                                                 bool expect_continue) {
             Headers headers = req.headers();
             if (!headers.contains("host")) {
                 headers.set("host", to_view(url.host_port_header()));
@@ -345,6 +416,9 @@ namespace megohttp {
             if (req.has_body() && !headers.contains("content-length")) {
                 headers.set("content-length",
                             to_view(format("{}", req.body_bytes().size())));
+            }
+            if (expect_continue && !headers.contains("expect")) {
+                headers.set("expect", "100-continue");
             }
             return encode_request_head(req.method(), req.custom_method(),
                                        to_view(url.request_target()), headers);
@@ -480,7 +554,13 @@ namespace megohttp {
             st->request.set_parsed_url(url);
 
             st->phase = detail::RequestPhase::BuildHead;
-            auto head = detail::build_request_head(st->request, url);
+            // Expect: 100-continue only makes sense when there is a body to hold
+            // back. Record the decision once so the head and the exchange agree.
+            st->expect_continue_sent = st->options.expect_continue
+                                    && st->request.has_body()
+                                    && !st->request.body_bytes().empty();
+            auto head = detail::build_request_head(st->request, url,
+                                                   st->expect_continue_sent);
             if (!head) { st->finish(head.error()); return; }
 
             std::weak_ptr<detail::RequestState> weak = st;
@@ -544,9 +624,15 @@ namespace megohttp {
             // stores a reference to it), and the Exchange must keep itself alive
             // while the exchange is in flight. It does so via shared_from_this().
             auto exchange = std::make_shared<detail::Exchange>(st);
-            exchange->set_parser(std::make_unique<ResponseParser>(
-                *exchange, st->options.parser_limits));
-            exchange->start(std::move(head));
+            auto parser = std::make_unique<ResponseParser>(
+                *exchange, st->options.parser_limits);
+            // The parser must know the request method: a response to HEAD never
+            // carries a body even when it advertises Content-Length (RFC 7230
+            // 3.3.3). Without this the parser would wait for bytes that a correct
+            // server will never send.
+            parser->set_request_method(st->request.method());
+            exchange->set_parser(std::move(parser));
+            exchange->start(std::move(head), st->expect_continue_sent);
         }
 
     public:

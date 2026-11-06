@@ -35,6 +35,14 @@ namespace megohttp {
         Duration recv_timeout{std::chrono::seconds(30)};     // 0 = disabled, whole body
         Duration total_timeout{std::chrono::seconds(0)};     // 0 = disabled, whole request
 
+        // Send "Expect: 100-continue" for requests that carry a body and hold the
+        // body back until the server answers 100 Continue (RFC 7230 5.1.1).
+        //
+        // Off by default: many servers answer 417 and some never answer at all, so
+        // waiting costs a round trip. When on, the wait is bounded by send_timeout
+        // and a 4xx/5xx final response cancels the body send.
+        bool expect_continue{false};
+
         // Address-family preference for the connection race (S2.5-03).
         // Unspecified lets the racing logic decide (IPv6 first when present);
         // PreferIPv4 / PreferIPv6 pin which family is attempted first.

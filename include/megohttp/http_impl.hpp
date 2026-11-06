@@ -718,6 +718,10 @@ namespace megohttp {
                 informational_.push_back(code);
                 head_buf_.clear();
                 state_ = State::Head;
+                // Notify after the state is reset: a callback may start writing the
+                // request body, and the parser must already be ready for more input.
+                auto r = cb_.on_informational(code);
+                if (!r) return fail_from(r.error());
                 return VoidResult{};
             }
             if (code == 101) {
