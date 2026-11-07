@@ -3,7 +3,7 @@
 
 #include <megohttp/executor.hpp>
 
-#if !defined(MGHTTP_BACKEND_LIBUV)
+#if !MGHTTP_BACKEND_LIBUV
 #   error "executor_libuv.hpp requires MGHTTP_BACKEND_LIBUV"
 #endif
 

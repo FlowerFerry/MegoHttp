@@ -14,6 +14,11 @@ namespace megohttp {
         Headers headers;
         std::vector<uint8_t> body;
         bool has_body{false};
+        // S3.2-01: BodySource for streaming upload
+        std::optional<Request::BodySource> body_source;
+        // S3.2-02: BodySink for streaming download
+        std::optional<Request::BodySink> body_sink;
+        std::optional<Request::BodySinkComplete> body_sink_complete;
     };
 
     inline Request::Request() : impl_(std::make_unique<Impl>()) {}
@@ -80,6 +85,13 @@ namespace megohttp {
     inline void Request::set_body(std::vector<uint8_t> data) {
         impl_->body = std::move(data);
         impl_->has_body = true;
+        impl_->body_source.reset();   // mutually exclusive with source
+    }
+
+    inline void Request::set_body_source(BodySource src) {
+        impl_->body_source = std::move(src);
+        impl_->has_body = true;
+        impl_->body.clear();          // mutually exclusive with buffer
     }
 
     inline bool Request::has_body() const noexcept { return impl_->has_body; }
@@ -90,14 +102,32 @@ namespace megohttp {
     }
 
     inline bool Request::is_body_replayable() const noexcept {
-        // A buffered byte body can always be re-sent. Anything streamed is not
-        // assumed replayable unless the source proves otherwise, and no source is
-        // wired up yet.
-        return true;
+        // A buffered byte body can always be re-sent. A BodySource has no reset
+        // contract yet, so a streamed body must be reported as non-replayable --
+        // otherwise redirect/retry would silently re-send it (and send nothing,
+        // because the source has already been drained).
+        return !impl_->body_source.has_value();
     }
 
     inline const std::vector<uint8_t>& Request::body_bytes() const noexcept {
         return impl_->body;
+    }
+
+    inline const std::optional<Request::BodySource>& Request::body_source() const noexcept {
+        return impl_->body_source;
+    }
+
+    inline void Request::set_body_sink(BodySink sink, BodySinkComplete complete) {
+        impl_->body_sink = std::move(sink);
+        impl_->body_sink_complete = std::move(complete);
+    }
+
+    inline const std::optional<Request::BodySink>& Request::body_sink() const noexcept {
+        return impl_->body_sink;
+    }
+
+    inline const std::optional<Request::BodySinkComplete>& Request::body_sink_complete() const noexcept {
+        return impl_->body_sink_complete;
     }
 
 } // namespace megohttp

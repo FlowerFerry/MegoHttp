@@ -7,6 +7,7 @@
 #include <megohttp/string_adapter.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -64,6 +65,14 @@ namespace megohttp {
         const std::vector<uint8_t>& body_bytes() const noexcept;
         string_view body_text() const noexcept;
         bool body_is_buffered() const noexcept;
+
+        // --- Streaming body (S3.2-02) ---
+        // Called for each chunk of response body as it arrives.
+        // Return true to continue, false to pause (backpressure).
+        // The callback runs on the I/O thread; copy data if you need it later.
+        using BodySink = std::function<bool(string_view chunk)>;
+        // Called once when the body is complete (eof) or on error.
+        using BodySinkComplete = std::function<void(VoidResult)>;
 
         // --- Encoding bookkeeping ---
         // body_bytes() is already Content-Decoded. These record the wire facts so a

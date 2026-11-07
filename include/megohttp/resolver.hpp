@@ -142,11 +142,17 @@ namespace megohttp {
 
 } // namespace megohttp
 
-#if defined(MGHTTP_BACKEND_LIBUV)
+#if MGHTTP_BACKEND_LIBUV
 #   include <megohttp/backend/resolver_libuv.hpp>
-#elif defined(MGHTTP_BACKEND_ASIO)
+#elif MGHTTP_BACKEND_ASIO
 #   include <megohttp/backend/resolver_asio.hpp>
+#else
+#   error "No resolver backend selected (MGHTTP_BACKEND_LIBUV / MGHTTP_BACKEND_ASIO)"
 #endif
+
+// Tell resolver_impl.hpp that SystemResolverImpl has a definition in scope.
+// A TU that includes a backend header directly sets that header's guard, so
+// the #include above is then skipped and the type would be merely declared.
 #include <megohttp/resolver_impl.hpp>
 
 #endif // MEGOHTTP_RESOLVER_HPP_INCLUDED

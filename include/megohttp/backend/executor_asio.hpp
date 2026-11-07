@@ -11,7 +11,7 @@
 //     does not exit while work is outstanding. reset() is called on shutdown.
 #include <megohttp/config.hpp>
 
-#if !defined(MGHTTP_BACKEND_ASIO)
+#if !MGHTTP_BACKEND_ASIO
 #   error "executor_asio.hpp requires MGHTTP_BACKEND_ASIO"
 #endif
 

@@ -4,7 +4,7 @@
 #include <megohttp/resolver.hpp>
 #include <megohttp/backend/executor_libuv.hpp>
 
-#if !defined(MGHTTP_BACKEND_LIBUV)
+#if !MGHTTP_BACKEND_LIBUV
 #   error "resolver_libuv.hpp requires MGHTTP_BACKEND_LIBUV"
 #endif
 
@@ -26,6 +26,8 @@ namespace megohttp {
     private:
         std::shared_ptr<Executor> executor_;
     };
+
+#define MEGOHTTP_SYSTEM_RESOLVER_IMPL_DEFINED 1
 
 } // namespace megohttp
 

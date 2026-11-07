@@ -12,7 +12,7 @@
 #include <megohttp/resolver.hpp>
 #include <megohttp/backend/executor_asio.hpp>
 
-#if !defined(MGHTTP_BACKEND_ASIO)
+#if !MGHTTP_BACKEND_ASIO
 #   error "resolver_asio.hpp requires MGHTTP_BACKEND_ASIO"
 #endif
 
@@ -33,6 +33,8 @@ namespace megohttp {
     private:
         std::shared_ptr<Executor> executor_;
     };
+
+#define MEGOHTTP_SYSTEM_RESOLVER_IMPL_DEFINED 1
 
 } // namespace megohttp
 

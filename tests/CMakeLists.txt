@@ -21,6 +21,14 @@ set(MGHTTP_TEST_SOURCES
     test_core.cpp
     test_http.cpp
     test_client.cpp
+    test_streaming.cpp
+    test_streaming_integration.cpp
+    test_multipart.cpp
+    test_multipart_response.cpp
+    test_multipart_continuous.cpp
+    test_content_range.cpp
+    test_content_type.cpp
+    test_fuzz_parsers.cpp
 )
 
 if(MGHTTP_BACKEND_LIBUV)
@@ -53,3 +61,17 @@ add_executable(test_multi_tu tu_a.cpp tu_b.cpp)
 target_link_libraries(test_multi_tu PRIVATE MegoHttp::megohttp)
 mghttp_copy_runtime_dll(test_multi_tu)
 add_test(NAME test_multi_tu COMMAND test_multi_tu)
+
+# Independent-include check (spec 13.6). tests/include_check/ holds one TU per
+# public header, each including exactly that header and nothing else. If a
+# header stops being self-contained, only its own TU fails, which points at the
+# culprit directly instead of producing a cascade.
+file(GLOB MGHTTP_INCLUDE_CHECK_SOURCES CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/include_check/*.cpp")
+if(MGHTTP_INCLUDE_CHECK_SOURCES)
+    add_library(mghttp_include_check OBJECT ${MGHTTP_INCLUDE_CHECK_SOURCES})
+    target_link_libraries(mghttp_include_check PRIVATE MegoHttp::megohttp)
+    # The object library is never linked, so it needs no DLL copy step: it only
+    # has to compile.
+endif()
+

@@ -109,7 +109,7 @@ inline Result<Response> Client::request_sync(const Request& req) {
     // Only reliable when the Client owns an internal loop (libuv).
     // For Asio or external executors the caller must ensure another thread
     // drives the loop.
-#if defined(MGHTTP_BACKEND_LIBUV)
+#if MGHTTP_BACKEND_LIBUV
     if (impl_->owns_executor) {
         if (auto uv_ex = std::dynamic_pointer_cast<libuv_backend::UvExecutor>(impl_->executor)) {
             if (uv_ex->is_in_loop_thread()) {

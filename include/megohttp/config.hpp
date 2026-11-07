@@ -77,8 +77,18 @@
 #endif
 
 // ============================================================================
-// Backend Selection (exactly one must be defined)
+// Backend Selection (exactly one must be selected)
+//
+// Every check below uses the VALUE of the macro, not its mere presence, so that
+// -DMGHTTP_BACKEND_LIBUV=0 behaves identically to leaving it undefined.
 // ============================================================================
+
+#if defined(MGHTTP_BACKEND_LIBUV) && !MGHTTP_BACKEND_LIBUV
+#   undef MGHTTP_BACKEND_LIBUV
+#endif
+#if defined(MGHTTP_BACKEND_ASIO) && !MGHTTP_BACKEND_ASIO
+#   undef MGHTTP_BACKEND_ASIO
+#endif
 
 #if defined(MGHTTP_BACKEND_LIBUV) && defined(MGHTTP_BACKEND_ASIO)
 #   error "Cannot enable both LIBUV and ASIO backends"
@@ -89,8 +99,18 @@
 #endif
 
 // ============================================================================
-// TLS Selection (exactly one must be defined)
+// TLS Selection (exactly one must be selected)
 // ============================================================================
+
+#if defined(MGHTTP_TLS_NONE) && !MGHTTP_TLS_NONE
+#   undef MGHTTP_TLS_NONE
+#endif
+#if defined(MGHTTP_TLS_OPENSSL) && !MGHTTP_TLS_OPENSSL
+#   undef MGHTTP_TLS_OPENSSL
+#endif
+#if defined(MGHTTP_TLS_MBEDTLS) && !MGHTTP_TLS_MBEDTLS
+#   undef MGHTTP_TLS_MBEDTLS
+#endif
 
 #if defined(MGHTTP_TLS_NONE) && (defined(MGHTTP_TLS_OPENSSL) || defined(MGHTTP_TLS_MBEDTLS))
 #   error "Cannot enable TLS_NONE with other TLS backends"
@@ -113,16 +133,17 @@
 // ============================================================================
 
 // DoT/DoH requires TLS
-#if defined(MGHTTP_ENABLE_DOT) && defined(MGHTTP_TLS_NONE)
+#if defined(MGHTTP_ENABLE_DOT) && MGHTTP_ENABLE_DOT && defined(MGHTTP_TLS_NONE)
 #   error "DoT requires TLS (MGHTTP_TLS_NONE cannot be used with MGHTTP_ENABLE_DOT)"
 #endif
 
-#if defined(MGHTTP_ENABLE_DOH) && defined(MGHTTP_TLS_NONE)
+#if defined(MGHTTP_ENABLE_DOH) && MGHTTP_ENABLE_DOH && defined(MGHTTP_TLS_NONE)
 #   error "DoH requires TLS (MGHTTP_TLS_NONE cannot be used with MGHTTP_ENABLE_DOH)"
 #endif
 
 // WebSocket DEFLATE requires WebSocket
-#if defined(MGHTTP_ENABLE_WEBSOCKET_DEFLATE) && !defined(MGHTTP_ENABLE_WEBSOCKET)
+#if defined(MGHTTP_ENABLE_WEBSOCKET_DEFLATE) && MGHTTP_ENABLE_WEBSOCKET_DEFLATE && \
+    !(defined(MGHTTP_ENABLE_WEBSOCKET) && MGHTTP_ENABLE_WEBSOCKET)
 #   error "WebSocket DEFLATE requires WebSocket support"
 #endif
 
@@ -130,7 +151,7 @@
 // Coroutine Support
 // ============================================================================
 
-#if defined(MGHTTP_ENABLE_COROUTINES)
+#if defined(MGHTTP_ENABLE_COROUTINES) && MGHTTP_ENABLE_COROUTINES
 #   if !MEGOHTTP_HAS_CXX20
 #       error "C++20 required for coroutines"
 #   endif
@@ -143,57 +164,62 @@
 
 // ============================================================================
 // Feature Availability Macros (used internally)
+//
+// All consumer-side checks must use the numeric macros (MEGOHTTP_HAS_*) rather
+// than #ifdef, so that explicitly passing -DMGHTTP_ENABLE_GZIP=0 produces the
+// same "off" result as the flag being absent.  The conversion below is the
+// single place where the raw #define / -D flag becomes a 0/1 value.
 // ============================================================================
 
-#ifdef MGHTTP_USE_MEMESTRING
+#if defined(MGHTTP_USE_MEMESTRING) && MGHTTP_USE_MEMESTRING != 0
 #   define MEGOHTTP_HAS_MEMESTRING 1
 #else
 #   define MEGOHTTP_HAS_MEMESTRING 0
 #endif
 
-#ifdef MGHTTP_ENABLE_GZIP
+#if defined(MGHTTP_ENABLE_GZIP) && MGHTTP_ENABLE_GZIP != 0
 #   define MEGOHTTP_HAS_GZIP 1
 #else
 #   define MEGOHTTP_HAS_GZIP 0
 #endif
 
-#ifdef MGHTTP_ENABLE_BROTLI
+#if defined(MGHTTP_ENABLE_BROTLI) && MGHTTP_ENABLE_BROTLI != 0
 #   define MEGOHTTP_HAS_BROTLI 1
 #else
 #   define MEGOHTTP_HAS_BROTLI 0
 #endif
 
-#ifdef MGHTTP_ENABLE_SSE
+#if defined(MGHTTP_ENABLE_SSE) && MGHTTP_ENABLE_SSE != 0
 #   define MEGOHTTP_HAS_SSE 1
 #else
 #   define MEGOHTTP_HAS_SSE 0
 #endif
 
-#ifdef MGHTTP_ENABLE_WEBSOCKET
+#if defined(MGHTTP_ENABLE_WEBSOCKET) && MGHTTP_ENABLE_WEBSOCKET != 0
 #   define MEGOHTTP_HAS_WEBSOCKET 1
 #else
 #   define MEGOHTTP_HAS_WEBSOCKET 0
 #endif
 
-#ifdef MGHTTP_ENABLE_WEBSOCKET_DEFLATE
+#if defined(MGHTTP_ENABLE_WEBSOCKET_DEFLATE) && MGHTTP_ENABLE_WEBSOCKET_DEFLATE != 0
 #   define MEGOHTTP_HAS_WEBSOCKET_DEFLATE 1
 #else
 #   define MEGOHTTP_HAS_WEBSOCKET_DEFLATE 0
 #endif
 
-#ifdef MGHTTP_ENABLE_DOT
+#if defined(MGHTTP_ENABLE_DOT) && MGHTTP_ENABLE_DOT != 0
 #   define MEGOHTTP_HAS_DOT 1
 #else
 #   define MEGOHTTP_HAS_DOT 0
 #endif
 
-#ifdef MGHTTP_ENABLE_DOH
+#if defined(MGHTTP_ENABLE_DOH) && MGHTTP_ENABLE_DOH != 0
 #   define MEGOHTTP_HAS_DOH 1
 #else
 #   define MEGOHTTP_HAS_DOH 0
 #endif
 
-#ifdef MGHTTP_ENABLE_COROUTINES
+#if defined(MGHTTP_ENABLE_COROUTINES) && MGHTTP_ENABLE_COROUTINES != 0
 #   define MEGOHTTP_HAS_COROUTINES 1
 #else
 #   define MEGOHTTP_HAS_COROUTINES 0

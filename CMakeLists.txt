@@ -263,11 +263,11 @@ endif()
 if(MGHTTP_ENABLE_GZIP OR MGHTTP_ENABLE_WEBSOCKET_DEFLATE)
     set(ZLIB_ROOT "${MGHTTP_DEPS_DIR}/zlib-1.3.1")
     if(MSVC)
-        set(ZLIB_LIB "${ZLIB_ROOT}/${MGHTTP_DEP_BUILD}/Release/zlibstatic.lib")
+        set(ZLIB_LIB "$<BUILD_INTERFACE:${ZLIB_ROOT}/${MGHTTP_DEP_BUILD}>/Release/zlibstatic.lib")
     elseif(WIN32)
-        set(ZLIB_LIB "${ZLIB_ROOT}/${MGHTTP_DEP_BUILD}/libzlibstatic.a")
+        set(ZLIB_LIB "$<BUILD_INTERFACE:${ZLIB_ROOT}/${MGHTTP_DEP_BUILD}>/libzlibstatic.a")
     else()
-        set(ZLIB_LIB "${ZLIB_ROOT}/${MGHTTP_DEP_BUILD}/libzlibstatic.a")
+        set(ZLIB_LIB "$<BUILD_INTERFACE:${ZLIB_ROOT}/${MGHTTP_DEP_BUILD}>/libzlibstatic.a")
     endif()
     if(EXISTS "${ZLIB_LIB}")
         set(MGHTTP_ZLIB_AVAILABLE ON)
@@ -309,6 +309,13 @@ if(MGHTTP_USE_MEMESTRING)
 endif()
 
 # Compile definitions
+# Consumers must also compile with /utf-8: fmt's base.h static_asserts on it and
+# the MegoHttp headers are UTF-8 without a BOM. Without this an installed package
+# fails to compile in a fresh project (S1.9-04).
+if(MSVC)
+    target_compile_options(megohttp INTERFACE /utf-8)
+endif()
+
 target_compile_definitions(megohttp INTERFACE
     MGHTTP_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
     MGHTTP_VERSION_MINOR=${PROJECT_VERSION_MINOR}
@@ -437,7 +444,7 @@ if(TARGET fmt::fmt)
 else()
     target_include_directories(megohttp INTERFACE
         $<BUILD_INTERFACE:${FMT_ROOT}/include>)
-    target_link_libraries(megohttp INTERFACE "$<BUILD_INTERFACE:${FMT_LIB}>")
+    target_link_libraries(megohttp INTERFACE "${FMT_LIB}")
 endif()
 
 if(MGHTTP_USE_UVW AND MGHTTP_UVW_AVAILABLE)
@@ -461,7 +468,7 @@ if(MGHTTP_USE_MEMESTRING)
         endif()
         message(STATUS "MemeString runtime: ${MEMESTRING_RUNTIME}")
         message(STATUS "MemeString implib:  ${MEMESTRING_IMPLIB}")
-        target_link_libraries(megohttp INTERFACE "$<BUILD_INTERFACE:${MEMESTRING_IMPLIB}>")
+        target_link_libraries(megohttp INTERFACE "${MEMESTRING_IMPLIB}")
         target_compile_definitions(megohttp INTERFACE MGHTTP_MEMESTRING_DIR="${MEMESTRING_RUNTIME_DIR}")
     elseif(WIN32)
         # Link the DLL directly. Its import library in deps/MemeString/build_verify
@@ -474,7 +481,7 @@ if(MGHTTP_USE_MEMESTRING)
                 "MemeString runtime DLL not found. Pass -DMEMESTRING_RUNTIME=<path>.")
         endif()
         message(STATUS "MemeString runtime: ${MEMESTRING_RUNTIME}")
-        target_link_libraries(megohttp INTERFACE "$<BUILD_INTERFACE:${MEMESTRING_RUNTIME}>")
+        target_link_libraries(megohttp INTERFACE "${MEMESTRING_RUNTIME}")
         get_filename_component(MEMESTRING_RUNTIME_DIR "${MEMESTRING_RUNTIME}" DIRECTORY)
         target_compile_definitions(megohttp INTERFACE MGHTTP_MEMESTRING_DIR="${MEMESTRING_RUNTIME_DIR}")
     else()
@@ -488,7 +495,7 @@ if(WIN32 AND MEMESTRING_RUNTIME AND MGHTTP_USE_MEMESTRING)
     function(mghttp_copy_runtime_dll target)
         add_custom_command(TARGET ${target} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${MEMESTRING_RUNTIME}" "$<TARGET_FILE_DIR:${target}>"
+                "$<BUILD_INTERFACE:${MEMESTRING_RUNTIME}>" "$<TARGET_FILE_DIR:${target}>"
             VERBATIM)
     endfunction()
 else()
@@ -539,10 +546,19 @@ install(DIRECTORY include/
 # Package configuration
 include(CMakePackageConfigHelpers)
 
+# Generate the package config with both @...@ substitution (for boolean options)
+# and @PACKAGE_INIT@ expansion (for install tree relocation).
 configure_package_config_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/MegoHttpConfig.cmake.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/MegoHttpConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/MegoHttpConfig.cmake.in2"
     INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/MegoHttp
+)
+
+# The in2 file still has @MGHTTP_...@ placeholders; resolve them here.
+configure_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/MegoHttpConfig.cmake.in2"
+    "${CMAKE_CURRENT_BINARY_DIR}/MegoHttpConfig.cmake"
+    @ONLY
 )
 
 write_basic_package_version_file(
@@ -550,6 +566,33 @@ write_basic_package_version_file(
     VERSION ${PROJECT_VERSION}
     COMPATIBILITY SameMajorVersion
 )
+
+# Install the third-party headers the public interface depends on, at the same
+# include root the sources use. Without them an installed consumer cannot
+# resolve <memepp/string.hpp>, <uv.h>, <fmt/format.h> and friends, because the
+# BUILD_INTERFACE include dirs do not survive export (S1.9-04).
+#
+# These are copied flat into ${CMAKE_INSTALL_INCLUDEDIR} to match the include
+# spelling used by the library and by the dependencies themselves.
+install(DIRECTORY "${MEMESTRING_ROOT}/include/" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} OPTIONAL)
+install(DIRECTORY "${LIBUV_ROOT}/include/"       DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} OPTIONAL)
+install(DIRECTORY "${ASIO_ROOT}/asio/include/"   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} OPTIONAL)
+install(DIRECTORY "${FMT_ROOT}/include/"         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} OPTIONAL)
+install(DIRECTORY "${UVW_ROOT}/src/"             DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} OPTIONAL)
+# Install the static libraries the exported interface links against, so an
+# installed package is self-contained rather than pointing back into deps/.
+if(MGHTTP_FMT_AVAILABLE)
+    install(FILES "${FMT_LIB}" DESTINATION ${CMAKE_INSTALL_LIBDIR} OPTIONAL)
+endif()
+if(MGHTTP_BACKEND_LIBUV AND MGHTTP_LIBUV_AVAILABLE)
+    install(FILES "${LIBUV_LIB}" DESTINATION ${CMAKE_INSTALL_LIBDIR} OPTIONAL)
+endif()
+if(MGHTTP_USE_MEMESTRING)
+    install(FILES "${MEMESTRING_IMPLIB}"   DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    install(FILES "${MEMESTRING_RUNTIME}"  DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+
+install(FILES "${ZLIB_ROOT}/zlib.h" "${ZLIB_ROOT}/zconf.h" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} OPTIONAL)
 
 install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/MegoHttpConfig.cmake"

@@ -10,7 +10,7 @@
 #include <megohttp/transport.hpp>
 #include <megohttp/backend/executor_asio.hpp>
 
-#if !defined(MGHTTP_BACKEND_ASIO)
+#if !MGHTTP_BACKEND_ASIO
 #   error "transport_asio_impl.hpp requires MGHTTP_BACKEND_ASIO"
 #endif
 

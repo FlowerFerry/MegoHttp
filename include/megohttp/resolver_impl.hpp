@@ -11,6 +11,12 @@ namespace megohttp {
     // The body lives in backend/resolver_<backend>.hpp because the async lookup
     // mechanism is backend-specific; resolver.hpp already pulled that header in.
 
+#if defined(MEGOHTTP_SYSTEM_RESOLVER_IMPL_DEFINED)
+    // SystemResolverImpl lives in the selected backend header. That header sets
+    // MEGOHTTP_SYSTEM_RESOLVER_IMPL_DEFINED after its class definition, which is
+    // how this file tells "in scope" from "merely forward-declared": a TU that
+    // includes the backend header directly sets the backend's own include guard,
+    // so resolver.hpp's #include of it becomes a no-op on the way back here.
     inline SystemResolver::SystemResolver(std::shared_ptr<Executor> executor)
         : impl_(std::make_shared<SystemResolverImpl>(std::move(executor))) {}
 
@@ -19,6 +25,7 @@ namespace megohttp {
     inline CancelHandle SystemResolver::resolve(string host, uint16_t port, Callback cb) {
         return impl_->resolve(std::move(host), port, std::move(cb));
     }
+#endif
 
     // --- parse_ip_literal ----------------------------------------------------
     inline AddressList parse_ip_literal(const string_view& host, uint16_t port) {

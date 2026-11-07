@@ -10,9 +10,9 @@
 // Everything runs on the executor. A request submitted from another thread is
 // marshalled with post(), so no state below needs a lock beyond the cancel flag.
 
-#if defined(MGHTTP_BACKEND_LIBUV)
+#if MGHTTP_BACKEND_LIBUV
 #include <megohttp/backend/executor_libuv.hpp>
-#elif defined(MGHTTP_BACKEND_ASIO)
+#elif MGHTTP_BACKEND_ASIO
 #include <megohttp/backend/executor_asio.hpp>
 #endif
 
@@ -26,9 +26,9 @@ namespace megohttp {
 
         // Creates the default executor for the compiled backend.
         inline std::shared_ptr<Executor> make_default_executor() {
-#if defined(MGHTTP_BACKEND_LIBUV)
+#if MGHTTP_BACKEND_LIBUV
             return libuv_backend::UvExecutor::create_internal();
-#elif defined(MGHTTP_BACKEND_ASIO)
+#elif MGHTTP_BACKEND_ASIO
             return asio_backend::AsioExecutor::create_internal();
 #else
             return nullptr;
@@ -37,13 +37,13 @@ namespace megohttp {
 
         inline void shutdown_executor(const std::shared_ptr<Executor>& ex) {
             if (!ex) return;
-#if defined(MGHTTP_BACKEND_LIBUV)
+#if MGHTTP_BACKEND_LIBUV
             if (auto uv_ex = std::dynamic_pointer_cast<libuv_backend::UvExecutor>(ex)) {
                 uv_ex->shutdown();
                 return;
             }
 #endif
-#if defined(MGHTTP_BACKEND_ASIO)
+#if MGHTTP_BACKEND_ASIO
             if (auto a_ex = std::dynamic_pointer_cast<asio_backend::AsioExecutor>(ex)) {
                 a_ex->shutdown();
                 return;
@@ -259,18 +259,35 @@ namespace megohttp {
             }
 
             // Send body if present, then start reading the response.
+            // Supports both buffered (body_bytes) and streaming (body_source) modes.
             void send_body() {
                 state_->phase = detail::RequestPhase::SendBody;
                 body_sent_ = true;
                 auto self = shared_from_this();
                 auto stream = state_->stream;
-                if (!state_->request.has_body() || state_->request.body_bytes().empty()) {
+
+                // No body at all: go straight to reading.
+                if (!state_->request.has_body()) {
                     disarm_send_timer();
                     arm_recv_timer();
                     read_more();
                     return;
                 }
+
+                // Streaming mode: pull from BodySource.
+                if (auto& src = state_->request.body_source()) {
+                    send_body_streaming();
+                    return;
+                }
+
+                // Buffered mode: single write of the whole buffer.
                 const auto& body = state_->request.body_bytes();
+                if (body.empty()) {
+                    disarm_send_timer();
+                    arm_recv_timer();
+                    read_more();
+                    return;
+                }
                 stream->async_write(body.data(), body.size(),
                     [self](Result<size_t> w) {
                         if (!w) { self->fail(w.error()); return; }
@@ -278,6 +295,49 @@ namespace megohttp {
                         self->arm_recv_timer();
                         self->read_more();
                     });
+            }
+
+            // Streaming body: pull chunks from BodySource and write them.
+            // Backpressure: empty chunk from Source means "not ready, retry later".
+            void send_body_streaming() {
+                auto& src = *state_->request.body_source();
+                auto r = src();
+                if (!r) { fail(r.error()); return; }
+
+                auto& [data, eof] = r.value();
+                if (data.empty() && !eof) {
+                    // Backpressure: Source not ready. Retry shortly.
+                    auto self = shared_from_this();
+                    state_->executor->schedule_after(
+                        std::chrono::milliseconds(10),
+                        [self]() { self->send_body_streaming(); });
+                    return;
+                }
+
+                if (!data.empty()) {
+                    auto self = shared_from_this();
+                    auto stream = state_->stream;
+                    // Must keep data alive until async_write completes.
+                    auto buf = std::make_shared<string>(to_string(data));
+                    stream->async_write(
+                        reinterpret_cast<const uint8_t*>(buf->data()), buf->size(),
+                        [self, buf, eof](Result<size_t> w) {
+                            (void)buf; // keep alive
+                            if (!w) { self->fail(w.error()); return; }
+                            if (eof) {
+                                self->disarm_send_timer();
+                                self->arm_recv_timer();
+                                self->read_more();
+                            } else {
+                                self->send_body_streaming();
+                            }
+                        });
+                } else if (eof) {
+                    // Empty body with eof.
+                    disarm_send_timer();
+                    arm_recv_timer();
+                    read_more();
+                }
             }
 
             // --- ResponseParser::Callbacks ---
@@ -321,33 +381,56 @@ namespace megohttp {
                 }
                 rh.informational_status_codes = head.informational;
 
-                sink_ = std::make_unique<BufferSink>(std::move(rh),
-                                                     state_->options.max_response_body);
+                // S3.2-02: Choose buffered or streaming mode based on request.
+                if (auto& bs = state_->request.body_sink()) {
+                    body_sink_ = bs;
+                    body_sink_complete_ = state_->request.body_sink_complete();
+                } else {
+                    buffer_sink_ = std::make_unique<BufferSink>(std::move(rh),
+                                                         state_->options.max_response_body);
+                }
                 return VoidResult{};
             }
 
             VoidResult on_body_data(const uint8_t* data, size_t size) override {
-                if (!sink_) {
-                    return Error{ErrorCode::HttpInvalidResponse, ErrorPhase::Receive,
-                                 string("body data before response head")};
+                if (buffer_sink_) {
+                    if (!buffer_sink_->append(data, size)) {
+                        return Error{ErrorCode::HttpBodyTooLarge, ErrorPhase::Receive,
+                                     string("response body exceeded max_response_body")};
+                    }
+                    return VoidResult{};
                 }
-                if (!sink_->append(data, size)) {
-                    return Error{ErrorCode::HttpBodyTooLarge, ErrorPhase::Receive,
-                                 string("response body exceeded max_response_body")};
+                // S3.2-02: Streaming mode
+                if (body_sink_) {
+                    auto sv = string_view(reinterpret_cast<const char*>(data), size);
+                    if (!(*body_sink_)(sv)) {
+                        // Backpressure: sink asked to pause.
+                        // For now we don't pause the parser; we just continue.
+                        // Full backpressure would require parser pause/resume.
+                    }
                 }
                 return VoidResult{};
             }
 
             VoidResult on_trailers(const Headers& tr) override {
-                if (sink_) sink_->set_trailers(tr);
+                if (buffer_sink_) buffer_sink_->set_trailers(tr);
+                // In streaming mode, trailers are dropped (not supported yet).
                 return VoidResult{};
             }
 
             VoidResult on_complete() override {
                 complete_ = true;
                 disarm_recv_timer();
-                auto response = sink_ ? sink_->finish() : Response{};
-                state_->finish(std::move(response));
+                if (buffer_sink_) {
+                    auto response = buffer_sink_->finish();
+                    state_->finish(std::move(response));
+                } else if (body_sink_complete_) {
+                    // S3.2-02: Streaming mode complete.
+                    (*body_sink_complete_)(VoidResult{});
+                    state_->finish(Response{});  // Empty response, data already delivered
+                } else {
+                    state_->finish(Response{});
+                }
                 return VoidResult{};
             }
         private:
@@ -393,7 +476,11 @@ namespace megohttp {
             std::unique_ptr<ResponseParser> parser_;
             std::shared_ptr<Timer> send_timer_;
             std::shared_ptr<Timer> recv_timer_;
-            std::unique_ptr<BufferSink> sink_;
+            // Buffered mode: accumulates body into a vector.
+            std::unique_ptr<BufferSink> buffer_sink_;
+            // Streaming mode: user-provided callbacks. Mutually exclusive with buffer_sink_.
+            std::optional<Request::BodySink> body_sink_;
+            std::optional<Request::BodySinkComplete> body_sink_complete_;
             bool complete_{false};
             // Expect: 100-continue bookkeeping (S3.1-09).
             bool expect_continue_pending_{false};

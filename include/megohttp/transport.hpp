@@ -13,9 +13,9 @@
 #include <memory>
 #include <vector>
 
-#if defined(MGHTTP_BACKEND_LIBUV)
+#if MGHTTP_BACKEND_LIBUV
 #   include <uv.h>
-#elif defined(MGHTTP_BACKEND_ASIO)
+#elif MGHTTP_BACKEND_ASIO
 #   include <asio/ip/tcp.hpp>
 #   include <asio/io_context.hpp>
 #endif
@@ -96,7 +96,7 @@ namespace megohttp {
         void set_no_delay(bool enable);
 
     private:
-#if defined(MGHTTP_BACKEND_LIBUV)
+#if MGHTTP_BACKEND_LIBUV
         // libuv keeps pointers into the uv_tcp_t handle and into every request
         // (uv_connect_t / uv_write_t / uv_shutdown_t) it is given, and touches
         // them after our calls return:
@@ -138,7 +138,7 @@ namespace megohttp {
 
         uv_loop_t* loop_{nullptr};
         bool connecting_{false};
-#elif defined(MGHTTP_BACKEND_ASIO)
+#elif MGHTTP_BACKEND_ASIO
         static void on_connect(std::shared_ptr<TcpStream> self,
                                const asio::error_code& ec);
         static void on_read(std::shared_ptr<TcpStream> self,
@@ -153,7 +153,7 @@ namespace megohttp {
         // longer accept work. Always destroys the socket object it was given.
         void close_socket_on_strand();
 
-#if defined(MGHTTP_INTERNAL_TESTING)
+#if MGHTTP_INTERNAL_TESTING
     public:
         // Observability for tests: how many closes were handed to the strand vs
         // performed inline because no executor was available. Lets a test prove
@@ -196,7 +196,7 @@ namespace megohttp {
             size_t total{0};
             size_t written{0};
             WriteCallback cb;
-#if defined(MGHTTP_BACKEND_LIBUV)
+#if MGHTTP_BACKEND_LIBUV
             // The uv_write_t itself lives in Node: libuv keeps it until the write
             // callback fires, which can be after TcpStream is gone.
             uv_buf_t buf{};
@@ -206,7 +206,7 @@ namespace megohttp {
         CloseCallback close_cb_;
     };
 
-#if defined(MGHTTP_BACKEND_ASIO)
+#if MGHTTP_BACKEND_ASIO
     // TcpStream (asio) implementation is in backend/transport_asio_impl.hpp.
 #endif
 
@@ -230,9 +230,9 @@ namespace megohttp {
 } // namespace megohttp
 
 // --- backend implementation -----------------------------------------------
-#if defined(MGHTTP_BACKEND_LIBUV)
+#if MGHTTP_BACKEND_LIBUV
 #   include <megohttp/backend/transport_libuv_impl.hpp>
-#elif defined(MGHTTP_BACKEND_ASIO)
+#elif MGHTTP_BACKEND_ASIO
 #   include <megohttp/backend/transport_asio_impl.hpp>
 #endif
 #endif // MEGOHTTP_TRANSPORT_HPP_INCLUDED

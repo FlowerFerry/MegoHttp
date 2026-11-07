@@ -9,6 +9,7 @@
 #include <megohttp/url.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -59,6 +60,12 @@ namespace megohttp {
         // Take the bytes. Replayable.
         void set_body(std::vector<uint8_t> data);
 
+        // Body source: stream the request body piece by piece.
+        // Called repeatedly until it returns eof or an error.
+        // Returning an empty view means "not ready now, ask again later" (backpressure).
+        using BodySource = std::function<Result<std::pair<string_view, bool>>()>;
+        void set_body_source(BodySource src);
+
         bool has_body() const noexcept;
         void clear_body();
 
@@ -69,6 +76,17 @@ namespace megohttp {
 
         // Body bytes when the body is a byte buffer; empty otherwise.
         const std::vector<uint8_t>& body_bytes() const noexcept;
+
+        // Body source for streaming upload; nullopt if using buffer mode.
+        const std::optional<BodySource>& body_source() const noexcept;
+
+        // Body sink for streaming download; nullopt if using buffer mode (default).
+        // When set, body_bytes() will be empty and body_is_buffered() false.
+        using BodySink = std::function<bool(string_view chunk)>;
+        using BodySinkComplete = std::function<void(VoidResult)>;
+        void set_body_sink(BodySink sink, BodySinkComplete complete);
+        const std::optional<BodySink>& body_sink() const noexcept;
+        const std::optional<BodySinkComplete>& body_sink_complete() const noexcept;
 
     private:
         class Impl;
