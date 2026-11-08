@@ -93,6 +93,7 @@ namespace megohttp {
             BuildHead,
             Resolve,
             Connect,
+            TlsHandshake,
             SendHead,
             SendBody,
             Receive,
@@ -119,6 +120,12 @@ namespace megohttp {
 
             // Held while the exchange is live so the stream outlives its callbacks.
             std::shared_ptr<AsyncByteStream> stream;
+
+            // Holds the TLS layer for https:// requests. Once the handshake
+            // completes `stream` points at this same object; on a handshake
+            // failure `stream` still refers to the raw TCP stream, which is what
+            // the error path needs.
+            std::shared_ptr<TlsStream> tls_stream;
 
             // Self-hold until the terminal callback fires.
             std::shared_ptr<RequestState> self_hold;
@@ -158,6 +165,7 @@ namespace megohttp {
                     case RequestPhase::BuildHead: p = ErrorPhase::Send;      break;
                     case RequestPhase::Resolve:   p = ErrorPhase::Resolve;   break;
                     case RequestPhase::Connect:   p = ErrorPhase::TcpConnect;break;
+                    case RequestPhase::TlsHandshake: p = ErrorPhase::TlsHandshake; break;
                     case RequestPhase::SendHead:
                     case RequestPhase::SendBody:  p = ErrorPhase::Send;      break;
                     case RequestPhase::Receive:   p = ErrorPhase::Receive;   break;
@@ -630,14 +638,20 @@ namespace megohttp {
             if (!parsed) { st->finish(parsed.error()); return; }
             Url url = std::move(parsed.value());
 
-            if (url.scheme != Scheme::Http) {
-                // Phase 1 has no TLS: refuse rather than silently downgrade.
-                st->finish(Error{url.is_secure() ? ErrorCode::TlsNotEnabled
-                                                 : ErrorCode::InvalidArgument,
-                                 ErrorPhase::None,
-                                 string("phase 1 supports plaintext http:// only")});
+            if (url.scheme != Scheme::Http && url.scheme != Scheme::Https) {
+                st->finish(Error{ErrorCode::InvalidArgument, ErrorPhase::None,
+                                 string("only http:// and https:// are supported")});
                 return;
             }
+#if MGHTTP_TLS_NONE
+            if (url.is_secure()) {
+                // Built without a TLS backend: report it rather than silently
+                // downgrading to plaintext (task book 3.7).
+                st->finish(Error{ErrorCode::TlsNotEnabled, ErrorPhase::None,
+                                 string("https:// requires a TLS backend")});
+                return;
+            }
+#endif
             st->request.set_parsed_url(url);
 
             st->phase = detail::RequestPhase::BuildHead;
@@ -698,10 +712,50 @@ namespace megohttp {
                         if (!conn) { s2->fail(conn.error()); return; }
 
                         s2->stream = conn.value();
-                        begin_exchange(s2, std::move(head));
+                        begin_tls_or_exchange(s2, std::move(head));
                     });
             });
             st->dns_cancel = dns_handle;
+        }
+
+        // Layered between TCP and the HTTP exchange: when the URL is https://,
+        // the connected byte stream is wrapped in a TlsStream first. TLS is
+        // built on AsyncByteStream (not on a raw socket), which is what lets the
+        // same code serve a proxy CONNECT tunnel later (task book 5).
+        static void begin_tls_or_exchange(const std::shared_ptr<detail::RequestState>& st,
+                                          string head) {
+            if (!st->request.parsed_url() || !st->request.parsed_url()->is_secure()) {
+                begin_exchange(st, std::move(head));
+                return;
+            }
+
+            TlsConfig cfg = st->options.tls;
+            // Hostname drives both SNI and the certificate identity check, so it
+            // must be the URL host -- never the resolved address.
+            cfg.hostname = st->request.parsed_url()->host;
+
+            st->phase = detail::RequestPhase::TlsHandshake;
+            auto tls = make_tls_stream(st->stream, cfg);
+            if (!tls) {
+                st->fail(Error{ErrorCode::TlsHandshakeFailed, ErrorPhase::TlsHandshake,
+                               string("failed to create the TLS stream")});
+                return;
+            }
+            st->tls_stream = tls;
+
+            std::weak_ptr<detail::RequestState> weak = st;
+            tls->start([weak, head = std::move(head)](VoidResult r) mutable {
+                auto s = weak.lock();
+                if (!s || s->finished.load()) return;
+                if (!r) {
+                    // The TLS stream already tagged this with ErrorPhase and a
+                    // specific certificate code where applicable.
+                    s->fail(r.error());
+                    return;
+                }
+                s->stream = s->tls_stream;   // exchange talks TLS from here on
+                begin_exchange(s, std::move(head));
+            });
         }
 
         // Free of `this` so it can run from a detached async callback: the

@@ -14,6 +14,7 @@
 #include <megohttp/response.hpp>
 #include <megohttp/string_adapter.hpp>
 #include <megohttp/transport.hpp>
+#include <megohttp/tls_stream.hpp>
 
 #include <chrono>
 #include <functional>
@@ -63,6 +64,12 @@ namespace megohttp {
         std::shared_ptr<Executor> executor;
 
         string user_agent{"MegoHttp/0.1"};
+
+        // TLS settings for https:// requests. One object only: proxy TLS is a
+        // separate concern that arrives with the proxy layer (task book 9.3
+        // forbids one object silently driving both identities).
+        // Left at its defaults, the backend's platform trust store is used.
+        TlsConfig tls;
 
         // Rejects any duration that cannot be represented as a timer deadline.
         // Called by the Client constructor so a bad option fails immediately

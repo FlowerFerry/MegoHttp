@@ -111,6 +111,12 @@ struct TlsStream::Impl {
     State state_{State::Handshake};
     bool handshake_complete_{false};
 
+    // True once start() has initialised the crypto backend. Before that the
+    // backend handle is null, so driving it (SSL_do_handshake / SSL_read /
+    // mbedtls_* ) would dereference nullptr. Reads and writes must be refused
+    // until this is true.
+    bool started_{false};
+
     ErrorPhase handshake_phase_{ErrorPhase::TlsHandshake};
     ErrorPhase protocol_phase_{ErrorPhase::Receive};
 
@@ -171,6 +177,12 @@ struct TlsStream::Impl {
     // the pump where we hold Impl* rather than TlsStream*.
     ErrorCode impl_certificate_error() const noexcept;
 
+    // True when the handshake failed because the peer would not agree on a
+    // protocol version (e.g. we require TLS 1.3, the server caps at 1.2).
+    // Reported as TlsProtocolVersionUnsupported so a caller can tell "the
+    // server is too old" apart from a certificate or transport failure.
+    bool impl_version_failure() const noexcept;
+
 #if MGHTTP_TLS_OPENSSL
     SSL_CTX* ctx_{nullptr};
     BIO*     rbio_{nullptr};
@@ -188,6 +200,9 @@ struct TlsStream::Impl {
     mbedtls_ctr_drbg_context ctr_drbg_;
     mbedtls_entropy_context  entropy_;
     bool                     owns_conf_{false};
+    // Last handshake return code. Needed because a version refusal produces no
+    // certificate verdict, so the verify result alone cannot classify it.
+    int                      last_mbedtls_error_{0};
     // mbedtls_ssl_conf_alpn_protocols stores the POINTER, not a copy, so the
     // null-terminated array must outlive the config. A local vector here made
     // the handshake read freed memory.
@@ -236,7 +251,18 @@ inline bool TlsStream::Impl::init_openssl() {
             return false;
         }
     } else if (config_.verify_peer) {
-        // No explicit source: fall back to the platform default store.
+        // No explicit source: try the platform default bundle first, then fall
+        // back to the OpenSSL default paths (OPENSSLDIR). Both are REPLACEMENT
+        // sources, not additions -- the platform's default store takes over in
+        // lieu of anything else, it does not widen a previously-set trust set.
+        string def = tls_trust::default_ca_file();
+        if (!def.empty()) {
+            SSL_CTX_load_verify_locations(ctx_, def.c_str(), nullptr);
+        }
+        // Still try the built-in paths in case the platform bundle export
+        // failed. SSL_CTX_set_default_verify_paths loads OPENSSLDIR/cafile
+        // and OPENSSLDIR/cadir, which on Windows points at the OpenSSL
+        // install's certs directory (usually empty).
         SSL_CTX_set_default_verify_paths(ctx_);
     }
 
@@ -376,20 +402,41 @@ inline bool TlsStream::Impl::init_mbedtls() {
 
     bool any_ca = false;
     if (!config_.ca_file.empty()) {
-        if (mbedtls_x509_crt_parse_file(&cacert_, config_.ca_file.c_str()) != 0) {
-            return false;
-        }
+        // Docs (x509_crt.h): 0 = all parsed, POSITIVE = number of certificates
+        // that failed to parse while others succeeded, negative = hard error.
+        // The Windows ROOT store export legitimately contains certs mbedTLS
+        // cannot parse (legacy algorithms), so rejecting every positive return
+        // threw away the entire trust store. Accept partial success as long as
+        // something got parsed.
+        const int rc = mbedtls_x509_crt_parse_file(&cacert_, config_.ca_file.c_str());
+        if (rc < 0) return false;
         any_ca = true;
     }
     if (!config_.ca_path.empty()) {
-        if (mbedtls_x509_crt_parse_path(&cacert_, config_.ca_path.c_str()) != 0) {
-            return false;
-        }
+        const int rc = mbedtls_x509_crt_parse_path(&cacert_, config_.ca_path.c_str());
+        if (rc < 0) return false;
         any_ca = true;
+    }
+    if (!any_ca && config_.verify_peer) {
+        // mbedTLS ships no trust store of its own, so without an explicit source
+        // it would have nothing to verify against. Use the platform bundle that
+        // tls_trust discovered (on Windows this is the system ROOT store
+        // exported to PEM). If even that is unavailable, refusing is correct:
+        // silently continuing would mean an unverified connection.
+        string def = tls_trust::default_ca_file();
+        if (!def.empty()) {
+            // Positive return = some certs failed but others parsed; see the
+            // ca_file branch above for why that must not be a hard failure.
+            const int rc = mbedtls_x509_crt_parse_file(&cacert_, def.c_str());
+            if (rc < 0) return false;
+            any_ca = true;
+        }
     }
     if (any_ca) {
         mbedtls_ssl_conf_ca_chain(&conf_, &cacert_, nullptr);
     } else if (config_.verify_peer) {
+        // No trust material from any source: fail loudly rather than hand out
+        // an unverified connection (task book 9.2).
         return false;
     }
 
@@ -506,12 +553,53 @@ inline ErrorCode TlsStream::Impl::impl_certificate_error() const noexcept {
     }
 #elif MGHTTP_TLS_MBEDTLS
     const uint32_t f = mbedtls_ssl_get_verify_result(&ssl_);
-    if (f == 0) return ErrorCode::Success;
+    // 0xFFFFFFFF is mbedTLS's sentinel for "no certificate verdict exists"
+    // (set when the handshake dies before the certificate is examined, e.g. on
+    // a protocol-version alert). Treating it as a certificate verdict would
+    // report a bogus TlsCertificateInvalid.
+    if (f == 0 || f == 0xFFFFFFFFu) return ErrorCode::Success;
     if (f & MBEDTLS_X509_BADCERT_EXPIRED) return ErrorCode::TlsCertificateExpired;
     if (f & MBEDTLS_X509_BADCERT_CN_MISMATCH) return ErrorCode::TlsHostnameMismatch;
     return ErrorCode::TlsCertificateInvalid;
 #else
     return ErrorCode::Success;
+#endif
+}
+
+inline bool TlsStream::Impl::impl_version_failure() const noexcept {
+#if MGHTTP_TLS_OPENSSL
+    if (!ssl_) return false;
+    // SSL_do_handshake returned a non-WANT error: inspect the error queue rather
+    // than the verify result, because a version mismatch never produces a
+    // certificate verdict. SSL_R_TLSV1_ALERT_PROTOCOL_VERSION is the peer's
+    // protocol_version alert; the rest are local version-floor refusals.
+    const unsigned long e = ERR_peek_last_error();
+    if (e == 0) return false;
+    switch (ERR_GET_REASON(e)) {
+        case SSL_R_TLSV1_ALERT_PROTOCOL_VERSION:
+        case SSL_R_UNSUPPORTED_PROTOCOL:
+        case SSL_R_VERSION_TOO_LOW:
+        case SSL_R_VERSION_TOO_HIGH:
+        case SSL_R_WRONG_SSL_VERSION:
+            return true;
+        default:
+            return false;
+    }
+#elif MGHTTP_TLS_MBEDTLS
+    // mbedTLS has no public accessor for the peer's alert code, so classify on
+    // the pair of facts the two failure modes differ in. Verified by probe
+    // (tests/probe_mbedtls_codes.cpp):
+    //   version refusal  -> rc = MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE,
+    //                       verify_result = 0xFFFFFFFF (sentinel: no cert verdict
+    //                       was ever reached)
+    //   certificate refusal -> rc = MBEDTLS_ERR_X509_CERT_VERIFY_FAILED,
+    //                       verify_result = a real bitmask (e.g. 0x8 NOT_TRUSTED)
+    // Trusting the sentinel alone keeps a genuine alert from being mislabelled
+    // as a certificate error and vice versa.
+    if (last_mbedtls_error_ != MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE) return false;
+    return mbedtls_ssl_get_verify_result(&ssl_) == 0xFFFFFFFFu;
+#else
+    return false;
 #endif
 }
 
@@ -527,6 +615,9 @@ inline void TlsStream::Impl::notify_closed() {
 
 inline void TlsStream::Impl::pump() {
     if (pumping_) { pump_again_ = true; return; }
+    // Nothing can be driven before the backend exists: state_ is Handshake but
+    // ssl_ is null, so SSL_do_handshake / mbedtls_ssl_handshake would crash.
+    if (!started_) return;
     pumping_ = true;
 
     do {
@@ -579,8 +670,17 @@ inline void TlsStream::Impl::pump() {
                 int e = SSL_get_error(ssl_, ret);
                 if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) {
                     const ErrorCode ce = impl_certificate_error();
-                    fail(ce != ErrorCode::Success ? ce : ErrorCode::TlsHandshakeFailed,
-                         handshake_phase_, "TLS handshake failed");
+                    // Order matters: a version refusal leaves the verify result
+                    // at X509_V_OK, so it must be checked before falling back to
+                    // a generic handshake error.
+                    if (ce != ErrorCode::Success)
+                        fail(ce, handshake_phase_, "TLS handshake failed");
+                    else if (impl_version_failure())
+                        fail(ErrorCode::TlsProtocolVersionUnsupported, handshake_phase_,
+                             "TLS protocol version not supported by the peer");
+                    else
+                        fail(ErrorCode::TlsHandshakeFailed, handshake_phase_,
+                             "TLS handshake failed");
                 }
             }
 #elif MGHTTP_TLS_MBEDTLS
@@ -591,11 +691,20 @@ inline void TlsStream::Impl::pump() {
                 finish_ready(VoidResult{});
             } else if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
                        ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+                // Record the code before classifying: impl_version_failure()
+                // reads it, and the verify result is untouched by a version
+                // refusal.
+                last_mbedtls_error_ = ret;
                 const ErrorCode ce = impl_certificate_error();
                 char detail[128] = {0};
                 mbedtls_strerror(ret, detail, sizeof detail);
-                fail(ce != ErrorCode::Success ? ce : ErrorCode::TlsHandshakeFailed,
-                     handshake_phase_, detail);
+                if (ce != ErrorCode::Success)
+                    fail(ce, handshake_phase_, detail);
+                else if (impl_version_failure())
+                    fail(ErrorCode::TlsProtocolVersionUnsupported, handshake_phase_,
+                         detail);
+                else
+                    fail(ErrorCode::TlsHandshakeFailed, handshake_phase_, detail);
                 break;
             }
 #endif
@@ -659,6 +768,7 @@ inline void TlsStream::Impl::pump() {
             finish_read(Result<string_view>{
                 string_view{reinterpret_cast<const char*>(plain_.data()),
                             static_cast<string_view::size_type>(plain_.size())}});
+            plain_.clear();
         }
 
         if (close_requested_ && state_ != State::Failed) {
@@ -752,10 +862,11 @@ inline void TlsStream::start(ReadyCallback on_ready) {
         return;
     }
 
+    bool ok = false;
 #if MGHTTP_TLS_OPENSSL
-    bool ok = impl_->init_openssl();
+    ok = impl_->init_openssl();
 #elif MGHTTP_TLS_MBEDTLS
-    bool ok = impl_->init_mbedtls();
+    ok = impl_->init_mbedtls();
 #else
     impl_->state_ = Impl::State::Failed;
     impl_->finish_ready(VoidResult{Error{ErrorCode::TlsNotEnabled, ErrorPhase::None,
@@ -773,10 +884,19 @@ inline void TlsStream::start(ReadyCallback on_ready) {
     // Pending underlying callbacks outlive this call, so the stream must hold
     // itself. Same reason TcpStream's Node keeps a shared_ptr to itself.
     if (!impl_->self_) impl_->self_ = shared_from_this();
+    impl_->started_ = true;
     impl_->pump();
 }
 
 inline void TlsStream::async_read_some(ReadCallback cb) {
+    if (!impl_->started_) {
+        // start() was never called: there is no TLS session to read from, and
+        // parking the callback would hang the caller forever.
+        cb(Result<string_view>{Error{ErrorCode::InvalidArgument,
+                                     impl_->handshake_phase_,
+                                     string("TLS stream has not been started")}});
+        return;
+    }
     if (impl_->state_ == Impl::State::Failed) {
         cb(Result<string_view>{Error{ErrorCode::ConnectionClosed, impl_->protocol_phase_,
                                      string("TLS stream has failed")}});
@@ -815,7 +935,16 @@ inline void TlsStream::async_write(const uint8_t* data, size_t size, WriteCallba
 }
 
 inline void TlsStream::async_close(CloseCallback cb) {
-    if (impl_->close_notified_) { if (cb) cb(); return; }
+    if (impl_->close_notified_) {
+        // Already fully closed. The terminal notification is exactly-once
+        // (task book 5.3), so a late caller gets no second callback.
+        return;
+    }
+    if (impl_->close_cb_) {
+        // A close is already in progress: the pending callback owns the single
+        // terminal notification. A second caller must not add another one.
+        return;
+    }
     impl_->close_cb_ = std::move(cb);
     impl_->close_requested_ = true;
 

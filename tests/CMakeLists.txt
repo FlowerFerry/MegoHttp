@@ -29,6 +29,10 @@ set(MGHTTP_TEST_SOURCES
     test_content_range.cpp
     test_content_type.cpp
     test_fuzz_parsers.cpp
+    test_tls_stream.cpp
+    test_client_tls.cpp
+    test_tls_layering.cpp
+    test_tls_trust.cpp
 )
 
 if(MGHTTP_BACKEND_LIBUV)
@@ -50,7 +54,14 @@ foreach(test_src IN LISTS MGHTTP_TEST_SOURCES)
     # Catch2WithMain supplies main(); the test files contain only TEST_CASEs.
     target_link_libraries(${test_name} PRIVATE MegoHttp::megohttp Catch2::Catch2WithMain)
     target_compile_definitions(${test_name} PRIVATE MGHTTP_INTERNAL_TESTING=1)
+    # TLS tests start tests/tls_test_server.py and read PEMs from tls_fixtures/.
+    # Paths are compile definitions rather than relative lookups so the test does
+    # not depend on the working directory it was launched from.
+    target_compile_definitions(${test_name} PRIVATE
+        MEGOHTTP_TESTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+        MEGOHTTP_TLS_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tls_fixtures")
     mghttp_copy_runtime_dll(${test_name})
+    mghttp_copy_tls_runtime_dll(${test_name})
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
 

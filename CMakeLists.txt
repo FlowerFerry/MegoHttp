@@ -238,16 +238,53 @@ if(MGHTTP_BACKEND_ASIO)
 endif()
 
 if(MGHTTP_TLS_OPENSSL)
-    # Phase 1 does not consume TLS yet, so a missing toolkit must not block the
-    # build; it becomes fatal as soon as the TLS layer lands.
+    # Now consumed by tls_stream_impl.hpp, so a missing toolkit is fatal rather
+    # than a warning: silently compiling without TLS would make every https://
+    # request fail at runtime with a misleading error.
     find_package(OpenSSL QUIET)
     if(NOT OpenSSL_FOUND)
-        message(STATUS "OpenSSL not found for this generator; TLS layer will be unavailable")
+        message(FATAL_ERROR
+            "MGHTTP_TLS_OPENSSL=ON but OpenSSL was not found. "
+            "Set CMAKE_PREFIX_PATH to an OpenSSL installation, or configure with "
+            "-DMGHTTP_TLS_NONE=ON / -DMGHTTP_TLS_MBEDTLS=ON.")
     endif()
+    message(STATUS "OpenSSL: ${OPENSSL_VERSION} (${OPENSSL_INCLUDE_DIR})")
 endif()
 
 if(MGHTTP_TLS_MBEDTLS)
-    find_package(MbedTLS QUIET)
+    # Prefer an in-tree build (deps/mbedtls-*), fall back to a system package.
+    set(MBEDTLS_ROOT "${MGHTTP_DEPS_DIR}/mbedtls-3.6.7")
+    if(MSVC)
+        set(MBEDTLS_LIB_DIR "${MBEDTLS_ROOT}/build_msvc/library/Release")
+    else()
+        set(MBEDTLS_LIB_DIR "${MBEDTLS_ROOT}/build_mingw/library")
+    endif()
+
+    if(EXISTS "${MBEDTLS_ROOT}/include/mbedtls/ssl.h" AND
+       EXISTS "${MBEDTLS_LIB_DIR}/mbedtls.lib")
+        set(MGHTTP_MBEDTLS_AVAILABLE ON)
+        add_library(mbedtls_ext STATIC IMPORTED)
+        set_target_properties(mbedtls_ext PROPERTIES
+            IMPORTED_LOCATION "${MBEDTLS_LIB_DIR}/mbedtls.lib")
+        add_library(mbedx509_ext STATIC IMPORTED)
+        set_target_properties(mbedx509_ext PROPERTIES
+            IMPORTED_LOCATION "${MBEDTLS_LIB_DIR}/mbedx509.lib")
+        add_library(mbedcrypto_ext STATIC IMPORTED)
+        set_target_properties(mbedcrypto_ext PROPERTIES
+            IMPORTED_LOCATION "${MBEDTLS_LIB_DIR}/mbedcrypto.lib")
+        message(STATUS "mbedTLS: in-tree ${MBEDTLS_ROOT} (3.6.7)")
+    else()
+        find_package(MbedTLS QUIET)
+        if(MbedTLS_FOUND)
+            set(MGHTTP_MBEDTLS_AVAILABLE ON)
+            message(STATUS "mbedTLS: system package")
+        else()
+            message(FATAL_ERROR
+                "MGHTTP_TLS_MBEDTLS=ON but mbedTLS was not found. "
+                "Expected ${MBEDTLS_LIB_DIR}/mbedtls.lib, or a system package. "
+                "Build deps/mbedtls-3.6.7 first (see docs/process/resume-here.md).")
+        endif()
+    endif()
 endif()
 
 set(MEMESTRING_ROOT "${MGHTTP_DEPS_DIR}/MemeString")
@@ -343,7 +380,13 @@ endif()
 
 if(MGHTTP_TLS_MBEDTLS)
     target_compile_definitions(megohttp INTERFACE MGHTTP_TLS_MBEDTLS=1)
-    # target_link_libraries(megohttp INTERFACE MbedTLS::mbedtls)
+    target_include_directories(megohttp INTERFACE
+        $<BUILD_INTERFACE:${MBEDTLS_ROOT}/include>)
+    target_link_libraries(megohttp INTERFACE mbedtls_ext mbedx509_ext mbedcrypto_ext)
+    if(MSVC)
+        # mbedTLS needs bcrypt for CTR-DRBG entropy
+        target_link_libraries(megohttp INTERFACE bcrypt)
+    endif()
 endif()
 
 if(MGHTTP_ENABLE_GZIP)
@@ -503,6 +546,54 @@ else()
         # Nothing to copy on this platform/configuration.
     endfunction()
 endif()
+
+# OpenSSL on Windows is a shared toolkit: the import library links fine but the
+# test binaries die at load with 0xC0000135 (DLL not found) unless libssl /
+# libcrypto sit beside the exe or on PATH. Same technique as the MemeString DLL
+# above, and the same reason: a green run that depends on whoever happened to
+# have the toolkit on PATH is not reproducible evidence.
+#
+# The import library lives in <prefix>/lib and the runtime DLLs in <prefix>/bin,
+# so the DLL directory is derived from the library path rather than guessed.
+set(MGHTTP_TLS_RUNTIME_DLLS "")
+if(WIN32 AND MGHTTP_TLS_OPENSSL AND OpenSSL_FOUND)
+    set(_mghttp_ssl_lib "${OPENSSL_SSL_LIBRARY}")
+    if(TARGET OpenSSL::SSL)
+        get_target_property(_mghttp_implib OpenSSL::SSL IMPORTED_IMPLIB_RELEASE)
+        if(_mghttp_implib AND NOT _mghttp_implib MATCHES "NOTFOUND")
+            set(_mghttp_ssl_lib "${_mghttp_implib}")
+        endif()
+    endif()
+    get_filename_component(_mghttp_ssl_libdir "${_mghttp_ssl_lib}" DIRECTORY)
+    foreach(_mghttp_bindir "${_mghttp_ssl_libdir}/../bin" "${OPENSSL_INCLUDE_DIR}/../bin")
+        file(GLOB _mghttp_found_dlls
+             "${_mghttp_bindir}/libssl-*.dll" "${_mghttp_bindir}/libcrypto-*.dll")
+        if(_mghttp_found_dlls)
+            list(APPEND MGHTTP_TLS_RUNTIME_DLLS ${_mghttp_found_dlls})
+        endif()
+    endforeach()
+    list(REMOVE_DUPLICATES MGHTTP_TLS_RUNTIME_DLLS)
+    if(MGHTTP_TLS_RUNTIME_DLLS)
+        message(STATUS "OpenSSL runtime DLLs copied beside test binaries: "
+                       "${MGHTTP_TLS_RUNTIME_DLLS}")
+    else()
+        message(WARNING
+            "MGHTTP_TLS_OPENSSL=ON but no libssl-*.dll / libcrypto-*.dll was found "
+            "next to ${_mghttp_ssl_libdir}. TLS test binaries will fail to load "
+            "unless the OpenSSL bin directory is on PATH.")
+    endif()
+endif()
+
+function(mghttp_copy_tls_runtime_dll target)
+    if(MGHTTP_TLS_RUNTIME_DLLS)
+        foreach(_dll IN LISTS MGHTTP_TLS_RUNTIME_DLLS)
+            add_custom_command(TARGET ${target} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_dll}" "$<TARGET_FILE_DIR:${target}>"
+                VERBATIM)
+        endforeach()
+    endif()
+endfunction()
 
 if((MGHTTP_ENABLE_GZIP OR MGHTTP_ENABLE_WEBSOCKET_DEFLATE) AND MGHTTP_ZLIB_AVAILABLE)
     if(ZLIB_FOUND AND TARGET ZLIB::ZLIB)
