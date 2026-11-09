@@ -42,6 +42,9 @@ namespace megohttp {
             { ErrorCode::ConnectTimeout,          "ConnectTimeout" },
             { ErrorCode::ConnectionReset,         "ConnectionReset" },
             { ErrorCode::ConnectionClosed,        "ConnectionClosed" },
+            { ErrorCode::NotFound,                "NotFound" },
+            { ErrorCode::PoolTimeout,             "PoolTimeout" },
+            { ErrorCode::PoolExhausted,           "PoolExhausted" },
 
             { ErrorCode::TlsHandshakeFailed,      "TlsHandshakeFailed" },
             { ErrorCode::TlsCertificateInvalid,   "TlsCertificateInvalid" },

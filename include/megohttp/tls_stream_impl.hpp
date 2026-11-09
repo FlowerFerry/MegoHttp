@@ -855,6 +855,15 @@ inline TlsStream::~TlsStream() = default;
 inline void TlsStream::start(ReadyCallback on_ready) {
     impl_->ready_cb_ = std::move(on_ready);
 
+#if MGHTTP_TLS_NONE
+    // Report the missing backend before anything else: with TLS compiled out
+    // there is no engine to drive, so "the underlying stream is not connected"
+    // would be a misleading diagnosis of a build-configuration problem.
+    impl_->state_ = Impl::State::Failed;
+    impl_->finish_ready(VoidResult{Error{ErrorCode::TlsNotEnabled, ErrorPhase::None,
+                                         string("TLS support was not compiled in")}});
+    return;
+#else
     if (!impl_->underlying_ || !impl_->underlying_->is_open()) {
         impl_->state_ = Impl::State::Failed;
         impl_->finish_ready(VoidResult{Error{ErrorCode::InvalidArgument, ErrorPhase::None,
@@ -867,11 +876,6 @@ inline void TlsStream::start(ReadyCallback on_ready) {
     ok = impl_->init_openssl();
 #elif MGHTTP_TLS_MBEDTLS
     ok = impl_->init_mbedtls();
-#else
-    impl_->state_ = Impl::State::Failed;
-    impl_->finish_ready(VoidResult{Error{ErrorCode::TlsNotEnabled, ErrorPhase::None,
-                                         string("TLS support was not compiled in")}});
-    return;
 #endif
 
     if (!ok) {
@@ -886,6 +890,7 @@ inline void TlsStream::start(ReadyCallback on_ready) {
     if (!impl_->self_) impl_->self_ = shared_from_this();
     impl_->started_ = true;
     impl_->pump();
+#endif // MGHTTP_TLS_NONE
 }
 
 inline void TlsStream::async_read_some(ReadCallback cb) {

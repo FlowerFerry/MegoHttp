@@ -49,6 +49,14 @@ namespace megohttp {
         ConnectionReset         = MGEC__HTTP_BEGIN - 42,
         ConnectionClosed        = MGEC__HTTP_BEGIN - 43,
 
+        // --- Connection pool (phase 5) ---
+        // NotFound is a control signal on the pool seam, not a user-facing
+        // failure: "no idle connection, open a new one". It never escapes the
+        // Client, and the Client translate it into forward progress.
+        NotFound                = MGEC__HTTP_BEGIN - 50,
+        PoolTimeout             = MGEC__HTTP_BEGIN - 51,  // waited too long for a connection
+        PoolExhausted           = MGEC__HTTP_BEGIN - 52,  // queue full, no capacity
+
         // --- TLS ---
         TlsHandshakeFailed      = MGEC__HTTP_BEGIN - 60,
         TlsCertificateInvalid   = MGEC__HTTP_BEGIN - 61,

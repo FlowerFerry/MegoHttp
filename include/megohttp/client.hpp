@@ -7,9 +7,12 @@
 // API. Connection pooling, redirects, retries, proxies, TLS, SSE and WebSocket
 // come later; nothing here pretends to have them.
 #include <megohttp/config.hpp>
+#include <megohttp/connection_pool.hpp>
 #include <megohttp/error.hpp>
 #include <megohttp/executor.hpp>
+#include <megohttp/redirect.hpp>
 #include <megohttp/request.hpp>
+#include <megohttp/retry.hpp>
 #include <megohttp/resolver.hpp>
 #include <megohttp/response.hpp>
 #include <megohttp/string_adapter.hpp>
@@ -54,6 +57,43 @@ namespace megohttp {
 
         // Parser limits applied to every response.
         ParserLimits parser_limits{};
+
+        // Connection pool (phase 5, task book 8.1). Defaults reproduce the
+        // pre-phase-5 behaviour exactly: no limits and no queueing, so every
+        // request opens its own connection. Turning the limits on is what makes
+        // connections actually be reused; reuse itself also requires the server
+        // to keep the connection alive and the response framing to complete.
+        PoolOptions pool{};
+
+        // ------------------------------------------------------------------
+        // Redirects (phase 5, task book 8.3).
+        //
+        // Off by default: following redirects changes which origin sees the
+        // request and which credentials it carries, so it must be an explicit
+        // opt-in rather than something a caller discovers by surprise.
+        // ------------------------------------------------------------------
+        struct RedirectPolicy {
+            bool follow{false};
+            size_t max_redirects{10};
+            // An https:// -> http:// hop downgrades transport security. It stays
+            // refused unless the caller says otherwise (task book 8.3).
+            bool allow_https_to_http{false};
+        };
+        RedirectPolicy redirects;
+
+        // ------------------------------------------------------------------
+        // Automatic retry (phase 5, task book 8.4).
+        //
+        // Off by default: max_retries = 0. A retry re-sends the request, which
+        // can duplicate a side effect the server already performed, so it must
+        // never happen unless the caller asked for it.
+        // ------------------------------------------------------------------
+        RetryPolicy retry;
+
+        // Jitter source. Injected so a test can make retry timing deterministic;
+        // left null the Client uses its own seeded generator. This is a test
+        // seam, not a required setting.
+        std::function<uint32_t()> retry_rng;
 
         // Inject a resolver (tests, address override). Null = system resolver.
         std::shared_ptr<Resolver> resolver;

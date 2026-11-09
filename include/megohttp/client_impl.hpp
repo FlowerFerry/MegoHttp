@@ -134,12 +134,79 @@ namespace megohttp {
             // from its in-flight set and possibly fire a shutdown-drained callback.
             std::function<void()> on_retired;
 
+            // Connection pool plumbing (phase 5). `pool` is null when pooling is
+            // disabled, in which case every request opens and closes its own
+            // connection exactly as before Phase 5.
+            std::shared_ptr<ConnectionPool> pool;
+            PoolKey pool_key;
+            // Set while this request holds a pooled connection, so finish() can
+            // return it exactly once. Null means "not from the pool" (either
+            // pool disabled, or the request never got that far).
+            std::shared_ptr<AsyncByteStream> pooled_stream;
+            bool pooled_clean{false};
+
+            // Redirect bookkeeping (S5.2). `hops_left` counts down from the
+            // configured limit; `visited` holds the URLs already requested so a
+            // loop is detected instead of burning the whole budget.
+            size_t hops_left{0};
+            std::vector<string> visited;
+
+            // Continue with the next hop of a redirect. Called from the exchange
+            // once it has consumed the 3xx head. This is NOT a terminal event:
+            // the request keeps its cancel handle and timers, and the connection
+            // returns to the pool through the usual path.
+            //
+            // The restart lives in Client::Impl, so it arrives as an injected hook
+            // rather than a direct call: RequestState is defined before Impl and
+            // cannot name its statics.
+            std::function<void(int, std::optional<string>)> on_redirect;
+
+            // Retry bookkeeping (S5.3). `attempts_done` counts retries the
+            // policy has approved; `retry_timer` waits out the backoff and is
+            // cancelled by finish() so a retired request cannot restart itself.
+            size_t attempts_done{0};
+            std::shared_ptr<Timer> retry_timer;
+            // Set when any part of the response head arrived, or any body byte
+            // reached the caller: both make a retry unsafe.
+            bool response_started{false};
+            // Status of the last COMPLETE response head, and its Retry-After
+            // resolved to a duration. Both feed the retry decision: a 503 is
+            // retryable where a 200 is not, and the server may name its own
+            // delay.
+            int last_status{0};
+            std::optional<Duration> last_retry_after;
+            bool body_delivered{false};
+            // Restart hook, injected by Impl for the same reason as on_redirect.
+            // Returns true when it has started a retry (so the caller must NOT
+            // finish), false when the policy declined.
+            std::function<bool(Error)> on_retry;
+
             // Fires the terminal callback exactly once.
             void finish(Result<Response> result) {
                 if (finished.exchange(true)) return;
                 if (total_timer) total_timer->cancel();
                 if (dns_timer) dns_timer->cancel();
+                if (retry_timer) { retry_timer->cancel(); retry_timer.reset(); }
                 dns_cancel.cancel();   // stop a late DNS answer from firing the callback
+
+                // Return the connection to the pool (or close it) BEFORE the user
+                // callback runs, so a callback that immediately submits another
+                // request can reuse this connection. `pooled_clean` is only true
+                // when the response framing completed AND the server did not ask
+                // to close: task book 8.1 forbids pooling anything else, and
+                // S2.1-03 forbids pooling a connection whose framing broke.
+                if (pooled_stream && pool) {
+                    PooledConnection pc;
+                    pc.stream = std::move(pooled_stream);
+                    pc.key = pool_key;
+                    pooled_stream.reset();
+                    pool->put(std::move(pc), pooled_clean);
+                } else if (pooled_stream) {
+                    // Pool went away (Client shutting down): close it ourselves.
+                    pooled_stream->async_close(nullptr);
+                    pooled_stream.reset();
+                }
+
                 auto cb = std::move(on_complete);
                 auto retired = std::move(on_retired);
                 // Release the hold before the callback so a callback that
@@ -172,8 +239,15 @@ namespace megohttp {
                     default: break;
                     }
                 }
+                // Retry decision comes BEFORE the terminal callback. The hook
+                // returns true when it started a retry, in which case this request
+                // stays alive and must NOT finish now.
+                if (on_retry && on_retry(Error{code, p, msg})) {
+                    return;
+                }
                 finish(Result<Response>(Error{code, p, std::move(msg)}));
             }
+
         };
 
         // Drives one response over a connected stream: write the head, then feed
@@ -359,7 +433,58 @@ namespace megohttp {
                 return VoidResult{};
             }
 
+            // Decide whether this 3xx is followable. Returns true when the
+            // exchange should treat the response as a redirect-to-be-followed;
+            // false means "not followable, handle it as a normal response",
+            // which is what a caller wants when the policy is off or the
+            // Location is missing/unusable.
+            bool handle_redirect(const ParsedResponse& head) {
+                // The body of a redirect carries no useful payload, and reading
+                // it would keep the connection busy for nothing. The response
+                // parser still drives the stream; we simply stop descending into
+                // the normal path.
+                auto loc = head.headers.get("location");
+                if (!loc) return false;
+
+                // Budget.
+                if (state_->hops_left == 0) {
+                    fail(Error{ErrorCode::HttpInvalidResponse, ErrorPhase::Receive,
+                               string("too many redirects")});
+                    redirect_pending_ = true;   // stop on_complete from reporting success
+                    redirect_location_.reset();
+                    return true;
+                }
+
+                redirect_pending_ = true;
+                redirect_status_ = head.status_code;
+                redirect_location_ = to_string(*loc);
+                return true;
+            }
+
             VoidResult on_head(const ParsedResponse& head) override {
+                // Any head at all means the server accepted and answered this
+                // request. From here on a retry could duplicate its effect.
+                state_->response_started = true;
+                state_->last_status = head.status_code;
+                // Retry-After is resolved here, while the Date header is still
+                // at hand: a date-form value only becomes a delay against the
+                // server's own Date, never against the local clock.
+                state_->last_retry_after.reset();
+                if (auto ra = head.headers.get("retry-after")) {
+                    const string_view date_hdr = head.headers.get("date")
+                                                     ? *head.headers.get("date")
+                                                     : string_view{};
+                    state_->last_retry_after = retry_detail::parse_retry_after(
+                        *ra, date_hdr);
+                }
+                // Redirect interception (S5.2). This has to happen before the
+                // normal head handling: a 3xx with a usable Location is not a
+                // response the caller wants, it is the next request.
+                if (redirect_detail::is_redirect_status(head.status_code) &&
+                    state_->options.redirects.follow && !redirect_pending_) {
+                    if (handle_redirect(head)) return VoidResult{};
+                }
+
                 // If we were still holding the body for a 100 answer and the server
                 // went straight to a final status: 417 means it refuses the Expect,
                 // so do not send; any other status means it may have consumed the
@@ -397,10 +522,21 @@ namespace megohttp {
                     buffer_sink_ = std::make_unique<BufferSink>(std::move(rh),
                                                          state_->options.max_response_body);
                 }
+                // Framing fact needed later to decide whether this connection may
+                // be reused: Connection: close (or HTTP/1.0 without keep-alive)
+                // means the server will not carry a second exchange on it.
+                head_connection_close_ = head.connection_close;
                 return VoidResult{};
+
             }
 
             VoidResult on_body_data(const uint8_t* data, size_t size) override {
+                // "Delivered" means the CALLER has bytes. In buffered mode the
+                // body accumulates internally and the caller sees nothing until
+                // finish(), so a retry would not re-deliver anything -- that is
+                // what makes retrying a 503 with a body safe. In streaming mode
+                // the sink is invoked per chunk, so delivery is immediate.
+                if (size > 0 && body_sink_) state_->body_delivered = true;
                 if (buffer_sink_) {
                     if (!buffer_sink_->append(data, size)) {
                         return Error{ErrorCode::HttpBodyTooLarge, ErrorPhase::Receive,
@@ -429,6 +565,41 @@ namespace megohttp {
             VoidResult on_complete() override {
                 complete_ = true;
                 disarm_recv_timer();
+
+                if (redirect_pending_) {
+                    // The 3xx was consumed; the next hop is the Client's job.
+                    // Report through the state so the connection is returned to
+                    // the pool the same way a normal completion would be.
+                    if (state_->on_redirect) {
+                        state_->on_redirect(redirect_status_, std::move(redirect_location_));
+                    }
+                    return VoidResult{};
+                }
+
+                // The response framing reached its end. Whether the connection may
+                // be reused is a separate question: the server must not have asked
+                // to close, and the message must not have been delimited by close.
+                if (state_->pooled_stream) {
+                    const bool framed_fully = parser_->leftover_offset() == 0;
+                    state_->pooled_clean = framed_fully && !head_connection_close_;
+                }
+
+                // A retryable STATUS is a completed response, so it arrives here
+                // rather than through fail(). The body of a 503 was buffered
+                // internally, never handed to the caller, so retrying does not
+                // re-deliver anything. Consult the policy before reporting
+                // success: a caller who asked for retries does not want a 503
+                // handed back while attempts remain.
+                if (retry_detail::is_retryable_status(state_->last_status) &&
+                    state_->options.retry.retry_on_status &&
+                    !state_->body_delivered &&
+                    state_->on_retry &&
+                    state_->on_retry(Error{ErrorCode::HttpInvalidResponse,
+                                           ErrorPhase::Receive,
+                                           string("retryable server status")})) {
+                    return VoidResult{};
+                }
+
                 if (buffer_sink_) {
                     auto response = buffer_sink_->finish();
                     state_->finish(std::move(response));
@@ -454,9 +625,25 @@ namespace megohttp {
                             // Transport EOF: the parser decides whether that is a
                             // legal end (until-close framing) or a truncation. On
                             // success it has already fired on_complete().
+                            //
+                            // Distinguish the two truncation shapes, because they
+                            // mean different things to a retry policy:
+                            //   no head at all  -> the server hung up before
+                            //                      answering: a transport failure,
+                            //                      safe to retry
+                            //   partial message -> the server answered and then
+                            //                      broke off: a protocol problem,
+                            //                      NOT retryable
+                            const bool no_response_yet = !self->state_->response_started;
                             auto eof = self->parser_->feed_eof();
                             if (!eof) {
-                                self->fail(eof.error());
+                                if (no_response_yet) {
+                                    self->fail(Error{ErrorCode::ConnectionClosed,
+                                                     ErrorPhase::Receive,
+                                                     string("connection closed before the response head arrived")});
+                                } else {
+                                    self->fail(eof.error());
+                                }
                             } else if (!self->complete_) {
                                 self->fail(Error{ErrorCode::HttpInvalidResponse,
                                                  ErrorPhase::Receive,
@@ -493,6 +680,16 @@ namespace megohttp {
             // Expect: 100-continue bookkeeping (S3.1-09).
             bool expect_continue_pending_{false};
             bool body_sent_{false};
+            // Connection-reuse facts captured from the final head. Decided once,
+            // when the head arrives, so on_complete() does not need to reach back
+            // into the parser.
+            bool head_connection_close_{false};
+            // Set when this exchange turned out to be a redirect that the
+            // Client is going to follow. on_complete must then NOT report a
+            // success to the caller.
+            bool redirect_pending_{false};
+            std::optional<string> redirect_location_;
+            int redirect_status_{0};
         };
 
         // Builds the request head for a direct (non-proxy) HTTP request.
@@ -500,13 +697,17 @@ namespace megohttp {
         // request qualifies (it must actually carry a body) and records the same
         // decision so the exchange holds the body accordingly.
         inline Result<string> build_request_head(const Request& req, const Url& url,
-                                                 bool expect_continue) {
+                                                 bool expect_continue, bool pooling) {
             Headers headers = req.headers();
             if (!headers.contains("host")) {
                 headers.set("host", to_view(url.host_port_header()));
             }
             if (!headers.contains("connection")) {
-                headers.set("connection", "close");
+                // Pooling needs a persistent connection; without a pool the
+                // historical "close" keeps the pre-phase-5 behaviour identical
+                // (a server that sees "close" hands out no second exchange,
+                // which is exactly what makes the no-pool path safe).
+                headers.set("connection", pooling ? "keep-alive" : "close");
             }
             if (req.has_body() && !headers.contains("content-length")) {
                 headers.set("content-length",
@@ -540,6 +741,18 @@ namespace megohttp {
             if (!resolver && executor) {
                 resolver = std::make_shared<SystemResolver>(executor);
             }
+
+            // Phase 5: pooling is ON as soon as any limit or the queue is
+            // configured. Leaving every option at 0 keeps the historical
+            // one-connection-per-request behaviour, so nothing changes for
+            // existing callers who never set these fields.
+            const auto& po = options.pool;
+            const bool pooling_enabled =
+                po.max_total_connections != 0 ||
+                po.max_connections_per_origin != 0;
+            if (pooling_enabled && executor) {
+                pool = std::make_shared<ConnectionPool>(executor, po);
+            }
         }
 
         ~Impl() { shutdown(); }
@@ -559,6 +772,14 @@ namespace megohttp {
             for (auto& st : live)
                 st->finish(Error{ErrorCode::Cancelled, ErrorPhase::None,
                                  string("client is shutting down")});
+
+            // Retire pooled state: waiters get a terminal error, idle
+            // connections close. In-flight exchanges close their own connection
+            // when they finish.
+            if (pool) {
+                pool->fail_waiters(ErrorCode::Cancelled, "client is shutting down");
+                pool->clear_idle();
+            }
 
             if (owns_executor) detail::shutdown_executor(executor);
             maybe_notify_drained();
@@ -581,6 +802,12 @@ namespace megohttp {
             st->executor = executor;
             st->resolver = resolver;
             st->options = options;
+            st->pool = pool;
+
+            // Redirect budget (S5.2). Only counts when the caller opted in;
+            // with the policy off the counter stays 0 and nothing follows.
+            st->hops_left = st->options.redirects.follow
+                                ? st->options.redirects.max_redirects : 0;
             st->request = req;
             st->on_complete = std::move(on_complete);
 
@@ -600,7 +827,14 @@ namespace megohttp {
                 return;
             }
 
-            // Total timeout covers the WHOLE logical request (spec 8.2).
+            // Total timeout covers the WHOLE logical request (spec 8.2): pool wait,
+            // DNS, connect, TLS, send, receive, every redirect hop and every retry
+            // backoff. It is created HERE, in submit(), and nowhere else.
+            //
+            // begin() and on_redirect/on_retry restart the pipeline, so they must
+            // NOT arm it again: a per-hop timeout would let a redirect chain or a
+            // retry loop outlive the caller's deadline indefinitely. finish()
+            // cancels it.
             if (options.total_timeout != Duration::zero()) {
                 std::weak_ptr<detail::RequestState> weak = st;
                 st->total_timer = executor->schedule_after(options.total_timeout, [weak] {
@@ -622,6 +856,141 @@ namespace megohttp {
                                     string("request cancelled")});
                 });
             });
+
+            // Redirect restart. Runs on the loop thread from the exchange, so it
+            // can go straight into begin() with the new URL.
+            std::weak_ptr<detail::RequestState> rw = st;
+            st->on_redirect = [rw](int status, std::optional<string> location) {
+                auto s = rw.lock();
+                if (!s || s->finished.load()) return;
+                if (!location) return;   // nothing to follow; already failed
+
+                // The URL that produced this response is the base for a relative
+                // Location.
+                const Url* base = nullptr;
+                if (s->request.parsed_url()) base = &*s->request.parsed_url();
+                if (!base) {
+                    s->fail(Error{ErrorCode::HttpInvalidResponse, ErrorPhase::Receive,
+                                  string("redirect without a parsed base URL")});
+                    return;
+                }
+
+                auto next = redirect_detail::resolve_location(*base, to_view(*location));
+                if (!next) { s->fail(next.error()); return; }
+                Url next_url = std::move(next.value());
+
+                // Refuse a transport downgrade unless the caller allowed it. This
+                // is checked against the URL we are leaving, not the one we are
+                // going to, because that is where the security loss happens.
+                if (redirect_detail::is_downgrade(*base, next_url) &&
+                    !s->options.redirects.allow_https_to_http) {
+                    s->fail(Error{ErrorCode::HttpInvalidResponse, ErrorPhase::Receive,
+                                  string("refusing to follow a redirect from https to http")});
+                    return;
+                }
+
+                // Loop detection: a URL we already requested in this same logical
+                // request means the server is cycling regardless of budget.
+                const string canonical = next_url.origin() + next_url.request_target();
+                for (const auto& seen : s->visited) {
+                    if (detail::ascii_iequals(to_view(seen), to_view(canonical))) {
+                        s->fail(Error{ErrorCode::HttpInvalidResponse, ErrorPhase::Receive,
+                                      string("redirect loop detected")});
+                        return;
+                    }
+                }
+                s->visited.push_back(canonical);
+
+                if (s->hops_left == 0) {
+                    s->fail(Error{ErrorCode::HttpInvalidResponse, ErrorPhase::Receive,
+                                  string("too many redirects")});
+                    return;
+                }
+                --s->hops_left;
+
+                // Method and body policy (RFC 7231 + what servers actually expect).
+                Request next_req = s->request;
+                if (redirect_detail::becomes_get(status, s->request.method())) {
+                    next_req.set_method(Method::Get);
+                    next_req.clear_body();
+                } else if (redirect_detail::preserves_body(status)) {
+                    // 307/308 keep the body, which requires it to be replayable:
+                    // a BodySource that has already been consumed cannot be re-sent,
+                    // and silently sending an empty body would look like success.
+                    if (s->request.has_body() && !s->request.is_body_replayable()) {
+                        s->fail(Error{ErrorCode::HttpInvalidResponse, ErrorPhase::Receive,
+                                      string("cannot follow a 307/308 redirect: the request body is not replayable")});
+                        return;
+                    }
+                }
+
+                // Cross-origin hops must not carry credentials.
+                if (!redirect_detail::same_origin(*base, next_url)) {
+                    // Headers iterates as a flat sequence of (name, value) pairs,
+                    // so filtering is a rebuild rather than a names() walk.
+                    Headers kept;
+                    for (auto it = next_req.headers().begin();
+                         it != next_req.headers().end(); ++it) {
+                        if (!redirect_detail::is_origin_bound_header(to_view(it->first))) {
+                            kept.add(to_view(it->first), to_view(it->second));
+                        }
+                    }
+                    next_req.headers() = std::move(kept);
+                }
+
+                next_req.set_url(to_view(canonical));
+                s->request = std::move(next_req);
+                s->pooled_clean = false;   // the 3xx body may not have been drained
+                s->stream.reset();
+                s->tls_stream.reset();
+
+                // Restart the pipeline for the new URL.
+                begin(s);
+            };
+
+            // Retry execution. Same shape as on_redirect: the policy decides,
+            // this restarts the pipeline, and the request state (not the Client)
+            // owns the in-flight bookkeeping.
+            st->on_retry = [rw](Error e) -> bool {
+                auto s = rw.lock();
+                if (!s || s->finished.load()) return false;
+
+                RetryContext ctx;
+                ctx.method = s->request.method();
+                ctx.body_replayable = s->request.is_body_replayable();
+                ctx.response_started = s->response_started;
+                ctx.body_delivered = s->body_delivered;
+                ctx.status = s->last_status;
+                ctx.retry_after = s->last_retry_after;
+
+                const auto delay = retry_detail::next_delay(
+                    s->options.retry, ctx, e.code(), s->attempts_done,
+                    s->options.retry_rng ? s->options.retry_rng
+                                         : std::function<uint32_t()>{});
+                if (!delay) return false;   // policy declined: the caller finishes
+
+                ++s->attempts_done;
+                s->response_started = false;
+                s->body_delivered = false;
+                s->last_status = 0;
+                s->last_retry_after.reset();
+                s->pooled_clean = false;
+                s->stream.reset();
+                s->tls_stream.reset();
+                s->pooled_stream.reset();
+
+                // Wait out the backoff on the loop thread. The timer lives on the
+                // state so finish() can cancel it; without that a request retired
+                // during the wait would restart itself after the callback fired.
+                std::weak_ptr<detail::RequestState> tw = s;
+                s->retry_timer = s->executor->schedule_after(*delay, [tw] {
+                    auto st2 = tw.lock();
+                    if (!st2 || st2->finished.load()) return;
+                    st2->retry_timer.reset();
+                    begin(st2);
+                });
+                return true;
+            };
 
             executor->post([st] { begin(st); });
             (void)handle;
@@ -654,6 +1023,27 @@ namespace megohttp {
 #endif
             st->request.set_parsed_url(url);
 
+            // Pool key: every fact that affects the security boundary. Proxy
+            // and TLS token fields stay empty until those layers land; adding them
+            // later to an already-keyed pool would silently reuse across identities.
+            if (st->pool) {
+                st->pool_key.scheme = url.is_secure() ? string("https") : string("http");
+                st->pool_key.host = url.host;
+                st->pool_key.port = url.port;
+                st->pool_key.tls_verify_peer = st->options.tls.verify_peer;
+                if (url.is_secure()) {
+                    // Distinguish trust configurations: two TLS sessions with
+                    // different CA material are not interchangeable.
+                    string_builder tok;
+                    detail::sb_append(tok, st->options.tls.ca_file);
+                    detail::sb_append(tok, "|");
+                    detail::sb_append(tok, st->options.tls.ca_path);
+                    detail::sb_append(tok, "|");
+                    detail::sb_append(tok, st->options.tls.cert_file);
+                    st->pool_key.tls_ca_token = tok.release();
+                }
+            }
+
             st->phase = detail::RequestPhase::BuildHead;
             // Expect: 100-continue only makes sense when there is a body to hold
             // back. Record the decision once so the head and the exchange agree.
@@ -661,12 +1051,60 @@ namespace megohttp {
                                     && st->request.has_body()
                                     && !st->request.body_bytes().empty();
             auto head = detail::build_request_head(st->request, url,
-                                                   st->expect_continue_sent);
+                                                   st->expect_continue_sent, st->pool != nullptr);
             if (!head) { st->finish(head.error()); return; }
 
             std::weak_ptr<detail::RequestState> weak = st;
             const string host = url.host;
             const uint16_t port = url.port;
+
+            // Phase 5: when a pool is configured, try to take a reusable
+            // connection first. Pool::acquire always calls back on this thread:
+            //   - Found      -> stream already connected, skip DNS and connect
+            //   - NotFound   -> the pool reserved a slot; open a new connection
+            //   - queued     -> the callback fires later (bounded by max_waiting)
+            //   - error      -> surface it (pool exhausted / shutting down)
+            if (st->pool) {
+                st->pool->acquire(st->pool_key,
+                    [weak, head = std::move(head.value())](Result<PooledConnection> conn) mutable {
+                        auto s = weak.lock();
+                        if (!s || s->finished.load()) {
+                            // Request retired while we waited: hand the connection
+                            // straight back so it is not leaked.
+                            if (conn && conn.value().stream && s && s->pool) {
+                                s->pool->put(std::move(conn.value()), true);
+                            }
+                            return;
+                        }
+                        if (!conn) {
+                            if (conn.error().code() == ErrorCode::NotFound) {
+                                // Pool has capacity: open a new connection.
+                                start_connect(s, std::move(head));
+                            } else {
+                                s->fail(conn.error());
+                            }
+                            return;
+                        }
+                        // Reused a pooled connection: it is already connected.
+                        s->stream = conn.value().stream;
+                        s->pooled_stream = conn.value().stream;
+                        s->pooled_clean = false;  // not clean until framing completes
+                        s->phase = detail::RequestPhase::Connect;
+                        begin_tls_or_exchange(s, std::move(head));
+                    });
+                return;
+            }
+
+            start_connect(st, std::move(head.value()));
+        }
+
+        // Resolve, race the addresses, then continue to TLS/exchange. Split out so
+        // the pooled path can reach the same code after the pool says "open one".
+        static void start_connect(const std::shared_ptr<detail::RequestState>& st,
+                                  string head) {
+            std::weak_ptr<detail::RequestState> weak = st;
+            const string host = st->request.parsed_url()->host;
+            const uint16_t port = st->request.parsed_url()->port;
             st->phase = detail::RequestPhase::Resolve;
 
             // DNS timeout: covers the resolve stage only. Cancelling the resolve
@@ -682,7 +1120,7 @@ namespace megohttp {
                 });
             }
 
-            auto dns_handle = st->resolver->resolve(host, port, [weak, head = std::move(head.value())](
+            auto dns_handle = st->resolver->resolve(host, port, [weak, head = std::move(head)](
                                            Result<AddressList> resolved) mutable {
                 auto s = weak.lock();
                 if (!s || s->finished.load()) return;
@@ -712,6 +1150,10 @@ namespace megohttp {
                         if (!conn) { s2->fail(conn.error()); return; }
 
                         s2->stream = conn.value();
+                        // Phase 5: a connection opened while pooling is active must
+                        // be handed back when the request finishes, or the pool
+                        // would keep reserving a slot for a stream it never sees.
+                        if (s2->pool) s2->pooled_stream = conn.value();
                         begin_tls_or_exchange(s2, std::move(head));
                     });
             });
@@ -782,6 +1224,7 @@ namespace megohttp {
         std::shared_ptr<Executor> executor;
         std::shared_ptr<Resolver> resolver;
         bool owns_executor{false};
+        std::shared_ptr<ConnectionPool> pool;   // null = pooling disabled
         std::atomic<bool> stopped{false};
 
         // In-flight request tracking for shutdown(S2.6-02/04).

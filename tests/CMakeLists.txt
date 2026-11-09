@@ -33,6 +33,11 @@ set(MGHTTP_TEST_SOURCES
     test_client_tls.cpp
     test_tls_layering.cpp
     test_tls_trust.cpp
+    test_connection_pool.cpp
+    test_client_pool.cpp
+    test_redirect.cpp
+    test_retry.cpp
+    test_client_retry.cpp
 )
 
 if(MGHTTP_BACKEND_LIBUV)
