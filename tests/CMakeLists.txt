@@ -37,6 +37,8 @@ set(MGHTTP_TEST_SOURCES
     test_client_pool.cpp
     test_redirect.cpp
     test_retry.cpp
+    test_proxy.cpp
+    test_client_proxy.cpp
     test_client_retry.cpp
 )
 

@@ -8,6 +8,7 @@
 // come later; nothing here pretends to have them.
 #include <megohttp/config.hpp>
 #include <megohttp/connection_pool.hpp>
+#include <megohttp/proxy.hpp>
 #include <megohttp/error.hpp>
 #include <megohttp/executor.hpp>
 #include <megohttp/redirect.hpp>
@@ -64,6 +65,17 @@ namespace megohttp {
         // connections actually be reused; reuse itself also requires the server
         // to keep the connection alive and the response framing to complete.
         PoolOptions pool{};
+
+        // ------------------------------------------------------------------
+        // Proxy routing (phase 5, task book 10.1 / 10.2).
+        //
+        // Off by default, and reading the environment is off by default inside
+        // it: a request must not be routed through whatever the caller's shell
+        // happens to export without being asked. Target TLS stays in `tls`;
+        // the proxy layer has its own TlsConfig and the two never share one
+        // object (task book 9.3 forbids that).
+        // ------------------------------------------------------------------
+        ProxyOptions proxy{};
 
         // ------------------------------------------------------------------
         // Redirects (phase 5, task book 8.3).
@@ -125,6 +137,16 @@ namespace megohttp {
                 {"recv_timeout", recv_timeout},
                 {"total_timeout", total_timeout},
             };
+            if (proxy.proxy.is_set()) {
+                if (proxy.proxy.host.empty()) {
+                    return Error{ErrorCode::InvalidArgument, ErrorPhase::None,
+                                 string("proxy is enabled but has no host")};
+                }
+                if (proxy.proxy.port == 0) {
+                    return Error{ErrorCode::InvalidArgument, ErrorPhase::None,
+                                 string("proxy is enabled but has no port")};
+                }
+            }
             for (const auto& c : checks) {
                 if (c.d < Duration::zero()) {
                     return Error{ErrorCode::InvalidArgument, ErrorPhase::None,

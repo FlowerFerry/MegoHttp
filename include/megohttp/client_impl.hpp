@@ -17,6 +17,7 @@
 #endif
 
 #include <atomic>
+#include <cstdlib>
 #include <mutex>
 #include <vector>
 
@@ -93,6 +94,14 @@ namespace megohttp {
             BuildHead,
             Resolve,
             Connect,
+            // Proxy stages (S5.4). Kept separate from their target-side
+            // counterparts so a failure report says which hop broke: a proxy
+            // that refuses CONNECT must not look like a target TLS failure.
+            ProxyResolve,
+            ProxyConnect,
+            ProxyTls,
+            ProxyAuth,
+            ProxyConnectTunnel,
             TlsHandshake,
             SendHead,
             SendBody,
@@ -144,6 +153,21 @@ namespace megohttp {
             // pool disabled, or the request never got that far).
             std::shared_ptr<AsyncByteStream> pooled_stream;
             bool pooled_clean{false};
+
+            // Proxy routing (S5.4). `proxy` is the decision resolved once in
+            // begin() for this hop: an empty ProxyConfig means "connect directly".
+            // `proxy_tls_stream` holds the PROXY layer's TLS object, which is a
+            // different object from `tls_stream` (the target layer) on purpose:
+            // one object must never validate both identities.
+            ProxyConfig proxy;
+            TlsConfig proxy_tls_config;
+            std::shared_ptr<TlsStream> proxy_tls_stream;
+            // Bytes the proxy handshake read past what it consumed.
+            byte_buffer proxy_leftover;
+            // The target's address as raw bytes, used only by SOCKS5 local-DNS
+            // mode (remote DNS sends the name instead). Filled from the URL when
+            // the target is a literal, or from the resolver when it is a name.
+            byte_buffer proxy_target_addr;
 
             // Redirect bookkeeping (S5.2). `hops_left` counts down from the
             // configured limit; `visited` holds the URLs already requested so a
@@ -692,13 +716,91 @@ namespace megohttp {
             int redirect_status_{0};
         };
 
+        // A byte stream that serves a fixed prefix first, then delegates.
+        //
+        // Needed because a proxy handshake reads MORE bytes than it consumes:
+        // the CONNECT response head can arrive in the same read as the first
+        // bytes of the target's TLS handshake, and a SOCKS5 reply can arrive
+        // with the start of the tunnel payload. Dropping those bytes would break
+        // the handshake above this layer in a way that looks like a bad server.
+        // Wrapping the raw stream keeps that leftover in front of everything
+        // stacked on top of it, including TLS.
+        class PrefixedStream final : public AsyncByteStream {
+        public:
+            PrefixedStream(std::shared_ptr<AsyncByteStream> inner, byte_buffer prefix)
+                : inner_(std::move(inner)), prefix_(std::move(prefix)) {}
+
+            void start(ReadyCallback on_ready) override {
+                // The underlying stream is already connected: re-starting it
+                // would re-issue a connect.
+                if (on_ready) on_ready(VoidResult{});
+            }
+
+            void async_read_some(ReadCallback cb) override {
+                if (!prefix_.empty()) {
+                    const string_view sv(reinterpret_cast<const char*>(prefix_.data()),
+                                         static_cast<string_view::size_type>(prefix_.size()));
+                    // Copy out before clearing: the view must stay valid for the
+                    // duration of the callback only, which this satisfies.
+                    byte_buffer held = std::move(prefix_);
+                    prefix_.clear();
+                    if (cb) cb(string_view(reinterpret_cast<const char*>(held.data()),
+                                           static_cast<string_view::size_type>(held.size())));
+                    (void)sv;
+                    return;
+                }
+                inner_->async_read_some(std::move(cb));
+            }
+
+            void async_write(const uint8_t* data, size_t size, WriteCallback cb) override {
+                inner_->async_write(data, size, std::move(cb));
+            }
+
+            void async_close(CloseCallback cb) override { inner_->async_close(std::move(cb)); }
+            bool is_open() const noexcept override { return inner_ && inner_->is_open(); }
+            string_view tls_protocol() const noexcept override {
+                return inner_ ? inner_->tls_protocol() : string_view();
+            }
+
+        private:
+            std::shared_ptr<AsyncByteStream> inner_;
+            byte_buffer prefix_;
+        };
+
         // Builds the request head for a direct (non-proxy) HTTP request.
         // `expect_continue` adds the Expect header; the caller decides whether the
         // request qualifies (it must actually carry a body) and records the same
         // decision so the exchange holds the body accordingly.
         inline Result<string> build_request_head(const Request& req, const Url& url,
-                                                 bool expect_continue, bool pooling) {
+                                                 bool expect_continue, bool pooling,
+                                                                                                  bool forward_proxy,
+                                                                                                  const ProxyConfig& proxy) {
             Headers headers = req.headers();
+
+            // Proxy credentials belong to the proxy hop and to nothing else.
+            // Two leaks are possible and both are silent:
+            //   - `Proxy-Authorization` reaching the TARGET, which hands the
+            //     proxy credential to the origin server;
+            //   - the target's `Authorization` reaching the PROXY, which is why
+            //     the CONNECT builder never reads the request's headers.
+            // Stripping here covers the first, because this head is what the
+            // target (through a forward proxy) actually receives.
+            headers.remove("proxy-authorization");
+            headers.remove("proxy-connection");
+
+            // When relaying through a forward proxy, the proxy hop is the one
+            // that needs the credentials. They are built from the proxy config
+            // alone: the target's Authorization is never consulted, so a target
+            // token can never be mistaken for a proxy credential.
+            if (forward_proxy && proxy.has_credentials()) {
+                string_builder sb;
+                detail::sb_append(sb, "Basic ");
+                detail::sb_append(sb, to_view(proxy_detail::basic_auth_value(
+                                           to_view(proxy.username),
+                                           to_view(proxy.password))));
+                headers.set("proxy-authorization", to_view(sb.release()));
+            }
+
             if (!headers.contains("host")) {
                 headers.set("host", to_view(url.host_port_header()));
             }
@@ -716,8 +818,22 @@ namespace megohttp {
             if (expect_continue && !headers.contains("expect")) {
                 headers.set("expect", "100-continue");
             }
+            // A forward proxy (plain http:// target, any proxy type that speaks
+            // HTTP) needs the absolute form so it knows where to relay. An
+            // https:// target always uses origin-form inside the CONNECT tunnel,
+            // because by then the proxy is not reading anything (RFC 7230 5.3.2).
+            //
+            // absolute_form_target() returns an OWNING string, so it has to be
+            // held in a local: taking to_view() of the temporary left a dangling
+            // view that encode_request_head read a moment later, and the request
+            // went out with a corrupted target the proxy could not route.
+            string absolute;
+            if (forward_proxy) absolute = url.absolute_form_target();
+            const string_view target = forward_proxy
+                                           ? to_view(absolute)
+                                           : to_view(url.request_target());
             return encode_request_head(req.method(), req.custom_method(),
-                                       to_view(url.request_target()), headers);
+                                       target, headers);
         }
 
     } // namespace detail
@@ -1044,14 +1160,57 @@ namespace megohttp {
                 }
             }
 
+            // Proxy routing (S5.4). Resolved once per hop, before the head is
+            // built, because the target form (absolute vs origin) and the set of
+            // headers depend on the decision.
+            {
+                auto decision = proxy_detail::select_proxy(
+                    st->options.proxy,
+                    [](const char* name) { return std::getenv(name); },
+                    to_view(url.host), url.port, url.is_secure());
+                if (!decision) { st->finish(decision.error()); return; }
+                st->proxy = decision.value().config;
+
+#if MGHTTP_TLS_NONE
+                if (proxy_detail::uses_proxy_tls(st->proxy.type)) {
+                    // Built without a TLS backend: an HTTPS proxy cannot be
+                    // used, and silently falling back to a cleartext proxy would
+                    // be a downgrade the caller never agreed to.
+                    st->finish(Error{ErrorCode::TlsNotEnabled, ErrorPhase::ProxyTls,
+                                     string("an https:// proxy requires a TLS backend")});
+                    return;
+                }
+#endif
+                if (st->proxy.type == ProxyType::Https) {
+                    st->proxy_tls_config = st->options.proxy.tls;
+                    // The proxy's own identity drives SNI and the certificate
+                    // check; the target's name must never be used here, which
+                    // would validate the proxy as if it were the origin.
+                    //
+                    // An explicitly configured hostname wins: the proxy is very
+                    // often reached by address while its certificate names a
+                    // host, exactly like an origin behind a load balancer.
+                    if (st->proxy_tls_config.hostname.empty()) {
+                        st->proxy_tls_config.hostname = st->proxy.host;
+                    }
+                }
+            }
+
             st->phase = detail::RequestPhase::BuildHead;
             // Expect: 100-continue only makes sense when there is a body to hold
             // back. Record the decision once so the head and the exchange agree.
             st->expect_continue_sent = st->options.expect_continue
                                     && st->request.has_body()
                                     && !st->request.body_bytes().empty();
+            // Absolute-form is used only when an HTTP-speaking proxy relays a
+            // cleartext target. A secure target goes through CONNECT and then
+            // uses origin-form inside the tunnel.
+            const bool forward_proxy = proxy_detail::is_forward_proxy(st->proxy.type) &&
+                                       !url.is_secure();
             auto head = detail::build_request_head(st->request, url,
-                                                   st->expect_continue_sent, st->pool != nullptr);
+                                                   st->expect_continue_sent,
+                                                   st->pool != nullptr, forward_proxy,
+                                                   st->proxy);
             if (!head) { st->finish(head.error()); return; }
 
             std::weak_ptr<detail::RequestState> weak = st;
@@ -1090,7 +1249,7 @@ namespace megohttp {
                         s->pooled_stream = conn.value().stream;
                         s->pooled_clean = false;  // not clean until framing completes
                         s->phase = detail::RequestPhase::Connect;
-                        begin_tls_or_exchange(s, std::move(head));
+                        begin_proxy_stage(s, std::move(head));
                     });
                 return;
             }
@@ -1103,9 +1262,51 @@ namespace megohttp {
         static void start_connect(const std::shared_ptr<detail::RequestState>& st,
                                   string head) {
             std::weak_ptr<detail::RequestState> weak = st;
-            const string host = st->request.parsed_url()->host;
-            const uint16_t port = st->request.parsed_url()->port;
-            st->phase = detail::RequestPhase::Resolve;
+
+            // With a proxy in play the TCP connection goes to the PROXY. The
+            // target name is handed over later (CONNECT / SOCKS5) and, in the
+            // SOCKS5 remote-DNS mode, is never resolved locally at all -- which
+            // is the whole point of that mode (task book 9-A.5).
+            const bool via_proxy = st->proxy.is_set();
+            const bool remote_dns = via_proxy && st->proxy.type == ProxyType::Socks5 &&
+                                    st->proxy.socks5_remote_dns;
+            const string host = via_proxy ? st->proxy.host
+                                          : st->request.parsed_url()->host;
+            const uint16_t port = via_proxy ? st->proxy.port
+                                            : st->request.parsed_url()->port;
+            st->phase = via_proxy ? detail::RequestPhase::ProxyResolve
+                                  : detail::RequestPhase::Resolve;
+
+            // A SOCKS5 proxy that has agreed to resolve the name means the local
+            // resolver must not see it: the connection goes to the proxy, so only
+            // the proxy's address is resolved and the target name is handed over
+            // in the CONNECT command.
+            //
+            // The opposite mode (socks5, local DNS) needs the target's ADDRESS,
+            // because the tunnel command carries one. An IP literal already has
+            // it; a name has to be resolved here, before the proxy hop, and the
+            // result is stashed in proxy_target_addr for the handshake to use.
+            const Url& target_url = *st->request.parsed_url();
+            if (via_proxy && st->proxy.type == ProxyType::Socks5 && !remote_dns) {
+                if (target_url.is_ip_literal) {
+                    // The literal is already an address: take its bytes directly
+                    // rather than sending the URL's text form, which the wire
+                    // format does not accept.
+                    const AddressList lits = parse_ip_literal(to_view(target_url.host),
+                                                              target_url.port);
+                    if (!lits.empty()) st->proxy_target_addr = lits.front().bytes;
+                } else {
+                    // socks5 (local DNS) with a NAME target needs a local
+                    // resolution whose result the tunnel command carries. That
+                    // path is not implemented, so it is refused explicitly rather
+                    // than sending a tunnel command with an empty address.
+                    // socks5h is the supported way to use a name target.
+                    st->finish(Error{ErrorCode::NotImplemented, ErrorPhase::ProxyConnectTunnel,
+                                     string("SOCKS5 local DNS requires an IP literal target; "
+                                            "use socks5h for name targets")});
+                    return;
+                }
+            }
 
             // DNS timeout: covers the resolve stage only. Cancelling the resolve
             // handle tells the resolver to drop its late answer (S2.3-02).
@@ -1115,7 +1316,9 @@ namespace megohttp {
                     auto s = tw.lock();
                     if (!s || s->finished.load()) return;
                     s->dns_cancel.cancel();
-                    s->finish(Error{ErrorCode::TimeoutResolve, ErrorPhase::Resolve,
+                    s->finish(Error{ErrorCode::TimeoutResolve,
+                                    s->proxy.is_set() ? ErrorPhase::ProxyResolve
+                                                      : ErrorPhase::Resolve,
                                     string("DNS resolution timed out")});
                 });
             }
@@ -1133,7 +1336,8 @@ namespace megohttp {
                     return;
                 }
 
-                s->phase = detail::RequestPhase::Connect;
+                s->phase = s->proxy.is_set() ? detail::RequestPhase::ProxyConnect
+                                             : detail::RequestPhase::Connect;
                 ConnectOptions copts;
                 copts.connect_timeout = s->options.connect_timeout;
                 auto addresses = std::move(resolved.value());
@@ -1154,10 +1358,441 @@ namespace megohttp {
                         // be handed back when the request finishes, or the pool
                         // would keep reserving a slot for a stream it never sees.
                         if (s2->pool) s2->pooled_stream = conn.value();
-                        begin_tls_or_exchange(s2, std::move(head));
+                        begin_proxy_stage(s2, std::move(head));
                     });
             });
             st->dns_cancel = dns_handle;
+        }
+
+        // -------------------------------------------------------------------
+        // Proxy handshake stages (S5.4)
+        //
+        // Inserted between "TCP connected" and the target's TLS layer, because
+        // every proxy mode has to finish talking to the proxy before the target
+        // protocol may start:
+        //
+        //   http/https proxy + https target   CONNECT, then target TLS
+        //   http/https proxy + http target    no handshake; absolute-form head
+        //   socks5                            binary handshake, then target TLS
+        //
+        // "CONNECT succeeded" is the only point at which target bytes may be
+        // sent: task book 10.2 makes sending them earlier a defect, and a proxy
+        // that answers 407 afterwards would have already received the target's
+        // TLS ClientHello.
+        // -------------------------------------------------------------------
+
+        // Reads exactly `want` bytes (at least) from the stream, keeping any
+        // extra bytes in `leftover` so the next layer sees them.
+        static void read_proxy_bytes(const std::shared_ptr<detail::RequestState>& st,
+                                     size_t want,
+                                     std::function<void(Result<byte_buffer>)> done) {
+            auto acc = std::make_shared<byte_buffer>();
+            auto self = st;
+            struct Loop {
+                static void run(const std::shared_ptr<detail::RequestState>& s,
+                                size_t want,
+                                std::shared_ptr<byte_buffer> acc,
+                                std::function<void(Result<byte_buffer>)> done) {
+                    // Stop conditions that matter: a retired request must not
+                    // keep reading, and the buffer must not grow without bound.
+                    if (s->finished.load()) return;
+                    if (acc->size() >= want) {
+                        done(*acc);
+                        return;
+                    }
+                    auto stream = s->stream;
+                    stream->async_read_some(
+                        [s, want, acc, done](Result<string_view> r) mutable {
+                            if (!r) { done(r.error()); return; }
+                            const string_view sv = r.value();
+                            if (sv.empty()) {
+                                done(Error{ErrorCode::ConnectionClosed,
+                                           s->proxy.is_set() ? ErrorPhase::ProxyConnectTunnel
+                                                             : ErrorPhase::Receive,
+                                           string("proxy closed the connection mid-handshake")});
+                                return;
+                            }
+                            acc->insert(acc->end(),
+                                        reinterpret_cast<const uint8_t*>(sv.data()),
+                                        reinterpret_cast<const uint8_t*>(sv.data()) +
+                                            static_cast<size_t>(sv.size()));
+                            run(s, want, acc, done);
+                        });
+                }
+            };
+            Loop::run(self, want, acc, std::move(done));
+        }
+
+        // Reads until the CRLFCRLF that ends a response head, keeping the rest.
+        static void read_proxy_head(const std::shared_ptr<detail::RequestState>& st,
+                                    size_t max_bytes,
+                                    std::function<void(Result<std::string>)> done) {
+            auto acc = std::make_shared<std::string>();
+            struct Loop {
+                static void run(const std::shared_ptr<detail::RequestState>& s,
+                                size_t max_bytes,
+                                std::shared_ptr<std::string> acc,
+                                std::function<void(Result<std::string>)> done) {
+                    if (s->finished.load()) return;
+                    if (acc->find("\r\n\r\n") != std::string::npos) {
+                        done(*acc);
+                        return;
+                    }
+                    if (acc->size() > max_bytes) {
+                        done(Error{ErrorCode::ProxyProtocolError,
+                                   ErrorPhase::ProxyConnectTunnel,
+                                   string("proxy response head is too large")});
+                        return;
+                    }
+                    auto stream = s->stream;
+                    stream->async_read_some(
+                        [s, max_bytes, acc, done](Result<string_view> r) mutable {
+                            if (!r) { done(r.error()); return; }
+                            const string_view sv = r.value();
+                            if (sv.empty()) {
+                                done(Error{ErrorCode::ConnectionClosed,
+                                           ErrorPhase::ProxyConnectTunnel,
+                                           string("proxy closed before answering")});
+                                return;
+                            }
+                            acc->append(sv.data(), static_cast<size_t>(sv.size()));
+                            run(s, max_bytes, acc, done);
+                        });
+                }
+            };
+            Loop::run(st, max_bytes, acc, std::move(done));
+        }
+
+        // Sends `bytes`, then reads the CONNECT reply head.
+        static void send_connect(const std::shared_ptr<detail::RequestState>& st,
+                                 string head,
+                                 std::function<void(Result<byte_buffer>)> done) {
+            st->phase = detail::RequestPhase::ProxyConnectTunnel;
+            auto buf = std::make_shared<string>(std::move(head));
+            auto stream = st->stream;
+            stream->async_write(
+                reinterpret_cast<const uint8_t*>(buf->data()), buf->size(),
+                [st, buf, done](Result<size_t> w) mutable {
+                    (void)buf;
+                    if (!w) { done(Error{ErrorCode::ProxyConnectFailed,
+                                         ErrorPhase::ProxyConnect,
+                                         string("failed to send the CONNECT request")});
+                              return; }
+                    read_proxy_head(st, 64 * 1024,
+                        [st, done](Result<std::string> head) mutable {
+                            if (!head) { done(head.error()); return; }
+                            const std::string& h = head.value();
+                            // The status line is "HTTP/1.x NNN ...".
+                            int status = 0;
+                            const size_t sp1 = h.find(' ');
+                            if (sp1 == std::string::npos) {
+                                done(Error{ErrorCode::ProxyProtocolError,
+                                           ErrorPhase::ProxyConnectTunnel,
+                                           string("CONNECT response has no status line")});
+                                return;
+                            }
+                            const size_t sp2 = h.find(' ', sp1 + 1);
+                            const std::string code = h.substr(sp1 + 1, sp2 == std::string::npos
+                                                                        ? std::string::npos
+                                                                        : sp2 - sp1 - 1);
+                            status = std::atoi(code.c_str());
+
+                            const auto outcome = proxy_detail::classify_connect_response(status);
+                            if (outcome != proxy_detail::ConnectOutcome::Ok) {
+                                done(proxy_detail::connect_outcome_error(outcome, status));
+                                return;
+                            }
+                            // Anything after the head already belongs to the
+                            // tunnel; losing it would corrupt the target TLS
+                            // handshake that starts next.
+                            byte_buffer leftover;
+                            const size_t end = h.find("\r\n\r\n") + 4;
+                            for (size_t i = end; i < h.size(); ++i) {
+                                leftover.push_back(static_cast<uint8_t>(h[i]));
+                            }
+                            done(std::move(leftover));
+                        });
+                });
+        }
+
+        // The SOCKS5 greeting + optional user/pass, then the CONNECT.
+        static void socks5_handshake(const std::shared_ptr<detail::RequestState>& st,
+                                     std::function<void(Result<byte_buffer>)> done) {
+            using namespace proxy_detail::socks5;
+            const bool with_auth = st->proxy.has_credentials();
+            auto greeting = std::make_shared<byte_buffer>(
+                build_greeting(with_auth));
+
+            st->phase = detail::RequestPhase::ProxyConnectTunnel;
+            auto stream = st->stream;
+            stream->async_write(
+                greeting->data(), greeting->size(),
+                [st, greeting, done, with_auth](Result<size_t> w) mutable {
+                    (void)greeting;
+                    if (!w) { done(Error{ErrorCode::Socks5HandshakeFailed,
+                                         ErrorPhase::ProxyConnectTunnel,
+                                         string("failed to send the SOCKS5 greeting")});
+                              return; }
+                    read_proxy_bytes(st, 2, [st, done, with_auth](Result<byte_buffer> r) mutable {
+                        if (!r) { done(r.error()); return; }
+                        const byte_buffer& sel = r.value();
+                        const string_view sv(reinterpret_cast<const char*>(sel.data()),
+                                             static_cast<string_view::size_type>(sel.size()));
+                        auto method = parse_method_selection(sv);
+                        if (!method) { done(method.error()); return; }
+
+                        if (method.value() == kAuthNone) {
+                            socks5_send_connect(st, std::move(done));
+                            return;
+                        }
+                        if (method.value() != kAuthUserPass) {
+                            done(Error{ErrorCode::Socks5AuthFailed, ErrorPhase::ProxyAuth,
+                                       string("SOCKS5 proxy chose an auth method we did not offer")});
+                            return;
+                        }
+
+                        st->phase = detail::RequestPhase::ProxyAuth;
+                        auto creds = std::make_shared<byte_buffer>(
+                            build_user_pass(to_view(st->proxy.username),
+                                            to_view(st->proxy.password)));
+                        auto s2 = st->stream;
+                        s2->async_write(
+                            creds->data(), creds->size(),
+                            [st, creds, done](Result<size_t> wr) mutable {
+                                (void)creds;
+                                if (!wr) { done(Error{ErrorCode::Socks5AuthFailed,
+                                                      ErrorPhase::ProxyAuth,
+                                                      string("failed to send the SOCKS5 credentials")});
+                                          return; }
+                                read_proxy_bytes(st, 2,
+                                    [st, done](Result<byte_buffer> rr) mutable {
+                                        if (!rr) { done(rr.error()); return; }
+                                        const byte_buffer& b = rr.value();
+                                        const string_view vs(
+                                            reinterpret_cast<const char*>(b.data()),
+                                            static_cast<string_view::size_type>(b.size()));
+                                        auto ok = parse_user_pass_reply(vs);
+                                        if (!ok) { done(ok.error()); return; }
+                                        socks5_send_connect(st, std::move(done));
+                                    });
+                            });
+                    });
+                });
+        }
+
+        // Sends the SOCKS5 CONNECT and validates the reply.
+        //
+        // The reply length depends on its ATYP, and a domain reply depends on
+        // its own name-length byte, so the buffer grows until the parser reports
+        // a complete message. Guessing a size either blocks on bytes that will
+        // never arrive or swallows the first bytes of the tunnel.
+        static void socks5_send_connect(const std::shared_ptr<detail::RequestState>& st,
+                                        std::function<void(Result<byte_buffer>)> done) {
+            using namespace proxy_detail::socks5;
+            const Url& url = *st->request.parsed_url();
+            const bool is_literal = url.is_ip_literal;
+            // Remote DNS hands the NAME to the proxy, so the local resolver never
+            // sees it. An IP literal has no name to hand over and stays a literal
+            // in both modes.
+            const bool send_name = !is_literal && st->proxy.socks5_remote_dns;
+
+            if (!is_literal && !send_name) {
+                // Local-DNS mode needs a resolved address, which this stage does
+                // not have. begin() resolves the target first in that mode, so
+                // reaching here means the mode was configured inconsistently.
+                done(Error{ErrorCode::Socks5HandshakeFailed,
+                           ErrorPhase::ProxyConnectTunnel,
+                           string("SOCKS5 local-DNS mode needs a resolved target address")});
+                return;
+            }
+
+            // A literal target that arrived through a redirect/retry may not have
+            // gone through the fill in start_connect; parse it here so the frame
+            // always carries a real address. A zero-length address produces a
+            // malformed CONNECT that the proxy drops, which surfaces as a reset
+            // and looks like a proxy bug.
+            byte_buffer addr_bytes = st->proxy_target_addr;
+            if (!send_name && addr_bytes.empty()) {
+                const AddressList lits = parse_ip_literal(to_view(url.host), url.port);
+                if (!lits.empty()) addr_bytes = lits.front().bytes;
+                if (addr_bytes.empty()) {
+                    done(Error{ErrorCode::Socks5HandshakeFailed,
+                               ErrorPhase::ProxyConnectTunnel,
+                               string("SOCKS5 CONNECT has no target address")});
+                    return;
+                }
+            }
+
+            const uint8_t atyp = send_name
+                                     ? kAtypDomain
+                                     : (addr_bytes.size() == 16 ? kAtypIpv6 : kAtypIpv4);
+            const auto req = build_connect(atyp, to_view(url.host),
+                                           addr_bytes.empty() ? nullptr : addr_bytes.data(),
+                                           addr_bytes.size(), url.port);
+
+            auto buf = std::make_shared<byte_buffer>(req);
+            auto stream = st->stream;
+            stream->async_write(
+                buf->data(), buf->size(),
+                [st, buf, done](Result<size_t> w) mutable {
+                    (void)buf;
+                    if (!w) {
+                        done(Error{ErrorCode::Socks5HandshakeFailed,
+                                   ErrorPhase::ProxyConnectTunnel,
+                                   string("failed to send the SOCKS5 CONNECT")});
+                        return;
+                    }
+                    read_socks5_reply(st, std::move(done));
+                });
+        }
+
+        // Collects bytes until the SOCKS5 reply parses as complete.
+        static void read_socks5_reply(const std::shared_ptr<detail::RequestState>& st,
+                                      std::function<void(Result<byte_buffer>)> done) {
+            auto acc = std::make_shared<byte_buffer>();
+            struct Loop {
+                static void run(const std::shared_ptr<detail::RequestState>& s,
+                                std::shared_ptr<byte_buffer> acc,
+                                std::function<void(Result<byte_buffer>)> done) {
+                    if (s->finished.load()) return;
+                    if (acc->size() >= 4) {
+                        const string_view sv(
+                            reinterpret_cast<const char*>(acc->data()),
+                            static_cast<string_view::size_type>(acc->size()));
+                        auto probe = proxy_detail::socks5::parse_reply(sv);
+                        if (!probe) { done(probe.error()); return; }
+                        if (probe.value().complete) {
+                            using proxy_detail::socks5::Reply;
+                            if (probe.value().code != Reply::Succeeded) {
+                                done(proxy_detail::socks5::reply_error(probe.value().code));
+                                return;
+                            }
+                            byte_buffer leftover(
+                                acc->begin() + static_cast<std::ptrdiff_t>(
+                                                   probe.value().consumed),
+                                acc->end());
+                            done(std::move(leftover));
+                            return;
+                        }
+                    }
+                    if (acc->size() > 512) {
+                        done(Error{ErrorCode::Socks5HandshakeFailed,
+                                   ErrorPhase::ProxyConnectTunnel,
+                                   string("SOCKS5 reply is absurdly long")});
+                        return;
+                    }
+                    auto stream = s->stream;
+                    stream->async_read_some(
+                        [s, acc, done](Result<string_view> r) mutable {
+                            if (!r) { done(r.error()); return; }
+                            const string_view v = r.value();
+                            if (v.empty()) {
+                                done(Error{ErrorCode::Socks5HandshakeFailed,
+                                           ErrorPhase::ProxyConnectTunnel,
+                                           string("SOCKS5 proxy closed mid-reply")});
+                                return;
+                            }
+                            acc->insert(acc->end(),
+                                        reinterpret_cast<const uint8_t*>(v.data()),
+                                        reinterpret_cast<const uint8_t*>(v.data()) +
+                                            static_cast<size_t>(v.size()));
+                            run(s, acc, done);
+                        });
+                }
+            };
+            Loop::run(st, acc, std::move(done));
+        }
+
+        // Entry point: the stream is connected to the proxy (or to the target
+        // when no proxy is configured). Runs the proxy stage then hands over.
+        static void begin_proxy_stage(const std::shared_ptr<detail::RequestState>& st,
+                                      string head) {
+            if (!st->proxy.is_set()) {
+                begin_tls_or_exchange(st, std::move(head));
+                return;
+            }
+
+            const Url& url = *st->request.parsed_url();
+
+            // The head is needed by whichever branch runs, so it is shared rather
+            // than moved into the first lambda that mentions it. Moving it into
+            // `after_proxy_tls` left the later branches with an empty string and
+            // the request went out with no request line at all.
+            auto head_ptr = std::make_shared<string>(std::move(head));
+
+            // HTTPS proxy: the connection to the proxy itself is TLS. This layer
+            // uses proxy_tls_config, whose hostname is the PROXY's, so the proxy
+            // certificate is validated as the proxy and never as the target.
+            auto after_proxy_tls = [st, head_ptr](std::function<void()> next) {
+                st->phase = detail::RequestPhase::ProxyTls;
+                auto tls = make_tls_stream(st->stream, st->proxy_tls_config);
+                if (!tls) {
+                    st->fail(Error{ErrorCode::TlsHandshakeFailed, ErrorPhase::ProxyTls,
+                                   string("failed to create the proxy TLS stream")});
+                    return;
+                }
+                tls->set_error_phase(ErrorPhase::ProxyTls, ErrorPhase::ProxyTls);
+                st->proxy_tls_stream = tls;
+                std::weak_ptr<detail::RequestState> weak = st;
+                tls->start([weak, tls, next](VoidResult r) {
+                    auto s = weak.lock();
+                    if (!s || s->finished.load()) return;
+                    if (!r) { s->fail(r.error()); return; }
+                    // Everything above this point now talks through the proxy TLS
+                    // stream: CONNECT and, later, the target TLS both sit on it.
+                    s->stream = tls;
+                    next();
+                });
+            };
+
+            // Finishes the proxy stage: any leftover bytes are pushed back in
+            // front of the stream so the next layer (target TLS or the HTTP
+            // exchange) reads them first.
+            auto finish_proxy = [st, head_ptr](byte_buffer leftover) {
+                if (!leftover.empty()) {
+                    st->stream = std::make_shared<detail::PrefixedStream>(
+                        st->stream, std::move(leftover));
+                }
+                begin_tls_or_exchange(st, std::move(*head_ptr));
+            };
+
+            // Task book 10.2: a secure target behind an HTTP-speaking proxy needs
+            // a CONNECT tunnel; a cleartext target does not (absolute-form).
+            if (proxy_detail::needs_connect(st->proxy.type, url.is_secure())) {
+                auto do_connect = [st, finish_proxy]() {
+                    const Url& u = *st->request.parsed_url();
+                    string req = proxy_detail::build_connect_request(
+                        to_view(u.host), u.port, st->proxy,
+                        to_view(st->options.user_agent));
+                    send_connect(st, std::move(req),
+                        [st, finish_proxy](Result<byte_buffer> r) {
+                            if (!r) { st->fail(r.error()); return; }
+                            finish_proxy(std::move(r.value()));
+                        });
+                };
+                if (proxy_detail::uses_proxy_tls(st->proxy.type)) {
+                    after_proxy_tls(do_connect);
+                } else {
+                    do_connect();
+                }
+                return;
+            }
+
+            if (st->proxy.type == ProxyType::Socks5) {
+                socks5_handshake(st, [st, finish_proxy](Result<byte_buffer> r) {
+                    if (!r) { st->fail(r.error()); return; }
+                    finish_proxy(std::move(r.value()));
+                });
+                return;
+            }
+
+            // Forward proxy with a cleartext target: no handshake at all; the
+            // head already carries the absolute form.
+            if (proxy_detail::uses_proxy_tls(st->proxy.type)) {
+                after_proxy_tls([finish_proxy]() { finish_proxy(byte_buffer{}); });
+                return;
+            }
+            begin_tls_or_exchange(st, std::move(*head_ptr));
         }
 
         // Layered between TCP and the HTTP exchange: when the URL is https://,
