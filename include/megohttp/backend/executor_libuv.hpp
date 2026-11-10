@@ -148,6 +148,13 @@ namespace libuv_backend {
         // weak_from_this() is empty while the constructor is still running.
         void arm();
 
+        // Install the loop-thread dispatch and the "am I on the loop thread"
+        // probe. Both are required for safe cross-thread cancel/destruction:
+        // uv_timer_stop and uv_close are handle operations and libuv forbids
+        // calling them off the loop thread.
+        void set_dispatch(std::function<void(std::function<void()>)> post,
+                          std::function<bool()> on_loop_thread);
+
         // Invoked after the handler runs, so the owner can release its self-hold.
         void set_on_fired(std::function<void()> fn) { on_fired_ = std::move(fn); }
 
@@ -163,9 +170,14 @@ namespace libuv_backend {
         static void on_timeout(uv_timer_t* h);
         static void on_closed(uv_handle_t* h);
 
+        // Stops and closes the handle. ONLY on the loop thread.
+        void stop_and_close_locked();
+
         std::shared_ptr<Node> node_;
         std::function<void()> fn_;
         std::function<void()> on_fired_;
+        std::function<void(std::function<void()>)> post_;
+        std::function<bool()> on_loop_thread_;
         std::atomic<bool> cancelled_{false};
     };
 

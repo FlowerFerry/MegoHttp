@@ -23,6 +23,7 @@ set(MGHTTP_TEST_SOURCES
     test_client.cpp
     test_streaming.cpp
     test_streaming_integration.cpp
+    test_streaming_network.cpp
     test_multipart.cpp
     test_multipart_response.cpp
     test_multipart_continuous.cpp
@@ -40,6 +41,7 @@ set(MGHTTP_TEST_SOURCES
     test_proxy.cpp
     test_client_proxy.cpp
     test_client_retry.cpp
+    test_cookie.cpp
 )
 
 if(MGHTTP_BACKEND_LIBUV)

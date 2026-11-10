@@ -556,34 +556,111 @@ TEST_CASE("an unusable proxy configuration is rejected before any socket opens",
     REQUIRE_FALSE(r);
     CHECK(r.error().code() == ErrorCode::InvalidArgument);
 }
+#if !MGHTTP_TLS_NONE
+
 
 // ---------------------------------------------------------------------------
-// S5.4-03 / S5.4-04: HTTPS proxy (TLS to the proxy itself)
+// S5.4-03 / S5.4-04: HTTPS proxy (TLS to the proxy itself) and layered TLS
 //
 // Two identities are in play and they must not be confused:
 //   - the PROXY's certificate, validated with ProxyOptions::tls;
 //   - the TARGET's certificate, validated with ClientOptions::tls.
-// Task book 9.3 forbids one object driving both. The tests below therefore use
-// DIFFERENT trust material for the two layers, so a swap cannot silently pass:
-// the proxy cert is signed by the test CA, and "trusting only the CA" for the
-// target must still fail when the target presents a certificate the CA did not
-// sign.
+// Task book 9.3 forbids one object driving both, so the tests below configure
+// the two layers separately and assert that neither substitutes for the other.
 // ---------------------------------------------------------------------------
 
-#if !MGHTTP_TLS_NONE
 namespace {
 
 std::string fixture(const char* name) {
     return std::string(MEGOHTTP_TLS_FIXTURE_DIR) + "/" + name;
 }
 
-} // namespace
+// Spawns tests/https_test_server.py: a real TLS origin answering a fixed 200.
+// OriginServer above speaks cleartext, so a CONNECT-tunnel test needs this one.
+class HttpsOriginServer {
+public:
+    bool start(const char* cert, const char* key) {
+        std::string cmd = "python \"";
+        cmd += MEGOHTTP_TESTS_DIR;
+        cmd += "/https_test_server.py\" \"" + fixture(cert) + "\" \"" + fixture(key) + "\"";
+        return spawn_and_read_banner(cmd);
+    }
+
+    uint16_t port() const noexcept { return port_; }
+    ~HttpsOriginServer() { stop(); }
+
+    void stop() {
+#if defined(_WIN32)
+        if (pid_ > 0) {
+            std::string cmd = "taskkill /F /PID " + std::to_string(pid_) + " > nul 2>&1";
+            std::system(cmd.c_str());
+            pid_ = 0;
+        }
 #endif
+    }
+
+private:
+    bool spawn_and_read_banner(const std::string& cmd) {
+        SECURITY_ATTRIBUTES sa{};
+        sa.nLength = sizeof sa;
+        sa.bInheritHandle = TRUE;
+        HANDLE read_h = nullptr;
+        HANDLE write_h = nullptr;
+        if (!CreatePipe(&read_h, &write_h, &sa, 0)) return false;
+        SetHandleInformation(read_h, HANDLE_FLAG_INHERIT, 0);
+
+        STARTUPINFOA si{};
+        si.cb = sizeof si;
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdOutput = write_h;
+        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+        PROCESS_INFORMATION pi{};
+        std::vector<char> mutable_cmd(cmd.begin(), cmd.end());
+        mutable_cmd.push_back('\0');
+        const BOOL ok = CreateProcessA(nullptr, mutable_cmd.data(), nullptr, nullptr, TRUE, 0,
+                                       nullptr, nullptr, &si, &pi);
+        CloseHandle(write_h);
+        if (!ok) { CloseHandle(read_h); return false; }
+
+        pid_ = static_cast<int>(pi.dwProcessId);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+
+        std::string banner;
+        char buf[256];
+        DWORD got = 0;
+        const ULONG deadline = GetTickCount() + 15000;
+        while (banner.find('\n') == std::string::npos && GetTickCount() < deadline) {
+            if (!ReadFile(read_h, buf, sizeof buf, &got, nullptr) || got == 0) break;
+            banner.append(buf, got);
+        }
+        CloseHandle(read_h);
+
+        std::istringstream is(banner);
+        std::string tag;
+        int port = 0;
+        is >> tag >> pid_ >> port;
+        port_ = static_cast<uint16_t>(port);
+        return tag == "READY" && port_ != 0;
+    }
+
+    uint16_t port_{0};
+    int pid_{0};
+};
+
+// The fixture certificate covers "localhost", so the URL names localhost even
+// though the origin binds 127.0.0.1: identity check and dialled address agree.
+std::string tunnel_url(uint16_t port, const char* path = "/via-tunnel") {
+    return "https://localhost:" + std::to_string(port) + path;
+}
+
+string to_owning(const std::string& s) { return string(s.data(), s.size()); }
+
+} // namespace
 
 TEST_CASE("an HTTPS proxy wraps its own connection in TLS", "[proxy][client][https_proxy]") {
-#if MGHTTP_TLS_NONE
-    SUCCEED("TLS is compiled out in this configuration");
-#else
     // The proxy speaks TLS; the target is plain HTTP. Completing this proves the
     // proxy layer did TLS of its own, which is the distinction task book 10.2
     // draws between "HTTPS proxy" and "CONNECT".
@@ -611,14 +688,10 @@ TEST_CASE("an HTTPS proxy wraps its own connection in TLS", "[proxy][client][htt
     CHECK(proxy.recording().find("\"tls\": true") != std::string::npos);
     CHECK(proxy.recording().find("\"absolute_form\": true") != std::string::npos);
     CHECK(origin.last_request_line().rfind("GET /via-https-proxy ", 0) == 0);
-#endif
 }
 
 TEST_CASE("an HTTPS proxy whose certificate the client does not trust is refused",
           "[proxy][client][https_proxy][security]") {
-#if MGHTTP_TLS_NONE
-    SUCCEED("TLS is compiled out in this configuration");
-#else
     OriginServer origin;
     REQUIRE(origin.start());
 
@@ -642,19 +715,16 @@ TEST_CASE("an HTTPS proxy whose certificate the client does not trust is refused
     CHECK(r.error().phase() == ErrorPhase::ProxyTls);
     // And it must not have connected to the origin at all.
     CHECK(origin.accepts() == 0);
-#endif
 }
 
 TEST_CASE("the proxy and the target are validated with separate trust material",
           "[proxy][client][https_proxy][security]") {
-#if MGHTTP_TLS_NONE
-    SUCCEED("TLS is compiled out in this configuration");
-#else
-    // The point of this test is that ProxyOptions::tls and ClientOptions::tls are
-    // independent. Setting the proxy's CA must not also authorize the target, so
-    // a target certificate from a different CA still fails.
-    OriginServer origin;      // plain HTTP origin; the target-side TLS is exercised
-    REQUIRE(origin.start());  // through https:// in the layered test below.
+    // This test covers ONLY the proxy-layer object: setting ProxyOptions::tls
+    // leaves ClientOptions::tls untouched, asserted below. The target-side
+    // counterpart is "layered TLS: HTTPS proxy and HTTPS target use independent
+    // trust", which drives https:// through a CONNECT tunnel.
+    OriginServer origin;
+    REQUIRE(origin.start());
 
     ProxyServer proxy;
     REQUIRE(proxy.start("forward", std::string("--tls-cert \"") + fixture("server-cert.pem") +
@@ -674,5 +744,145 @@ TEST_CASE("the proxy and the target are validated with separate trust material",
     auto r = c.request_sync(Request(Method::Get, url(origin.port(), "/split")));
     REQUIRE(r);
     CHECK(r.value().head().status_code == 200);
-#endif
 }
+
+// ---------------------------------------------------------------------------
+// S5.4-02: a real CONNECT tunnel carries an https:// request end to end.
+//
+// The forward-proxy tests above prove absolute-form relaying, which is a
+// DIFFERENT path. Reaching an https:// target through an HTTP-speaking proxy
+// requires CONNECT first and then target TLS inside the tunnel; the assertion is
+// on the BODY the TLS origin served, and the proxy recording proves the CONNECT
+// actually happened rather than the client dialling the origin directly.
+// ---------------------------------------------------------------------------
+TEST_CASE("an https target behind an HTTP proxy uses a CONNECT tunnel",
+          "[proxy][client][connect]") {
+    HttpsOriginServer origin;
+    REQUIRE(origin.start("server-cert.pem", "server-key.pem"));
+
+    ProxyServer proxy;
+    REQUIRE(proxy.start("connect"));
+
+    ClientOptions o;
+    o.proxy.proxy.type = ProxyType::Http;
+    o.proxy.proxy.host = string("127.0.0.1");
+    o.proxy.proxy.port = proxy.port();
+    // Target TLS: trust the test CA and expect the origin's name. This is
+    // ClientOptions::tls -- the TARGET layer, not the proxy layer.
+    o.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.tls.hostname = string("localhost");
+
+    Client c(o);
+    auto r = c.request_sync(Request(Method::Get, to_owning(tunnel_url(origin.port()))));
+    REQUIRE(r);
+    CHECK(r.value().head().status_code == 200);
+    // The body proves the tunnel carried real TLS-framed HTTP, not merely a 200
+    // from the proxy's own CONNECT reply.
+    CHECK(r.value().body_text() == string_view("hello over https"));
+
+    const std::string rec = proxy.recording();
+    CHECK(rec.find("\"kind\": \"connect\"") != std::string::npos);
+    CHECK(rec.find("\"method\": \"CONNECT\"") != std::string::npos);
+    CHECK(rec.find("\"target\": \"localhost:") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// S5.4-02: a CONNECT the proxy refuses is a proxy-layer failure and the target
+// is never contacted.
+// ---------------------------------------------------------------------------
+TEST_CASE("a CONNECT refused by the proxy does not reach the target",
+          "[proxy][client][connect][security]") {
+    HttpsOriginServer origin;
+    REQUIRE(origin.start("server-cert.pem", "server-key.pem"));
+
+    ProxyServer proxy;
+    REQUIRE(proxy.start("connect", "--require-auth"));
+
+    ClientOptions o;
+    o.proxy.proxy.type = ProxyType::Http;
+    o.proxy.proxy.host = string("127.0.0.1");
+    o.proxy.proxy.port = proxy.port();
+    o.proxy.proxy.username = string("alice");
+    o.proxy.proxy.password = string("WRONG");   // the fixture expects alice:s3cret
+    o.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.tls.hostname = string("localhost");
+
+    Client c(o);
+    auto r = c.request_sync(Request(Method::Get, to_owning(tunnel_url(origin.port()))));
+    REQUIRE_FALSE(r);
+    // A refused CONNECT is a proxy failure, attributed to the proxy layer rather
+    // than to the target's TLS or to a generic transport error.
+    CHECK(r.error().phase() == ErrorPhase::ProxyAuth);
+    CHECK(r.error().code() == ErrorCode::ProxyAuthRequired);
+
+    CHECK(proxy.recording().find("\"kind\": \"connect\"") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// S5.4-04: layered TLS -- an HTTPS proxy whose own certificate the client
+// trusts, wrapping a CONNECT tunnel to an HTTPS target. Both layers are real
+// TLS and each is configured through its own object.
+// ---------------------------------------------------------------------------
+TEST_CASE("layered TLS: HTTPS proxy and HTTPS target use independent trust",
+          "[proxy][client][https_proxy][security]") {
+    HttpsOriginServer origin;
+    REQUIRE(origin.start("server-cert.pem", "server-key.pem"));
+
+    ProxyServer proxy;
+    REQUIRE(proxy.start("connect", std::string("--tls-cert \"") + fixture("server-cert.pem") +
+                                       "\" --tls-key \"" + fixture("server-key.pem") + "\""));
+
+    ClientOptions o;
+    // PROXY layer: Https means TLS to the proxy itself.
+    o.proxy.proxy.type = ProxyType::Https;
+    o.proxy.proxy.host = string("127.0.0.1");
+    o.proxy.proxy.port = proxy.port();
+    o.proxy.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.proxy.tls.hostname = string("localhost");
+    // TARGET layer: a separate TlsConfig. Same CA on purpose -- the sibling test
+    // below uses a wrong proxy CA, which is what proves they are not shared.
+    o.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.tls.hostname = string("localhost");
+
+    Client c(o);
+    auto r = c.request_sync(Request(Method::Get,
+        to_owning(tunnel_url(origin.port(), "/via-layered-tls"))));
+    REQUIRE(r);
+    CHECK(r.value().head().status_code == 200);
+    CHECK(r.value().body_text() == string_view("hello over https"));
+
+    // The proxy saw a CONNECT on its own TLS listener.
+    const std::string rec = proxy.recording();
+    CHECK(rec.find("\"kind\": \"connect\"") != std::string::npos);
+    CHECK(rec.find("\"tls\": true") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// S5.4-04: a wrong PROXY CA must fail at the proxy layer even though the target
+// layer is configured correctly -- that asymmetry is the proof of separation.
+// ---------------------------------------------------------------------------
+TEST_CASE("layered TLS: a wrong proxy CA fails at the proxy layer",
+          "[proxy][client][https_proxy][security]") {
+    HttpsOriginServer origin;
+    REQUIRE(origin.start("server-cert.pem", "server-key.pem"));
+
+    ProxyServer proxy;
+    REQUIRE(proxy.start("connect", std::string("--tls-cert \"") + fixture("server-cert.pem") +
+                                       "\" --tls-key \"" + fixture("server-key.pem") + "\""));
+
+    ClientOptions o;
+    o.proxy.proxy.type = ProxyType::Https;
+    o.proxy.proxy.host = string("127.0.0.1");
+    o.proxy.proxy.port = proxy.port();
+    o.proxy.tls.ca_file = string(fixture("untrusted-ca.pem").c_str());  // wrong for the proxy
+    o.proxy.tls.hostname = string("localhost");
+    o.tls.ca_file = string(fixture("ca.pem").c_str());                  // correct for the target
+    o.tls.hostname = string("localhost");
+
+    Client c(o);
+    auto r = c.request_sync(Request(Method::Get, to_owning(tunnel_url(origin.port()))));
+    REQUIRE_FALSE(r);
+    CHECK(r.error().phase() == ErrorPhase::ProxyTls);
+}
+
+#endif // !MGHTTP_TLS_NONE

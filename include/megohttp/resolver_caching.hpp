@@ -67,7 +67,16 @@ namespace megohttp {
                             AddressList answers = it->second;
                             for (auto& a : answers) a.port = port;
                             auto ready_cb = cb;
-                            executor_->post([ready_cb, answers]() {
+                            auto cancel_state_for_hit = cancel;
+                            executor_->post([ready_cb, answers, cancel_state_for_hit]() {
+                                // A cancelled lookup must not deliver, even from
+                                // the cache: "no callback after cancel" is the
+                                // Resolver contract, and a cache hit is still a
+                                // callback.
+                                if (cancel_state_for_hit &&
+                                    cancel_state_for_hit->is_cancelled()) {
+                                    return;
+                                }
                                 if (ready_cb) ready_cb(Result<AddressList>(answers));
                             });
                             return CancelHandle(cancel);

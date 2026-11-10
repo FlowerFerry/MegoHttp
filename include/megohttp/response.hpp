@@ -65,6 +65,11 @@ namespace megohttp {
         const std::vector<uint8_t>& body_bytes() const noexcept;
         string_view body_text() const noexcept;
         bool body_is_buffered() const noexcept;
+        // Marks the body as having been delivered elsewhere (a BodySink). A
+        // streamed response carries no body here, but its container alone cannot
+        // say so: an empty buffered 200 and an empty streamed 200 look
+        // identical, and callers branch on this flag.
+        void set_body_streamed() noexcept;
 
         // --- Streaming body (S3.2-02) ---
         // Called for each chunk of response body as it arrives.

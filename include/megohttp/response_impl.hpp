@@ -47,6 +47,8 @@ namespace megohttp {
 
     inline bool Response::body_is_buffered() const noexcept { return impl_->buffered; }
 
+    inline void Response::set_body_streamed() noexcept { impl_->buffered = false; }
+
     inline bool Response::body_decoded() const noexcept { return impl_->decoded; }
 
     inline std::optional<uint64_t> Response::wire_body_length() const noexcept {

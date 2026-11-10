@@ -451,13 +451,47 @@ TEST_CASE("chunk encode", "[http]") {
     CHECK(got == "5\r\nhello\r\n");
 
     auto last = chunked::encode_last_chunk(nullptr);
-    const std::string got2(last.data(), last.size());
+    REQUIRE(last.has_value());
+    const std::string got2(last.value().data(), last.value().size());
     CHECK(got2 == "0\r\n\r\n");
 
     Headers tr; tr.add("X-Sum", "42");
     auto last2 = chunked::encode_last_chunk(&tr);
-    const std::string got3(last2.data(), last2.size());
+    REQUIRE(last2.has_value());
+    const std::string got3(last2.value().data(), last2.value().size());
     CHECK(got3 == "0\r\nX-Sum: 42\r\n\r\n");
+
+    // A trailer is a header line: an unchecked CR/LF there would inject a line
+    // into the chunked body just as it would into a head.
+    Headers bad_tr;
+    bad_tr.add("X-Evil", "a\r\nInjected: yes");
+    CHECK_FALSE(chunked::encode_last_chunk(&bad_tr).has_value());
+
+    Headers bad_name;
+    bad_name.add("X Bad", "v");
+    CHECK_FALSE(chunked::encode_last_chunk(&bad_name).has_value());
+
+    // The reason phrase goes straight into the status line, so a CR/LF there
+    // splits the response exactly like an injected header would.
+    {
+        Headers h;
+        auto ok = encode_response_head(200, "OK", h);
+        REQUIRE(ok.has_value());
+        const std::string s(ok.value().data(), ok.value().size());
+        CHECK(s.rfind("HTTP/1.1 200 OK\r\n", 0) == 0);
+
+        CHECK_FALSE(encode_response_head(200, "OK\r\nInjected: yes", h).has_value());
+        CHECK_FALSE(encode_response_head(200, "OK\nInjected: yes", h).has_value());
+        // An embedded NUL: built with an explicit length, because a literal
+        // would stop at the NUL before the check ever saw it.
+        const char with_nul[] = {'O', 'K', '\0', 'x'};
+        CHECK_FALSE(encode_response_head(
+            200, string_view(with_nul, sizeof with_nul), h).has_value());
+        // Control bytes below 0x20 are rejected too; HTAB is the one exception
+        // the header grammar allows.
+        CHECK_FALSE(encode_response_head(200, "OK\x01", h).has_value());
+        CHECK(encode_response_head(200, "OK\tstill fine", h).has_value());
+    }
 
     // parse_chunk_size
     auto s1 = chunked::parse_chunk_size("1a");

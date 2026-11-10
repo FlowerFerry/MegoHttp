@@ -71,6 +71,10 @@ namespace megohttp {
     // True when `text` is an IPv4 or IPv6 literal (no DNS needed).
     bool is_ip_literal(string_view host, bool* out_is_ipv6 = nullptr) noexcept;
 
+    // True when `host` (brackets already stripped) is a well-formed IPv6
+    // address. Stricter than "contains a colon".
+    bool is_ipv6_literal(string_view host) noexcept;
+
 } // namespace megohttp
 
 #include <megohttp/url_impl.hpp>

@@ -255,15 +255,36 @@ inline bool TlsStream::Impl::init_openssl() {
         // back to the OpenSSL default paths (OPENSSLDIR). Both are REPLACEMENT
         // sources, not additions -- the platform's default store takes over in
         // lieu of anything else, it does not widen a previously-set trust set.
+        //
+        // A discovered source that FAILS to load is not silently skipped: that
+        // is exactly the case where SSL_CERT_FILE points at a file that cannot
+        // be read, and quietly continuing would verify against something the
+        // caller never named.
         string def = tls_trust::default_ca_file();
         if (!def.empty()) {
-            SSL_CTX_load_verify_locations(ctx_, def.c_str(), nullptr);
+            if (SSL_CTX_load_verify_locations(ctx_, def.c_str(), nullptr) != 1) {
+                return false;   // explicit-by-environment source is unusable
+            }
+        } else {
+            // A hashed CA directory can come from SSL_CERT_DIR. It was
+            // discoverable but never passed to OpenSSL, so a caller who set only
+            // SSL_CERT_DIR got the built-in paths and no indication why their
+            // directory was ignored.
+            string dir = tls_trust::default_ca_path();
+            if (!dir.empty()) {
+                if (SSL_CTX_load_verify_locations(ctx_, nullptr, dir.c_str()) != 1) {
+                    return false;
+                }
+            } else {
+                // No usable platform bundle or directory: fall back to the
+                // built-in paths, and treat a total failure as "no trust
+                // anchors", which is a setup error rather than something to
+                // discover at handshake time.
+                if (SSL_CTX_set_default_verify_paths(ctx_) != 1) {
+                    return false;
+                }
+            }
         }
-        // Still try the built-in paths in case the platform bundle export
-        // failed. SSL_CTX_set_default_verify_paths loads OPENSSLDIR/cafile
-        // and OPENSSLDIR/cadir, which on Windows points at the OpenSSL
-        // install's certs directory (usually empty).
-        SSL_CTX_set_default_verify_paths(ctx_);
     }
 
     // Client certificate for mutual TLS.
@@ -513,8 +534,12 @@ inline void TlsStream::Impl::fail(ErrorCode code, ErrorPhase phase, const char* 
     state_ = State::Failed;
     Error err{code, phase, format("{}", what)};
     if (!handshake_complete_) { finish_ready(VoidResult{err}); return; }
-    if (write_cb_) { finish_write(Result<size_t>{err}); return; }
-    if (read_cb_)  { finish_read(Result<string_view>{err}); return; }
+
+    // A TLS layer allows a read and a write to be outstanding at the same time.
+    // Completing only one of them -- which is what this used to do -- leaves the
+    // other caller waiting for a callback that never comes.
+    if (write_cb_) finish_write(Result<size_t>{err});
+    if (read_cb_) finish_read(Result<string_view>{err});
     notify_closed();
 }
 
@@ -955,10 +980,15 @@ inline void TlsStream::async_close(CloseCallback cb) {
 
     if (impl_->state_ == Impl::State::Failed) {
         impl_->state_ = Impl::State::Closed;
+        // The callback is delivered even when self_ is empty. A TlsStream that
+        // was never start()ed (or whose start failed) has no self-reference, and
+        // gating notify_closed() on lock() silently dropped the caller's close
+        // completion in exactly that case.
         std::weak_ptr<TlsStream> w = impl_->self_;
         impl_->underlying_->async_close([w] {
             if (auto s = w.lock()) s->impl_->notify_closed();
         });
+        if (!w.lock()) impl_->notify_closed();
         return;
     }
     if (impl_->state_ == Impl::State::Handshake) {
@@ -967,6 +997,7 @@ inline void TlsStream::async_close(CloseCallback cb) {
         impl_->underlying_->async_close([w] {
             if (auto s = w.lock()) s->impl_->notify_closed();
         });
+        if (!w.lock()) impl_->notify_closed();
         return;
     }
 

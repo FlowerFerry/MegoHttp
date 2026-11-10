@@ -8,9 +8,11 @@
 #include <megohttp/string_adapter.hpp>
 #include <megohttp/url.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -82,11 +84,42 @@ namespace megohttp {
 
         // Body sink for streaming download; nullopt if using buffer mode (default).
         // When set, body_bytes() will be empty and body_is_buffered() false.
+        //
+        // Returning false asks the client to PAUSE delivery. Pausing stops the
+        // reads, so a slow consumer actually stops the socket instead of the
+        // library buffering everything it cannot deliver. Delivery resumes when
+        // the caller signals the attached BodySinkFlow; without one attached the
+        // return value cannot be acted on and delivery continues (the historical
+        // behaviour, kept so existing callers are not broken silently).
         using BodySink = std::function<bool(string_view chunk)>;
         using BodySinkComplete = std::function<void(VoidResult)>;
+
+        // Cross-thread pause/resume for a streaming download. Copyable; every
+        // copy refers to the same state.
+        class BodySinkFlow {
+        public:
+            BodySinkFlow();
+            // Ask delivery to pause. Idempotent.
+            void pause();
+            // Resume after a pause. Safe to call from any thread.
+            void resume();
+            bool is_paused() const noexcept;
+
+            // Installed by the Client when the exchange starts. Not part of the
+            // caller-facing contract; `wake` is invoked on resume().
+            void set_wake(std::function<void()> wake);
+
+        private:
+            std::shared_ptr<struct BodySinkFlowState> state_;
+        };
+
         void set_body_sink(BodySink sink, BodySinkComplete complete);
+        // Same, with backpressure control.
+        void set_body_sink(BodySink sink, BodySinkComplete complete,
+                           std::shared_ptr<BodySinkFlow> flow);
         const std::optional<BodySink>& body_sink() const noexcept;
         const std::optional<BodySinkComplete>& body_sink_complete() const noexcept;
+        const std::shared_ptr<BodySinkFlow>& body_sink_flow() const noexcept;
 
     private:
         class Impl;

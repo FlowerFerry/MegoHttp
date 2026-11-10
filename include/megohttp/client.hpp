@@ -12,6 +12,7 @@
 #include <megohttp/error.hpp>
 #include <megohttp/executor.hpp>
 #include <megohttp/redirect.hpp>
+#include <megohttp/cookie.hpp>
 #include <megohttp/request.hpp>
 #include <megohttp/retry.hpp>
 #include <megohttp/resolver.hpp>
@@ -21,6 +22,7 @@
 #include <megohttp/tls_stream.hpp>
 
 #include <chrono>
+#include <future>
 #include <functional>
 #include <memory>
 
@@ -109,6 +111,18 @@ namespace megohttp {
 
         // Inject a resolver (tests, address override). Null = system resolver.
         std::shared_ptr<Resolver> resolver;
+
+        // ------------------------------------------------------------------
+        // Cookie jar (phase 5, task book 10.3).
+        //
+        // Null = cookies are off, which reproduces the pre-phase-5 behaviour
+        // exactly: no Cookie header is sent and no Set-Cookie is stored.
+        //
+        // Shared, not owned by value: the same jar is normally shared across
+        // several Clients, and "null means off" is harder to get wrong than a
+        // separate enable flag that can disagree with the pointer.
+        // ------------------------------------------------------------------
+        std::shared_ptr<CookieJar> cookie_jar;
 
         // External event loop. When set, the Client does NOT own the loop or any
         // driver thread, and the caller must keep running it. When null, the

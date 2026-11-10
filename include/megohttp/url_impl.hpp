@@ -67,18 +67,93 @@ namespace detail {
         return 0;
     }
 
+    // Strict IPv6 literal validation (brackets already stripped).
+    //
+    // "contains a colon" is not a test for an IPv6 address: [not:an:ipv6] passes
+    // it, and because parse_url sets is_ip_literal from that answer, the name
+    // then skips DNS and goes to connect() as if it were an address.
+    //
+    // Accepted forms: 8 groups; 1..7 groups with one "::"; and either of those
+    // with a trailing dotted-quad (IPv4-mapped / -compatible).
+    //
+    // (is_ip_literal is declared in url.hpp, so calling it here is fine.)
+    inline bool is_ipv6_literal(string_view host) noexcept {
+        const size_t n = static_cast<size_t>(host.size());
+        const char* p = host.data();
+        if (n < 2 || n > 45) return false;
+
+        size_t i = 0;
+        int groups = 0;
+        bool compressed = false;
+
+        // A leading "::" may collapse any number of zero groups.
+        if (p[0] == ':') {
+            if (n < 2 || p[1] != ':') return false;
+            compressed = true;
+            i = 2;
+        }
+
+        while (i < n) {
+            // Split off the next group.
+            const size_t start = i;
+            int digits = 0;
+            while (i < n && p[i] != ':') {
+                const char c = p[i];
+                // A dot means this group is actually a dotted-quad tail.
+                if (c == '.') {
+                    if (digits == 0) return false;
+                    // Validate the rest as IPv4 and stop.
+                    bool v6 = false;
+                    if (!is_ip_literal(string_view(p + start, n - start), &v6)) return false;
+                    if (v6) return false;              // no colons left in the tail
+                    if (groups + 2 > 8) return false;  // a v4 tail is two groups
+                    return true;
+                }
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                      (c >= 'A' && c <= 'F'))) {
+                    return false;
+                }
+                ++digits;
+                if (digits > 4) return false;
+                ++i;
+            }
+            if (digits == 0) return false;
+            ++groups;
+            if (groups > 8) return false;
+            if (i >= n) break;
+
+            // Consume the ':' separator; a second one means "::".
+            ++i;
+            if (i < n && p[i] == ':') {
+                if (compressed) return false;   // at most one "::"
+                compressed = true;
+                ++i;
+                if (i >= n) break;              // trailing "::" is legal
+            } else if (i >= n) {
+                return false;                   // a trailing single ':' is not
+            }
+        }
+
+        if (compressed) return groups <= 7;
+        return groups == 8;
+    }
+
     inline bool is_ip_literal(string_view host, bool* out_is_ipv6) noexcept {
         const size_t n = static_cast<size_t>((host).size());
         const char* p = (host).data();
         if (n == 0) { if (out_is_ipv6) *out_is_ipv6 = false; return false; }
 
-        // IPv6: contains a colon (brackets already stripped by the caller)
+        // IPv6: must actually parse as one, not merely contain a colon.
         bool has_colon = false, has_dot = false;
         for (size_t i = 0; i < n; ++i) {
             if (p[i] == ':') has_colon = true;
             if (p[i] == '.') has_dot = true;
         }
-        if (has_colon) { if (out_is_ipv6) *out_is_ipv6 = true; return true; }
+        if (has_colon) {
+            const bool ok = is_ipv6_literal(host);
+            if (out_is_ipv6) *out_is_ipv6 = ok;
+            return ok;
+        }
         if (out_is_ipv6) *out_is_ipv6 = false;
 
         // IPv4: exactly four 1-3 digit decimal groups, each <= 255
@@ -251,6 +326,13 @@ namespace detail {
             }
             if (close == 0) return Error{ErrorCode::InvalidArgument, "unterminated IPv6 literal"};
             host_sv = string_view(a + 1, static_cast<string_view::size_type>(close - 1));
+            // Being inside brackets is not the same as being an IPv6 address.
+            // "[not:an:ipv6]" used to be accepted here and then skipped DNS,
+            // because is_ip_literal was set unconditionally.
+            if (!is_ipv6_literal(host_sv)) {
+                return Error{ErrorCode::InvalidArgument,
+                             "bracketed host is not a valid IPv6 literal"};
+            }
             u.is_ipv6_literal = true;
             u.is_ip_literal = true;
             if (close + 1 < a_len) {
@@ -288,17 +370,22 @@ namespace detail {
                     u.is_ipv6_literal = v6;
                 }
             } else {
-                // A non-ASCII (IDN) host is converted to its A-label form here, so
-                // everything downstream -- DNS, TLS SNI, certificate identity, Host
-                // header -- sees the same ASCII name the wire requires.
-                auto encoded = idna_encode(host_sv);
-                if (!encoded) return encoded.error();
-                if (!is_valid_ascii_host(to_view(encoded.value()))) {
-                    return Error{ErrorCode::InvalidArgument,
-                                 "IDN host is invalid after IDNA encoding"};
-                }
-                u.host = detail::lower_ascii(to_view(encoded.value()));
-                u.is_ip_literal = false;
+                // A non-ASCII (IDN) host.
+                //
+                // Task book 5.4.1: "Unicode 域名必须明确拒绝，除非通过经过验证的
+                // IDNA 库转换，不得自行实现不完整的转换逻辑." This library's
+                // idna_encode() is RFC 3492 Punycode plus a SUBSET of IDNA2008 --
+                // it does not implement NFC folding, the Bidi rule, ContextJ/O,
+                // or the DISALLOWED table. Converting here would therefore accept
+                // names a conforming IDNA2008 implementation rejects, which is
+                // exactly what the task book forbids.
+                //
+                // So the default is to reject, and the caller converts with a
+                // real IDNA library and passes the resulting A-label. idna_encode
+                // remains available as an explicit, documented-subset helper.
+                return Error{ErrorCode::InvalidArgument,
+                             "Unicode host names are rejected: encode to an IDNA "
+                             "A-label with a conforming library first (see idna.hpp)"};
             }
         }
 
@@ -385,9 +472,10 @@ namespace detail {
 
     inline string Url::absolute_form_target() const {
         fmt::memory_buffer buf;
-        auto out = fmt::appender(buf);
-        fmt::format_to(out, FMT_COMPILE("http://"));
-        detail::buf_append(buf, host_port_header());
+        // The scheme must be the URL's own. A hardcoded "http://" here rewrote
+        // an https URL into http:// wherever the caller reconstructed the URL
+        // from this string, which silently downgrades transport security.
+        detail::buf_append(buf, origin());
         detail::buf_append(buf, request_target());
         return detail::sb_release(buf);
     }

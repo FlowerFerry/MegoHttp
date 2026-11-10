@@ -187,6 +187,14 @@ namespace megohttp {
         if (status_code < 100 || status_code > 999) {
             return Error{ErrorCode::InvalidArgument, "status code out of range"};
         }
+        // The reason phrase is written straight into the status line, so a CR or
+        // LF in it splits the response: whatever follows becomes a header or a
+        // second response. It takes the same character rules as a header value,
+        // which already excludes CR / LF / NUL / other control bytes.
+        if (!is_valid_header_value(reason)) {
+            return Error{ErrorCode::InvalidArgument,
+                         "reason phrase contains CR/LF/NUL or another control byte"};
+        }
         for (const auto& f : headers) {
             if (!is_valid_header_name(to_view(f.first))) {
                 return Error{ErrorCode::InvalidArgument, "invalid header name"};
@@ -231,7 +239,7 @@ namespace megohttp {
             return detail::sb_release(buf);
         }
 
-        inline string encode_last_chunk(const Headers* trailers) {
+        inline Result<string> encode_last_chunk(const Headers* trailers) {
             fmt::memory_buffer buf;
             auto out = fmt::appender(buf);
             buf.push_back('0');
@@ -239,6 +247,17 @@ namespace megohttp {
             buf.push_back('\n');
             if (trailers != nullptr) {
                 for (const auto& f : *trailers) {
+                    // Same rules the head enforces: a trailer is a header line,
+                    // so an unchecked name or value injects a line into the
+                    // chunked body.
+                    if (!is_valid_header_name(to_view(f.first))) {
+                        return Error{ErrorCode::InvalidArgument,
+                                     "invalid trailer name"};
+                    }
+                    if (!is_valid_header_value(to_view(f.second))) {
+                        return Error{ErrorCode::InvalidArgument,
+                                     "trailer value contains CR/LF/NUL"};
+                    }
                     fmt::format_to(out, "{}: {}\r\n", f.first, f.second);
                 }
             }
@@ -518,8 +537,14 @@ namespace megohttp {
             if (state_ == State::Complete) return VoidResult{};
             if (state_ == State::Failed) return fail_error_;
             if (state_ == State::Body_UntilClose) {
+                // Mark complete only AFTER the callback succeeds. Setting it first
+                // meant a callback that returned an error left the parser in
+                // Complete, so the next feed_eof()/feed() would not report the
+                // failure and the completion could be signalled twice.
+                auto r = cb_.on_complete();
+                if (!r) return fail_from(r.error());
                 state_ = State::Complete;
-                return cb_.on_complete();
+                return VoidResult{};
             }
             if (state_ == State::Head) {
                 return fail(ErrorCode::HttpInvalidResponse,

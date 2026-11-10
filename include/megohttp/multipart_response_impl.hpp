@@ -87,12 +87,23 @@ namespace megohttp {
                     suff = 2;
                     if (after + 3 < buffer_.size() && buffer_[after + 2] == '\r' &&
                         buffer_[after + 3] == '\n') suff += 2;
-                } else if (buffer_[after] == '\r' && buffer_[after + 1] == '\n') {
-                    suff = 2;
                 } else {
-                    if (!emit(pos + 1)) break;
-                    if (state_ == State::Failed) break;
-                    continue;
+                    // RFC 2046 规定 boundary 行可以有可选的 transport padding（空格或制表符），
+                    // 然后才是 CRLF。当前实现拒绝这种合法形式，导致某些服务器发送的 multipart
+                    // 响应解析失败。
+                    size_t pad = after;
+                    while (pad < buffer_.size() &&
+                           (buffer_[pad] == ' ' || buffer_[pad] == '\t')) {
+                        ++pad;
+                    }
+                    if (pad + 1 < buffer_.size() && buffer_[pad] == '\r' &&
+                        buffer_[pad + 1] == '\n') {
+                        suff = pad - after + 2;
+                    } else {
+                        if (!emit(pos + 1)) break;
+                        if (state_ == State::Failed) break;
+                        continue;
+                    }
                 }
 
                 if (state_ == State::Data) {

@@ -172,9 +172,21 @@ namespace megohttp {
         self->read_cb_ = nullptr;
 
         if (ec) {
-            if (ec == asio::error::eof || ec == asio::error::connection_reset) {
+            // Only a real EOF is "the peer closed the connection cleanly". A
+            // reset is a transport failure: the message may have been truncated,
+            // and reporting it as EOF would let a Content-Length or chunked body
+            // look complete when half of it never arrived. libuv distinguishes
+            // these two cases; this backend must do the same or the two backends
+            // disagree about what a truncated response is.
+            if (ec == asio::error::eof) {
                 self->open_ = false;
                 if (cb) cb(string_view{});   // empty view = clean EOF
+            } else if (ec == asio::error::connection_reset) {
+                self->open_ = false;
+                if (cb) {
+                    cb(Error{ErrorCode::ConnectionReset, ErrorPhase::Receive,
+                             string("connection reset by peer")});
+                }
             } else {
                 self->open_ = false;
                 if (cb) {
@@ -276,6 +288,10 @@ namespace megohttp {
 
             std::atomic<bool> finished{false};
             std::atomic<size_t> remaining{0};
+            // Attempts currently connecting. Bounded by max_concurrent_attempts.
+            std::atomic<size_t> in_flight{0};
+            // First address not yet started; survives the transient pump objects.
+            size_t cursor{0};
             std::shared_ptr<Timer> deadline_timer;
 
             std::mutex m;
@@ -376,51 +392,98 @@ namespace megohttp {
                 if (s->remaining.load() == 0) s->self_hold.reset();
             });
 
-        for (size_t i = 0; i < st->addresses.size(); ++i) {
-            const ResolvedAddress address = st->addresses[i];
-            const Duration delay = options.attempt_delay * static_cast<int64_t>(i);
-            auto attempt = [weak, address] {
-                auto s = weak.lock();
-                if (!s || s->finished.load()) return;
+        // Same pump as the libuv backend: at most max_concurrent_attempts
+        // connecting at once, and every unstarted address is counted down when
+        // the race is decided so the self-hold is released. The two backends have
+        // to agree here, otherwise "which address was attempted" depends on the
+        // build.
+        struct RacePump {
+            std::shared_ptr<detail::RaceState> st;
+
+            static size_t cap_of(const detail::RaceState& s) {
+                return s.options.max_concurrent_attempts == 0
+                           ? s.addresses.size()
+                           : s.options.max_concurrent_attempts;
+            }
+
+            void pump_next() {
+                auto& s = *st;
+                if (s.finished.load()) {
+                    const size_t skipped = s.addresses.size() - s.cursor;
+                    s.cursor = s.addresses.size();
+                    if (skipped != 0) s.remaining.fetch_sub(skipped);
+                    if (s.remaining.load() == 0) s.self_hold.reset();
+                    return;
+                }
+                if (s.cursor >= s.addresses.size()) return;
+                if (s.in_flight.load() >= cap_of(s)) return;
+
+                const size_t index = s.cursor++;
+                const ResolvedAddress address = s.addresses[index];
+                const Duration delay = s.options.attempt_delay * static_cast<int64_t>(index);
+                s.in_flight.fetch_add(1);
+
+                if (delay == Duration::zero()) {
+                    auto self = st;
+                    s.executor->post([self, address]() { RacePump{self}.run_one(address); });
+                } else {
+                    auto self = st;
+                    s.executor->schedule_after(
+                        delay, [self, address]() { RacePump{self}.run_one(address); });
+                }
+                // Fill the pipeline up to the cap rather than starting one
+                // attempt per completion, which would serialise the race.
+                pump_next();
+            }
+
+            void run_one(const ResolvedAddress& address) {
+                auto s = st;
+                if (s->finished.load()) {
+                    s->in_flight.fetch_sub(1);
+                    if (s->remaining.fetch_sub(1) == 1) s->self_hold.reset();
+                    return;
+                }
 
                 auto stream = std::make_shared<TcpStream>(s->executor, address,
                                                           s->options.connect_timeout);
-                stream->start([weak, stream](VoidResult ready) mutable {
-                    auto s2 = weak.lock();
-                    if (!s2) return;
-
+                stream->start([s, stream](VoidResult ready) mutable {
+                    s->in_flight.fetch_sub(1);
                     if (!ready) {
                         {
-                            std::lock_guard<std::mutex> lk(s2->m);
-                            s2->last_error = ready.error();
+                            std::lock_guard<std::mutex> lk(s->m);
+                            s->last_error = ready.error();
                         }
-                        if (s2->remaining.fetch_sub(1) == 1) {
+                        if (s->remaining.fetch_sub(1) == 1) {
                             Error e;
                             {
-                                std::lock_guard<std::mutex> lk(s2->m);
-                                e = s2->last_error;
+                                std::lock_guard<std::mutex> lk(s->m);
+                                e = s->last_error;
                             }
-                            detail::race_finish(s2, e);
-                            s2->self_hold.reset();
+                            detail::race_finish(s, e);
+                            s->self_hold.reset();
+                        } else {
+                            auto again = s;
+                            s->executor->post([again]() { RacePump{again}.pump_next(); });
                         }
                         return;
                     }
                     std::shared_ptr<AsyncByteStream> as_stream = stream;
-                    const bool last = (s2->remaining.fetch_sub(1) == 1);
-                    detail::race_finish(s2, std::move(as_stream));
-                    // Released here, by the last attempt, not inside race_finish:
-                    // a late attempt must still find `st` alive to reach the
-                    // loser path above.
-                    if (last) s2->self_hold.reset();
+                    const bool last = (s->remaining.fetch_sub(1) == 1);
+                    detail::race_finish(s, std::move(as_stream));
+                    // Released by the last attempt, not inside race_finish: a late
+                    // attempt must still find `st` alive for the loser path.
+                    if (last) {
+                        s->self_hold.reset();
+                    } else {
+                        auto again = s;
+                        s->executor->post([again]() { RacePump{again}.pump_next(); });
+                    }
                 });
-            };
-
-            if (delay == Duration::zero()) {
-                executor->post(attempt);
-            } else {
-                executor->schedule_after(delay, attempt);
             }
-        }
+        };
+
+        st->cursor = 0;
+        executor->post([st]() { RacePump{st}.pump_next(); });
     }
 
 } // namespace megohttp

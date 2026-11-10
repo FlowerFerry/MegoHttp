@@ -33,6 +33,21 @@ namespace libuv_backend {
         if (node_) node_->owner = weak_from_this();
     }
 
+    inline void UvTimer::set_dispatch(std::function<void(std::function<void()>)> post,
+                                       std::function<bool()> on_loop_thread) {
+        post_ = std::move(post);
+        on_loop_thread_ = std::move(on_loop_thread);
+    }
+
+    // Closes the handle. Must already be on the loop thread, and the caller must
+    // hold a reference that outlives this call.
+    inline void UvTimer::stop_and_close_locked() {
+        if (!node_) return;
+        if (uv_is_closing(reinterpret_cast<uv_handle_t*>(&node_->handle))) return;
+        uv_timer_stop(&node_->handle);
+        uv_close(reinterpret_cast<uv_handle_t*>(&node_->handle), &UvTimer::on_closed);
+    }
+
     inline UvTimer::~UvTimer() {
         cancelled_.store(true);
         if (!node_) return;
@@ -41,16 +56,49 @@ namespace libuv_backend {
         node_->owner.reset();
         // The Node keeps itself alive from here on: `self` is only cleared by
         // on_closed, i.e. after libuv has finished with the handle.
-        if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&node_->handle))) {
-            uv_timer_stop(&node_->handle);
-            uv_close(reinterpret_cast<uv_handle_t*>(&node_->handle), &UvTimer::on_closed);
+
+        // uv_timer_stop / uv_close are handle operations and are not thread safe
+        // (libuv: "The libuv event loop (or any other handle API) is not
+        // thread-safe except where stated otherwise"). Off the loop thread the
+        // close is posted, and the posted item holds the Node so its storage
+        // outlives the call.
+        if (on_loop_thread_ && on_loop_thread_()) {
+            stop_and_close_locked();
+            return;
         }
+        if (post_) {
+            auto node = node_;
+            post_([node]() {
+                if (uv_is_closing(reinterpret_cast<uv_handle_t*>(&node->handle))) return;
+                uv_timer_stop(&node->handle);
+                uv_close(reinterpret_cast<uv_handle_t*>(&node->handle), &UvTimer::on_closed);
+            });
+            return;
+        }
+        // No dispatch installed (a timer built outside the executor) and not on
+        // the loop thread: closing here would be the very race this guards
+        // against. Leaving it to on_closed is impossible without a close, so the
+        // handle is abandoned rather than touched unsafely; this path only exists
+        // for a timer that was never armed by the executor.
     }
 
     inline void UvTimer::cancel() {
         if (cancelled_.exchange(true)) return;
-        if (node_ && !uv_is_closing(reinterpret_cast<uv_handle_t*>(&node_->handle))) {
-            uv_timer_stop(&node_->handle);
+        if (!node_) return;
+
+        // Same rule as the destructor: stop is a handle operation.
+        if (on_loop_thread_ && on_loop_thread_()) {
+            if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&node_->handle))) {
+                uv_timer_stop(&node_->handle);
+            }
+            return;
+        }
+        if (post_) {
+            auto node = node_;
+            post_([node]() {
+                if (uv_is_closing(reinterpret_cast<uv_handle_t*>(&node->handle))) return;
+                uv_timer_stop(&node->handle);
+            });
         }
     }
 
@@ -280,6 +328,11 @@ namespace libuv_backend {
             // arm() must run through the shared_ptr: weak_from_this() is still
             // empty inside the constructor.
             real->arm();
+            // Cross-thread cancel / destruction needs to post back here.
+            auto* self = this;
+            real->set_dispatch(
+                [self](std::function<void()> job) { self->post(std::move(job)); },
+                [self]() { return self->is_in_loop_thread(); });
             timer->attach(real);
         });
         return timer;

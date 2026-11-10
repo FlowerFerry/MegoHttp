@@ -112,6 +112,11 @@ namespace megohttp {
         struct RequestState : std::enable_shared_from_this<RequestState> {
             std::shared_ptr<Executor> executor;
             std::shared_ptr<Resolver> resolver;
+            std::shared_ptr<CookieJar> cookie_jar;
+            // The URL this attempt is actually talking to. Differs from the
+            // request's text after a redirect, and it is what the cookie jar
+            // judges domain / path / Secure against.
+            std::optional<Url> current_url;
             ClientOptions options;
             Request request;
             Client::ResponseCallback on_complete;
@@ -126,6 +131,9 @@ namespace megohttp {
             // True when the request head carried Expect: 100-continue and the body
             // must wait for a 100 answer (S3.1-09).
             bool expect_continue_sent{false};
+            // True when the request body is sent chunk-framed (a BodySource with
+            // no caller-supplied framing header). The sender wraps every piece.
+            bool body_chunked{false};
 
             // Held while the exchange is live so the stream outlives its callbacks.
             std::shared_ptr<AsyncByteStream> stream;
@@ -240,7 +248,17 @@ namespace megohttp {
                 // Fire the user callback FIRST, then the retirement notice.
                 // shutdown(cb) waits for all retired callbacks before firing its
                 // drained signal, so the user callback must complete first.
-                if (cb) cb(std::move(result));
+                //
+                // Guarded: this runs inside an event-loop handler, and an
+                // exception escaping from here would unwind through libuv/Asio
+                // and skip the retirement notice below -- leaving shutdown(cb)
+                // waiting forever.
+                try {
+                    if (cb) cb(std::move(result));
+                } catch (...) {
+                    // A throwing completion callback must not corrupt the loop.
+                    // The request is already retired; nothing else to report.
+                }
                 if (retired) retired();
             }
 
@@ -405,9 +423,23 @@ namespace megohttp {
 
             // Streaming body: pull chunks from BodySource and write them.
             // Backpressure: empty chunk from Source means "not ready, retry later".
+            //
+            // When the request is chunk-framed every piece is wrapped:
+            //     "<hex size>\r\n<bytes>\r\n"
+            // and the terminator is emitted once at EOF. Sending the raw bytes
+            // without the wrapper would make the server read them as a new
+            // response, which is worse than failing.
             void send_body_streaming() {
                 auto& src = *state_->request.body_source();
-                auto r = src();
+                Result<std::pair<string_view, bool>> r = Error{
+                    ErrorCode::Unknown, ErrorPhase::None, string("body source threw")};
+                try {
+                    r = src();
+                } catch (...) {
+                    fail(Error{ErrorCode::Unknown, ErrorPhase::Send,
+                               string("request body source threw an exception")});
+                    return;
+                }
                 if (!r) { fail(r.error()); return; }
 
                 auto& [data, eof] = r.value();
@@ -423,27 +455,53 @@ namespace megohttp {
                 if (!data.empty()) {
                     auto self = shared_from_this();
                     auto stream = state_->stream;
-                    // Must keep data alive until async_write completes.
-                    auto buf = std::make_shared<string>(to_string(data));
+                    // The wire form is built into an owned buffer that stays
+                    // alive until the write completes.
+                    auto buf = std::make_shared<string>(
+                        state_->body_chunked
+                            ? chunked::encode_chunk(
+                                  reinterpret_cast<const uint8_t*>(data.data()),
+                                  static_cast<size_t>(data.size()))
+                            : to_string(data));
                     stream->async_write(
                         reinterpret_cast<const uint8_t*>(buf->data()), buf->size(),
                         [self, buf, eof](Result<size_t> w) {
                             (void)buf; // keep alive
                             if (!w) { self->fail(w.error()); return; }
                             if (eof) {
-                                self->disarm_send_timer();
-                                self->arm_recv_timer();
-                                self->read_more();
+                                self->finish_body_streaming();
                             } else {
                                 self->send_body_streaming();
                             }
                         });
                 } else if (eof) {
-                    // Empty body with eof.
+                    finish_body_streaming();
+                }
+            }
+
+            // Emits the chunked terminator (when chunk-framed) and moves on to
+            // reading the response.
+            void finish_body_streaming() {
+                if (!state_->body_chunked) {
                     disarm_send_timer();
                     arm_recv_timer();
                     read_more();
+                    return;
                 }
+                auto self = shared_from_this();
+                auto stream = state_->stream;
+                auto tail = chunked::encode_last_chunk(nullptr);
+                if (!tail) { fail(tail.error()); return; }
+                auto last = std::make_shared<string>(std::move(tail.value()));
+                stream->async_write(
+                    reinterpret_cast<const uint8_t*>(last->data()), last->size(),
+                    [self, last](Result<size_t> w) {
+                        (void)last;
+                        if (!w) { self->fail(w.error()); return; }
+                        self->disarm_send_timer();
+                        self->arm_recv_timer();
+                        self->read_more();
+                    });
             }
 
             // --- ResponseParser::Callbacks ---
@@ -490,6 +548,23 @@ namespace megohttp {
                 // request. From here on a retry could duplicate its effect.
                 state_->response_started = true;
                 state_->last_status = head.status_code;
+
+                // Cookies (S5.5). Stored BEFORE the redirect branch below, so a
+                // 3xx that sets a cookie still records it: the next hop's Cookie
+                // header is rebuilt from the jar, and losing this would drop a
+                // session the server just established.
+                //
+                // Each Set-Cookie header is applied separately. They cannot be
+                // comma-joined: an Expires value contains a comma.
+                if (state_->cookie_jar && state_->current_url) {
+                    for (const auto& v : head.headers.get_all("set-cookie")) {
+                        // A rejected cookie (public suffix, wrong domain, Secure
+                        // over http) must not fail the request: the response is
+                        // still valid, the cookie is simply not ours to keep.
+                        (void)state_->cookie_jar->set_from_header(*state_->current_url, v);
+                    }
+                }
+
                 // Retry-After is resolved here, while the Date header is still
                 // at hand: a date-form value only becomes a delay against the
                 // server's own Date, never against the local clock.
@@ -542,6 +617,31 @@ namespace megohttp {
                 if (auto& bs = state_->request.body_sink()) {
                     body_sink_ = bs;
                     body_sink_complete_ = state_->request.body_sink_complete();
+                    // The caller still needs the status line, headers and framing
+                    // facts; without this the streamed path returned a default
+                    // Response and every one of those vanished.
+                    head_ = std::move(rh);
+
+                    // Backpressure plumbing. resume() comes from the caller's
+                    // thread, so it posts back onto the executor before touching
+                    // the stream.
+                    sink_flow_ = state_->request.body_sink_flow();
+                    if (sink_flow_) {
+                        sink_paused_ = sink_flow_->is_paused() ? true : false;
+                        std::weak_ptr<Exchange> weak = shared_from_this();
+                        auto exec = state_->executor;
+                        sink_flow_->set_wake([weak, exec]() {
+                            if (!exec) return;
+                            exec->post([weak]() {
+                                auto self = weak.lock();
+                                if (!self || self->complete_) return;
+                                if (self->sink_paused_) {
+                                    self->sink_paused_ = false;
+                                    self->read_more();
+                                }
+                            });
+                        });
+                    }
                 } else {
                     buffer_sink_ = std::make_unique<BufferSink>(std::move(rh),
                                                          state_->options.max_response_body);
@@ -571,10 +671,25 @@ namespace megohttp {
                 // S3.2-02: Streaming mode
                 if (body_sink_) {
                     auto sv = string_view(reinterpret_cast<const char*>(data), size);
-                    if (!(*body_sink_)(sv)) {
-                        // Backpressure: sink asked to pause.
-                        // For now we don't pause the parser; we just continue.
-                        // Full backpressure would require parser pause/resume.
+                    // A throwing sink must not unwind through the parser/loop.
+                    bool keep_going = true;
+                    try {
+                        keep_going = (*body_sink_)(sv);
+                    } catch (...) {
+                        keep_going = false;
+                    }
+                    if (!keep_going) {
+                        // The sink asked to pause. With a flow attached the read
+                        // loop stops here and only restarts on resume(); without
+                        // one there is no way to signal a resume, so the
+                        // historical "keep going" behaviour is the only
+                        // non-hanging option.
+                        if (sink_flow_) {
+                            sink_paused_ = true;
+                            // The flow's own flag must agree, otherwise resume()
+                            // sees "was not paused" and never fires the wake-up.
+                            sink_flow_->pause();
+                        }
                     }
                 }
                 return VoidResult{};
@@ -628,11 +743,17 @@ namespace megohttp {
                     auto response = buffer_sink_->finish();
                     state_->finish(std::move(response));
                 } else if (body_sink_complete_) {
-                    // S3.2-02: Streaming mode complete.
+                    // S3.2-02: Streaming mode complete. The caller gets the head
+                    // it was promised; the body went to its sink, so body_bytes()
+                    // stays empty and body_is_buffered() is false.
                     (*body_sink_complete_)(VoidResult{});
-                    state_->finish(Response{});  // Empty response, data already delivered
+                    ResponseHead rh = head_ ? std::move(*head_) : ResponseHead{};
+                    Response out(std::move(rh), {});
+                    out.set_body_streamed();
+                    state_->finish(std::move(out));
                 } else {
-                    state_->finish(Response{});
+                    ResponseHead rh = head_ ? std::move(*head_) : ResponseHead{};
+                    state_->finish(Response(std::move(rh), {}));
                 }
                 return VoidResult{};
             }
@@ -681,6 +802,9 @@ namespace megohttp {
                             reinterpret_cast<const uint8_t*>(sv.data()), sv.size());
                         if (!res) { self->fail(res.error()); return; }
                         if (self->complete_) return;
+                        // A sink that paused inside this feed() must not be
+                        // handed more data. Resume restarts the loop.
+                        if (self->sink_paused_) return;
                         self->read_more();
                     });
             }
@@ -688,7 +812,20 @@ namespace megohttp {
             void fail(const Error& e) {
                 disarm_send_timer();
                 disarm_recv_timer();
+                // A streaming caller was promised exactly one completion
+                // notification. A cancel, timeout, EOF or parse error used to
+                // leave it waiting forever, because only the success path called
+                // it.
+                notify_sink_failed(e);
                 state_->fail(e);
+            }
+
+            // Delivers the streaming-mode terminal error, at most once.
+            void notify_sink_failed(const Error& e) {
+                if (!body_sink_complete_) return;
+                auto cb = std::move(*body_sink_complete_);
+                body_sink_complete_.reset();
+                if (cb) cb(VoidResult{e});
             }
 
             std::shared_ptr<RequestState> state_;
@@ -700,6 +837,14 @@ namespace megohttp {
             // Streaming mode: user-provided callbacks. Mutually exclusive with buffer_sink_.
             std::optional<Request::BodySink> body_sink_;
             std::optional<Request::BodySinkComplete> body_sink_complete_;
+            // Backpressure: set when the caller asked for flow control. Absent
+            // means a `false` from the sink cannot be honoured (nothing could
+            // ever resume it), so delivery continues as before.
+            std::shared_ptr<Request::BodySinkFlow> sink_flow_;
+            bool sink_paused_{false};
+            // Head kept for the streaming path, where there is no BufferSink to
+            // carry it to the caller.
+            std::optional<ResponseHead> head_;
             bool complete_{false};
             // Expect: 100-continue bookkeeping (S3.1-09).
             bool expect_continue_pending_{false};
@@ -811,9 +956,29 @@ namespace megohttp {
                 // which is exactly what makes the no-pool path safe).
                 headers.set("connection", pooling ? "keep-alive" : "close");
             }
-            if (req.has_body() && !headers.contains("content-length")) {
-                headers.set("content-length",
-                            to_view(format("{}", req.body_bytes().size())));
+            // Body framing. Three distinct cases, and conflating them is how a
+            // request ends up lying about its own shape:
+            //
+            //   no body            -> neither header
+            //   buffered bytes     -> Content-Length: <exact size>
+            //   BodySource (stream)-> Transfer-Encoding: chunked, because the
+            //                         length is not known before sending. Writing
+            //                         "Content-Length: 0" here (which is what
+            //                         body_bytes().size() yields for a stream)
+            //                         would tell the server the message ends
+            //                         immediately and then send bytes anyway.
+            //
+            // A caller-supplied Content-Length or Transfer-Encoding wins: it is
+            // an explicit assertion about the body and is not second-guessed.
+            const bool has_te = headers.contains("transfer-encoding");
+            const bool has_cl = headers.contains("content-length");
+            if (req.has_body() && !has_cl && !has_te) {
+                if (req.body_source().has_value()) {
+                    headers.set("transfer-encoding", "chunked");
+                } else {
+                    headers.set("content-length",
+                                to_view(format("{}", req.body_bytes().size())));
+                }
             }
             if (expect_continue && !headers.contains("expect")) {
                 headers.set("expect", "100-continue");
@@ -885,9 +1050,46 @@ namespace megohttp {
                     if (auto sp = w.lock()) live.push_back(std::move(sp));
                 in_flight_.clear();
             }
-            for (auto& st : live)
-                st->finish(Error{ErrorCode::Cancelled, ErrorPhase::None,
-                                 string("client is shutting down")});
+
+            // Retire on the I/O thread, not on the caller's. finish() runs the
+            // user callback, touches the pool and closes the stream; every one of
+            // those belongs to the loop thread, and libuv handle operations are
+            // not thread safe.
+            //
+            // Ordering matters: when this Client owns the executor, stopping the
+            // loop is itself posted as the LAST retirement job. Stopping it here
+            // and now would abandon every retirement queued ahead of it, and a
+            // caller would never see the terminal callbacks shutdown() promises.
+            if (!live.empty()) {
+                std::shared_ptr<Executor> ex = executor;
+                if (ex) {
+                    // A latch that fires after the LAST retirement has run, so a
+                    // shutdown that owns the loop can wait for those callbacks
+                    // before tearing the loop down. Without it, stopping the loop
+                    // here would abandon every retirement queued ahead of it.
+                    auto done = std::make_shared<std::promise<void>>();
+                    auto fut = done->get_future();
+                    for (size_t i = 0; i < live.size(); ++i) {
+                        auto st = live[i];
+                        const bool is_last = (i + 1 == live.size());
+                        ex->post([st, is_last, done] {
+                            st->finish(Error{ErrorCode::Cancelled, ErrorPhase::None,
+                                             string("client is shutting down")});
+                            if (is_last) done->set_value();
+                        });
+                    }
+                    if (owns_executor && !ex->is_in_loop_thread()) {
+                        // Bounded: a handler that blocks forever must not turn a
+                        // shutdown into a hang.
+                        (void)fut.wait_for(std::chrono::seconds(5));
+                    }
+                } else {
+                    for (auto& st : live) {
+                        st->finish(Error{ErrorCode::Cancelled, ErrorPhase::None,
+                                         string("client is shutting down")});
+                    }
+                }
+            }
 
             // Retire pooled state: waiters get a terminal error, idle
             // connections close. In-flight exchanges close their own connection
@@ -917,6 +1119,7 @@ namespace megohttp {
             st->self_hold = st;
             st->executor = executor;
             st->resolver = resolver;
+            st->cookie_jar = options.cookie_jar;
             st->options = options;
             st->pool = pool;
 
@@ -928,9 +1131,31 @@ namespace megohttp {
             st->on_complete = std::move(on_complete);
 
             // Track in-flight so shutdown() can retire this request (S2.6-02/04).
+            //
+            // The insert and the `stopped` test happen under one lock: checking
+            // `stopped` in the caller and inserting here were separate steps, so a
+            // shutdown between them left the request registered against a stopped
+            // client and it was never retired -- no terminal callback at all.
+            bool retired_here = false;
             {
                 std::lock_guard<std::mutex> lk(m_);
-                in_flight_.push_back(st);
+                if (stopped.load()) {
+                    retired_here = true;
+                } else {
+                    in_flight_.push_back(st);
+                }
+            }
+            if (retired_here) {
+                // Deliver the terminal result without enqueueing work on a
+                // stopped executor.
+                auto cb = std::move(st->on_complete);
+                st->finished.store(true);
+                st->self_hold.reset();
+                if (cb) {
+                    cb(Error{ErrorCode::Cancelled, ErrorPhase::None,
+                             string("client is shut down")});
+                }
+                return;
             }
             st->on_retired = [this] { this->maybe_notify_drained(); };
 
@@ -1138,6 +1363,7 @@ namespace megohttp {
             }
 #endif
             st->request.set_parsed_url(url);
+            st->current_url = url;
 
             // Pool key: every fact that affects the security boundary. Proxy
             // and TLS token fields stay empty until those layers land; adding them
@@ -1197,11 +1423,31 @@ namespace megohttp {
             }
 
             st->phase = detail::RequestPhase::BuildHead;
+            // Cookies (S5.5). Applied here rather than inside build_request_head
+            // because the jar needs the resolved Url and the Request is the thing
+            // that carries the headers. The jar decides what to send:
+            // domain / path / Secure, all judged against this URL.
+            //
+            // A jar-configured client rebuilds the header from scratch on every
+            // hop, including a same-origin redirect: the path changed, and a
+            // cookie scoped to the old path must not follow. A caller-supplied
+            // Cookie header (no jar) is left alone -- it was set deliberately.
+            if (st->cookie_jar) {
+                st->request.headers().remove("cookie");
+                const string value = st->cookie_jar->cookie_header(url);
+                if (!value.empty()) {
+                    st->request.headers().set("cookie", to_view(value));
+                }
+            }
             // Expect: 100-continue only makes sense when there is a body to hold
-            // back. Record the decision once so the head and the exchange agree.
+            // back. A BodySource counts: its bytes are not in body_bytes(), so
+            // testing that alone made Expect never fire for a streamed upload.
+            const bool body_carries_bytes =
+                st->request.body_source().has_value() ||
+                !st->request.body_bytes().empty();
             st->expect_continue_sent = st->options.expect_continue
                                     && st->request.has_body()
-                                    && !st->request.body_bytes().empty();
+                                    && body_carries_bytes;
             // Absolute-form is used only when an HTTP-speaking proxy relays a
             // cleartext target. A secure target goes through CONNECT and then
             // uses origin-form inside the tunnel.
@@ -1212,6 +1458,14 @@ namespace megohttp {
                                                    st->pool != nullptr, forward_proxy,
                                                    st->proxy);
             if (!head) { st->finish(head.error()); return; }
+            // Whether the body must be chunk-framed. Same three-case decision the
+            // head builder made; recorded on the state so the sender wraps each
+            // piece identically. A caller-supplied header was honoured there, so
+            // it is honoured here too.
+            st->body_chunked = st->request.has_body() &&
+                               st->request.body_source().has_value() &&
+                               !st->request.headers().contains("content-length") &&
+                               !st->request.headers().contains("transfer-encoding");
 
             std::weak_ptr<detail::RequestState> weak = st;
             const string host = url.host;
@@ -1818,6 +2072,11 @@ namespace megohttp {
                                string("failed to create the TLS stream")});
                 return;
             }
+            // Tag this layer as the TARGET one. Without it a target certificate
+            // failure is reported as the generic TlsHandshake phase, so a caller
+            // cannot tell a target identity problem from a proxy one -- which is
+            // the whole point of the phase split (task book 9.3).
+            tls->set_error_phase(ErrorPhase::TargetTls, ErrorPhase::TargetProtocol);
             st->tls_stream = tls;
 
             std::weak_ptr<detail::RequestState> weak = st;

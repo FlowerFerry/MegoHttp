@@ -15,10 +15,14 @@ namespace megohttp {
     //     turn a UTF-8 domain into its ASCII A-label form ("中文.com" ->
     //     "xn--fiq228c.com"). It does NOT implement the full IDNA2008 Unicode
     //     tables (bidi rules, contextual joining, script mixing, NFC folding).
-    //   • Therefore: a domain that survives conversion is safe to put on the wire;
-    //     exotic cases that IDNA2008 would reject may be accepted here. Callers
-    //     who need full conformance must pre-convert with a real IDNA library --
-    //     this is a convenience for the common case, not a claim of completeness.
+    //   • Because of that, parse_url() REJECTS a non-ASCII host by default
+    //     (task book 5.4.1 forbids an incomplete conversion). Convert with a
+    //     conforming IDNA library first and pass the A-label; that path goes
+    //     through the normal ASCII host checks.
+    //   • These functions remain available for callers that have decided the
+    //     subset is enough for their input. A domain that survives conversion is
+    //     safe to put on the wire; exotic cases IDNA2008 would reject may be
+    //     accepted here, which is why the URL parser does not call it implicitly.
     //   • Already-encoded A-labels ("xn--...") pass through unchanged, so the
     //     function is idempotent.
     // ---------------------------------------------------------------------------

@@ -167,7 +167,12 @@ namespace megohttp {
         string encode_chunk(const uint8_t* data, size_t size);
 
         // Terminating chunk: "0\r\n" + optional trailers + "\r\n"
-        string encode_last_chunk(const Headers* trailers = nullptr);
+        //
+        // Returns an error when a trailer name or value could not be written as
+        // a header line. Trailer values are attacker-influenced in the same way
+        // header values are, so an unchecked CR/LF there splits the chunked body
+        // exactly like it splits a head.
+        Result<string> encode_last_chunk(const Headers* trailers = nullptr);
 
         // Parsed chunk size line: hex digits with optional ;ext
         Result<uint64_t> parse_chunk_size(string_view line);

@@ -12,6 +12,7 @@
 #include <megohttp/error.hpp>
 #include <megohttp/format.hpp>
 #include <megohttp/idna.hpp>
+#include <megohttp/request.hpp>
 
 #include <cstdio>
 #include <cstring>
@@ -149,12 +150,20 @@ TEST_CASE("url rejects", "[core]") {
     CHECK(parse_url("http://example.com:abc/").has_error());   // non-numeric port
     CHECK(parse_url("http://example..com/").has_error());   // empty label
     CHECK(parse_url("http://example.com./").has_error());   // trailing dot
-    // A non-ASCII host is now converted to its A-label form rather than rejected
-    // (see test_idna for the conversion itself).
+    // A Unicode host is REJECTED, not converted: the built-in subset is not a
+    // conforming IDNA2008 implementation, and task book 5.4.1 forbids an
+    // incomplete conversion. The caller converts with a real library and passes
+    // the A-label, which then takes the normal ASCII path.
     {
         auto r = parse_url("http://\xE4\xB8\xAD\xE6\x96\x87.com/");
-        CHECK(r.has_value());
-        if (r) CHECK(s_eq(r.value().host, "xn--fiq228c.com"));
+        CHECK_FALSE(r.has_value());
+        CHECK(r.error().code() == ErrorCode::InvalidArgument);
+    }
+    // The already-encoded form is accepted and reaches DNS as an ASCII name.
+    {
+        auto r = parse_url("http://xn--fiq228c.com/");
+        REQUIRE(r.has_value());
+        CHECK(s_eq(r.value().host, "xn--fiq228c.com"));
     }
     // Invalid UTF-8 in the host is still rejected.
     CHECK(parse_url("http://\xFF\xFE.com/").has_error());
@@ -178,9 +187,102 @@ TEST_CASE("url targets", "[core]") {
     if (!r) return;
     CHECK(s_eq(r.value().request_target(), "/v1/items?page=2"));
     CHECK(s_eq(r.value().origin(), "https://api.example.com:8443"));
-    CHECK(s_eq(r.value().absolute_form_target(), "http://api.example.com:8443/v1/items?page=2"));
+    // The absolute form keeps the URL's own scheme. A hardcoded "http://" here
+    // rewrote an https URL into http:// in every caller that rebuilt the URL
+    // from this string -- a silent transport downgrade.
+    CHECK(s_eq(r.value().absolute_form_target(),
+               "https://api.example.com:8443/v1/items?page=2"));
     CHECK(r.value().is_secure());
     CHECK(!r.value().is_websocket());
+}
+
+TEST_CASE("a parsed https URL survives a store and reread", "[core][url]") {
+    auto r = parse_url("https://api.example.com:8443/v1/items?page=2");
+    REQUIRE(r.has_value());
+
+    Request req;
+    REQUIRE(req.set_parsed_url(r.value()));
+
+    // Reading the URL back must still say https. Storing a proxy request-target
+    // form here used to come back as "http://...", and the next submit() would
+    // parse that and open a cleartext connection.
+    CHECK(s_eq(to_string(req.url()), "https://api.example.com:8443/v1/items?page=2"));
+
+    // Re-parsing what we stored must yield the same scheme and origin.
+    auto again = parse_url(req.url());
+    REQUIRE(again.has_value());
+    CHECK(again.value().is_secure());
+    CHECK(s_eq(again.value().origin(), "https://api.example.com:8443"));
+}
+
+// ---------------------------------------------------------------------------
+// IPv6 literals
+//
+// "Inside brackets" was treated as "is an IPv6 address", so [not:an:ipv6]
+// parsed successfully and then skipped DNS, going to connect() as if it were an
+// address. The literal check has to be real.
+// ---------------------------------------------------------------------------
+TEST_CASE("an IPv6 literal is validated, not merely bracketed", "[core][url][ipv6]") {
+    // Well-formed forms.
+    bool v6 = false;
+    CHECK(is_ip_literal("::1", &v6));
+    CHECK(v6);
+    CHECK(is_ip_literal("::", &v6));
+    CHECK(v6);
+    CHECK(is_ip_literal("2001:db8::1", &v6));
+    CHECK(v6);
+    CHECK(is_ip_literal("fe80::1:2:3:4", &v6));
+    CHECK(v6);
+    CHECK(is_ip_literal("::ffff:192.168.1.1", &v6));
+    CHECK(v6);
+    CHECK(is_ip_literal("2001:0db8:0000:0000:0000:0000:0000:0001", &v6));
+    CHECK(v6);
+
+    // Not well-formed.
+    CHECK_FALSE(is_ip_literal("not:an:ipv6", &v6));
+    CHECK_FALSE(is_ip_literal("1:2:3", &v6));               // too few, no "::"
+    CHECK_FALSE(is_ip_literal("1:2:3:4:5:6:7:8:9", &v6));  // too many
+    CHECK_FALSE(is_ip_literal("12345::1", &v6));            // group > 4 hex
+    CHECK_FALSE(is_ip_literal("::1::2", &v6));              // two "::"
+    CHECK_FALSE(is_ip_literal("1::2::3:4:5:6:7", &v6));
+    CHECK_FALSE(is_ip_literal("gggg::1", &v6));             // not hex
+    CHECK_FALSE(is_ip_literal("1:2:3:4:5:6:7:", &v6));      // trailing single ':'
+
+    // And through the URL parser, a bogus bracketed host is rejected rather
+    // than accepted as a literal.
+    CHECK_FALSE(parse_url("http://[not:an:ipv6]/p").has_value());
+    auto good = parse_url("http://[::1]:8080/p");
+    REQUIRE(good.has_value());
+    CHECK(good.value().is_ipv6_literal);
+    CHECK(good.value().port == 8080);
+    CHECK(s_eq(good.value().host, "::1"));
+}
+
+// ---------------------------------------------------------------------------
+// Request body modes are mutually exclusive
+// ---------------------------------------------------------------------------
+TEST_CASE("setting one body mode clears the other", "[core][request]") {
+    Request req;
+    req.set_body_source([]() -> Result<std::pair<string_view, bool>> {
+        return std::make_pair(string_view{}, true);
+    });
+    CHECK(req.body_source().has_value());
+    CHECK(req.is_body_replayable() == false);
+
+    // A buffer body must replace the stream, not sit beside it.
+    req.set_body(string_view("abc", 3));
+    CHECK_FALSE(req.body_source().has_value());
+    CHECK(req.body_bytes().size() == 3);
+    CHECK(req.is_body_replayable());
+
+    // And clear_body() must drop both carriers.
+    req.set_body_source([]() -> Result<std::pair<string_view, bool>> {
+        return std::make_pair(string_view{}, true);
+    });
+    req.clear_body();
+    CHECK_FALSE(req.has_body());
+    CHECK_FALSE(req.body_source().has_value());
+    CHECK(req.body_bytes().empty());
 }
 
 TEST_CASE("headers basic", "[core]") {
@@ -499,27 +601,39 @@ TEST_CASE("idna", "[core]") {
     CHECK(idna_encode("").has_error());
     CHECK(idna_encode("a..b").has_error());          // empty label
 
-    // --- integrated into parse_url -------------------------------------------
+    // --- NOT integrated into parse_url ---------------------------------------
+    //
+    // parse_url rejects a Unicode host instead of converting it: this encoder is
+    // Punycode plus a SUBSET of IDNA2008, and task book 5.4.1 forbids relying on
+    // an incomplete conversion. A caller that wants an IDN encodes first with a
+    // conforming library and passes the A-label, which parses on the ASCII path.
     {
         auto r = parse_url("https://\xE4\xB8\xAD\xE6\x96\x87.com/path");
-        CHECK(r.has_value());
-        if (r) {
-            // The stored host is the A-label, so DNS / SNI / Host all agree.
-            CHECK(s_eq(r.value().host, "xn--fiq228c.com"));
-            CHECK(r.value().port == 443);
-            CHECK(s_eq(r.value().host_port_header(), "xn--fiq228c.com"));
-            CHECK(s_eq(r.value().request_target(), "/path"));
-            CHECK(!r.value().is_ip_literal);
-        }
+        CHECK_FALSE(r.has_value());
+        CHECK(r.error().code() == ErrorCode::InvalidArgument);
+    }
+    // The pre-encoded form parses normally and keeps every field intact.
+    {
+        auto r = parse_url("https://xn--fiq228c.com/path");
+        REQUIRE(r.has_value());
+        CHECK(s_eq(r.value().host, "xn--fiq228c.com"));
+        CHECK(r.value().port == 443);
+        CHECK(s_eq(r.value().host_port_header(), "xn--fiq228c.com"));
+        CHECK(s_eq(r.value().request_target(), "/path"));
+        CHECK(!r.value().is_ip_literal);
     }
     {
-        auto r = parse_url("http://www.b\xC3\xBC" "cher.example:8080/");
-        CHECK(r.has_value());
-        if (r) {
-            CHECK(s_eq(r.value().host, "www.xn--bcher-kva.example"));
-            CHECK(r.value().port == 8080);
-            CHECK(s_eq(r.value().host_port_header(), "www.xn--bcher-kva.example:8080"));
-        }
+        auto r = parse_url("http://www.xn--bcher-kva.example:8080/");
+        REQUIRE(r.has_value());
+        CHECK(s_eq(r.value().host, "www.xn--bcher-kva.example"));
+        CHECK(r.value().port == 8080);
+        CHECK(s_eq(r.value().host_port_header(), "www.xn--bcher-kva.example:8080"));
+    }
+    // And the encoder itself still works for a caller that asks for it directly.
+    {
+        auto e = idna_encode("www.b\xC3\xBC" "cher.example");
+        REQUIRE(e.has_value());
+        CHECK(s_eq(e.value(), "www.xn--bcher-kva.example"));
     }
     // ASCII hosts are untouched by the IDN path.
     {
@@ -617,10 +731,10 @@ TEST_CASE("parse_url rejects malformed UTF-8 in host", "[url]") {
     SECTION("valid + invalid tail") {
         CHECK(parse_url("http://\xE4\xB8\xAD\xFF.com/").has_error());  // 中 + \xFF
     }
-    SECTION("valid UTF-8 is accepted") {
+    SECTION("valid UTF-8 is rejected, not converted") {
+        // Well-formed UTF-8, but the parser does not convert it: see idna.hpp.
         auto r = parse_url("http://\xE4\xB8\xAD\xE6\x96\x87.com/");
-        REQUIRE(r.has_value());
-        REQUIRE(s_eq(r.value().host, "xn--fiq228c.com"));
+        CHECK_FALSE(r.has_value());
     }
     SECTION("mixed label: valid then bad") {
         CHECK(parse_url("http://\xE4\xB8\xAD\xE4\xB8.com/").has_error());  // 中 + truncated
