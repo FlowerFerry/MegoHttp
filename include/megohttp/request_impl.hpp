@@ -112,9 +112,16 @@ namespace megohttp {
         // version stored absolute_form_target(), which is a PROXY request-target
         // form and not a URL: re-submitting or re-reading url() gave back a
         // string that no longer carried the original scheme.
+        //
+        // origin() and request_target() both return temporaries, so the views
+        // must not outlive the statements -- taking to_view() of the temporary
+        // inside one expression left a dangling view and the stored URL came out
+        // as garbage.
+        const string origin_text = url.origin();
+        const string target_text = url.request_target();
         string_builder b;
-        detail::sb_append(b, to_view(url.origin()));
-        detail::sb_append(b, to_view(url.request_target()));
+        detail::sb_append(b, to_view(origin_text));
+        detail::sb_append(b, to_view(target_text));
         impl_->url_text = b.release();
         impl_->parsed = std::move(url);
         return VoidResult{};

@@ -182,7 +182,11 @@ TEST_CASE("the exported Windows root store is a usable trust source",
 
     REQUIRE(out.called.load());
     CHECK_FALSE(out.ok.load());
-    CHECK(static_cast<ErrorCode>(out.code.load()) == ErrorCode::TlsCertificateInvalid);
+    // The ROOT export could not be loaded as a trust source at all (OpenSSL),
+    // or it was loaded but the test CA is not in it (mbedTLS). Either way,
+    // the handshake must fail.
+    const ErrorCode code = static_cast<ErrorCode>(out.code.load());
+    CHECK((code == ErrorCode::TlsHandshakeFailed || code == ErrorCode::TlsCertificateInvalid));
 }
 #endif
 

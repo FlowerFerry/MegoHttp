@@ -475,8 +475,13 @@ namespace detail {
         // The scheme must be the URL's own. A hardcoded "http://" here rewrote
         // an https URL into http:// wherever the caller reconstructed the URL
         // from this string, which silently downgrades transport security.
-        detail::buf_append(buf, origin());
-        detail::buf_append(buf, request_target());
+        //
+        // origin() and request_target() return temporaries; buffering the result
+        // of to_view() on a temporary would copy from a dead object.
+        const string origin_text = origin();
+        const string target_text = request_target();
+        detail::buf_append(buf, to_view(origin_text));
+        detail::buf_append(buf, to_view(target_text));
         return detail::sb_release(buf);
     }
 

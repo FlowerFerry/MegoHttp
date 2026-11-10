@@ -145,7 +145,7 @@ TEST_CASE("client surfaces a certificate failure as TlsCertificateInvalid", "[tl
     auto r = c.request_sync(req);
     REQUIRE(!r);
     CHECK(r.error().code() == ErrorCode::TlsCertificateInvalid);
-    CHECK(r.error().phase() == ErrorPhase::TlsHandshake);
+    CHECK(r.error().phase() == ErrorPhase::TargetTls);
 }
 
 TEST_CASE("client surfaces a hostname mismatch separately", "[tls][client]") {
@@ -172,7 +172,7 @@ TEST_CASE("client does not silently downgrade https to http", "[tls][client]") {
 
     auto r = c.request_sync(req);
     REQUIRE(!r);
-    CHECK(r.error().phase() == ErrorPhase::TlsHandshake);
+    CHECK(r.error().phase() == ErrorPhase::TargetTls);
 }
 
 TEST_CASE("client validates a certificate signed by an intermediate CA",

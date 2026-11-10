@@ -251,37 +251,54 @@ inline bool TlsStream::Impl::init_openssl() {
             return false;
         }
     } else if (config_.verify_peer) {
-        // No explicit source: try the platform default bundle first, then fall
-        // back to the OpenSSL default paths (OPENSSLDIR). Both are REPLACEMENT
-        // sources, not additions -- the platform's default store takes over in
-        // lieu of anything else, it does not widen a previously-set trust set.
+        // No explicit source. Two different kinds of "discovered" exist and they
+        // must not be treated the same:
         //
-        // A discovered source that FAILS to load is not silently skipped: that
-        // is exactly the case where SSL_CERT_FILE points at a file that cannot
-        // be read, and quietly continuing would verify against something the
-        // caller never named.
-        string def = tls_trust::default_ca_file();
-        if (!def.empty()) {
-            if (SSL_CTX_load_verify_locations(ctx_, def.c_str(), nullptr) != 1) {
-                return false;   // explicit-by-environment source is unusable
+        //   environment (SSL_CERT_FILE / SSL_CERT_DIR)
+        //       The caller named this source. If it cannot be read, failing is
+        //       the only honest outcome -- silently verifying against something
+        //       else is how a typo'd path becomes "trust everything".
+        //
+        //   platform default (Windows ROOT export, Linux bundle)
+        //       We picked it. A Windows ROOT export legitimately contains a few
+        //       certificates OpenSSL cannot parse, and one bad entry must not
+        //       make the whole system store unusable. Fall back, and only fail
+        //       if nothing at all could be loaded.
+        const string env_file = tls_trust::env_ca_file();
+        if (!env_file.empty()) {
+            if (SSL_CTX_load_verify_locations(ctx_, env_file.c_str(), nullptr) != 1) {
+                return false;
             }
         } else {
-            // A hashed CA directory can come from SSL_CERT_DIR. It was
-            // discoverable but never passed to OpenSSL, so a caller who set only
-            // SSL_CERT_DIR got the built-in paths and no indication why their
-            // directory was ignored.
-            string dir = tls_trust::default_ca_path();
-            if (!dir.empty()) {
-                if (SSL_CTX_load_verify_locations(ctx_, nullptr, dir.c_str()) != 1) {
+            const string env_dir = tls_trust::env_ca_path();
+            if (!env_dir.empty()) {
+                if (SSL_CTX_load_verify_locations(ctx_, nullptr, env_dir.c_str()) != 1) {
                     return false;
                 }
             } else {
-                // No usable platform bundle or directory: fall back to the
-                // built-in paths, and treat a total failure as "no trust
-                // anchors", which is a setup error rather than something to
-                // discover at handshake time.
-                if (SSL_CTX_set_default_verify_paths(ctx_) != 1) {
-                    return false;
+                // Platform default. Try the bundle first, then the hashed
+                // directory, then OpenSSL's built-in paths, and accept the first
+                // one that loads.
+                bool loaded = false;
+                const string plat_file = tls_trust::system_ca_bundle_path();
+                if (!plat_file.empty()) {
+                    loaded = SSL_CTX_load_verify_locations(
+                                 ctx_, plat_file.c_str(), nullptr) == 1;
+                }
+                if (!loaded) {
+                    const string plat_dir = tls_trust::system_ca_directory();
+                    if (!plat_dir.empty()) {
+                        loaded = SSL_CTX_load_verify_locations(
+                                     ctx_, nullptr, plat_dir.c_str()) == 1;
+                    }
+                }
+                if (!loaded) {
+                    // Treat a total failure as "no trust anchors", which is a
+                    // setup error rather than something to discover at handshake
+                    // time.
+                    if (SSL_CTX_set_default_verify_paths(ctx_) != 1) {
+                        return false;
+                    }
                 }
             }
         }
@@ -440,17 +457,46 @@ inline bool TlsStream::Impl::init_mbedtls() {
     }
     if (!any_ca && config_.verify_peer) {
         // mbedTLS ships no trust store of its own, so without an explicit source
-        // it would have nothing to verify against. Use the platform bundle that
-        // tls_trust discovered (on Windows this is the system ROOT store
-        // exported to PEM). If even that is unavailable, refusing is correct:
-        // silently continuing would mean an unverified connection.
-        string def = tls_trust::default_ca_file();
-        if (!def.empty()) {
-            // Positive return = some certs failed but others parsed; see the
-            // ca_file branch above for why that must not be a hard failure.
-            const int rc = mbedtls_x509_crt_parse_file(&cacert_, def.c_str());
+        // it would have nothing to verify against. Two different kinds of
+        // "discovered" exist and they must not be treated the same:
+        //
+        //   environment (SSL_CERT_FILE / SSL_CERT_DIR)
+        //       The caller named this source. If it cannot be read, failing is
+        //       the only honest outcome.
+        //
+        //   platform default (Windows ROOT export, Linux bundle)
+        //       We picked it. A Windows ROOT export legitimately contains a few
+        //       certificates mbedTLS cannot parse, and one bad entry must not
+        //       make the whole system store unusable. Fall back, and only fail
+        //       if nothing at all could be loaded.
+        const string env_file = tls_trust::env_ca_file();
+        if (!env_file.empty()) {
+            const int rc = mbedtls_x509_crt_parse_file(&cacert_, env_file.c_str());
             if (rc < 0) return false;
             any_ca = true;
+        } else {
+            const string env_dir = tls_trust::env_ca_path();
+            if (!env_dir.empty()) {
+                const int rc = mbedtls_x509_crt_parse_path(&cacert_, env_dir.c_str());
+                if (rc < 0) return false;
+                any_ca = true;
+            } else {
+                // Platform default. Try the bundle first, then the hashed
+                // directory, and accept the first one that loads at least
+                // partially.
+                const string plat_file = tls_trust::system_ca_bundle_path();
+                if (!plat_file.empty()) {
+                    const int rc = mbedtls_x509_crt_parse_file(&cacert_, plat_file.c_str());
+                    if (rc >= 0) any_ca = true;
+                }
+                if (!any_ca) {
+                    const string plat_dir = tls_trust::system_ca_directory();
+                    if (!plat_dir.empty()) {
+                        const int rc = mbedtls_x509_crt_parse_path(&cacert_, plat_dir.c_str());
+                        if (rc >= 0) any_ca = true;
+                    }
+                }
+            }
         }
     }
     if (any_ca) {
