@@ -20,6 +20,10 @@ namespace megohttp {
         std::optional<Request::BodySink> body_sink;
         std::optional<Request::BodySinkComplete> body_sink_complete;
         std::shared_ptr<Request::BodySinkFlow> body_sink_flow;
+        // Content coding. Upload compression is opt-in; response decoding is on
+        // by default because Accept-Encoding is sent by this library.
+        Request::Compression compress{Request::Compression::None};
+        bool decode_response{true};
     };
 
     // Shared pause/resume flag for a streaming download. Deliberately tiny: an
@@ -199,6 +203,22 @@ namespace megohttp {
 
     inline const std::optional<Request::BodySinkComplete>& Request::body_sink_complete() const noexcept {
         return impl_->body_sink_complete;
+    }
+
+    inline void Request::set_compress_body(Compression coding) {
+        impl_->compress = coding;
+    }
+
+    inline Request::Compression Request::compress_body() const noexcept {
+        return impl_->compress;
+    }
+
+    inline void Request::set_decode_response_body(bool decode) {
+        impl_->decode_response = decode;
+    }
+
+    inline bool Request::decode_response_body() const noexcept {
+        return impl_->decode_response;
     }
 
 } // namespace megohttp

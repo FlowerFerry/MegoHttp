@@ -121,6 +121,28 @@ namespace megohttp {
         const std::optional<BodySinkComplete>& body_sink_complete() const noexcept;
         const std::shared_ptr<BodySinkFlow>& body_sink_flow() const noexcept;
 
+        // --- Content coding ---
+        // Request body compression. OFF by default: compressing an upload
+        // spends CPU the caller never asked for, and a server that does not
+        // understand the coding answers 415.
+        enum class Compression {
+            None,       // no Content-Encoding (default)
+            Gzip,       // Content-Encoding: gzip
+            Deflate,    // Content-Encoding: deflate (zlib wrapper)
+            Brotli,     // Content-Encoding: br
+        };
+        void set_compress_body(Compression coding);
+        Compression compress_body() const noexcept;
+
+        // Response decoding. ON by default: a server that sends gzip because it
+        // saw our Accept-Encoding owes us the decoded bytes.
+        //
+        // Setting this false delivers the raw compressed bytes (the caller
+        // handles the coding itself). The Content-Encoding header is preserved
+        // either way, and Response::body_decoded() says which happened.
+        void set_decode_response_body(bool decode);
+        bool decode_response_body() const noexcept;
+
     private:
         class Impl;
         std::unique_ptr<Impl> impl_;

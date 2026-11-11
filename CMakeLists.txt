@@ -299,14 +299,15 @@ endif()
 # independently and both being off must not link it.
 if(MGHTTP_ENABLE_GZIP OR MGHTTP_ENABLE_WEBSOCKET_DEFLATE)
     set(ZLIB_ROOT "${MGHTTP_DEPS_DIR}/zlib-1.3.1")
+    # The plain path is needed for EXISTS(); generator expressions cannot be
+    # evaluated there. The BUILD_INTERFACE wrapper is only applied when the
+    # library is actually linked.
     if(MSVC)
-        set(ZLIB_LIB "$<BUILD_INTERFACE:${ZLIB_ROOT}/${MGHTTP_DEP_BUILD}>/Release/zlibstatic.lib")
-    elseif(WIN32)
-        set(ZLIB_LIB "$<BUILD_INTERFACE:${ZLIB_ROOT}/${MGHTTP_DEP_BUILD}>/libzlibstatic.a")
+        set(ZLIB_LIB_PATH "${ZLIB_ROOT}/${MGHTTP_DEP_BUILD}/Release/zlibstatic.lib")
     else()
-        set(ZLIB_LIB "$<BUILD_INTERFACE:${ZLIB_ROOT}/${MGHTTP_DEP_BUILD}>/libzlibstatic.a")
+        set(ZLIB_LIB_PATH "${ZLIB_ROOT}/${MGHTTP_DEP_BUILD}/libzlibstatic.a")
     endif()
-    if(EXISTS "${ZLIB_LIB}")
+    if(EXISTS "${ZLIB_LIB_PATH}")
         set(MGHTTP_ZLIB_AVAILABLE ON)
         message(STATUS "zlib: in-tree ${ZLIB_LIB}")
     else()
@@ -320,8 +321,52 @@ else()
     set(MGHTTP_ZLIB_AVAILABLE OFF)
 endif()
 
+# Brotli follows the same model as zlib: a prebuilt static library under deps/,
+# per toolchain. It is NOT built by this project's generator, because brotli's
+# own CMakeLists needs rc.exe (absent from the Ninja toolchain here) and adding
+# C sources to this tree would require enable_language(C), which trips the same
+# problem.
+#
+# To populate deps/brotli-1.1.0/build_msvc:
+#   cmake -S deps/brotli-1.1.0 -B deps/brotli-1.1.0/build_msvc \
+#         -G "Visual Studio 17 2022" -A x64 \
+#         -DBROTLI_DISABLE_TESTS=ON -DBROTLI_BUILD_ENCODER=OFF
+#   cmake --build deps/brotli-1.1.0/build_msvc --config Release
 if(MGHTTP_ENABLE_BROTLI)
     find_package(Brotli QUIET)
+    if(BROTLI_FOUND AND TARGET Brotli::Decoder)
+        set(MGHTTP_BROTLI_AVAILABLE ON)
+        message(STATUS "brotli: system package")
+    else()
+        set(BROTLI_ROOT "${MGHTTP_DEPS_DIR}/brotli-1.1.0")
+        if(MSVC)
+            set(BROTLI_DIR "${BROTLI_ROOT}/${MGHTTP_DEP_BUILD}/Release")
+            set(BROTLI_LIB "${BROTLI_DIR}/brotlidec.lib")
+            set(BROTLI_COMMON "${BROTLI_DIR}/brotlicommon.lib")
+        else()
+            set(BROTLI_DIR "${BROTLI_ROOT}/${MGHTTP_DEP_BUILD}")
+            set(BROTLI_LIB "${BROTLI_DIR}/libbrotlidec.a")
+            set(BROTLI_COMMON "${BROTLI_DIR}/libbrotlicommon.a")
+        endif()
+        if(EXISTS "${BROTLI_LIB}")
+            add_library(mghttp_brotli STATIC IMPORTED GLOBAL)
+            set_target_properties(mghttp_brotli PROPERTIES
+                IMPORTED_LOCATION "${BROTLI_LIB}"
+                INTERFACE_LINK_LIBRARIES "${BROTLI_COMMON}"
+                INTERFACE_INCLUDE_DIRECTORIES
+                    "$<BUILD_INTERFACE:${BROTLI_ROOT}/c/include>")
+            add_library(Brotli::Decoder ALIAS mghttp_brotli)
+            set(MGHTTP_BROTLI_AVAILABLE ON)
+            message(STATUS "brotli: in-tree ${BROTLI_LIB}")
+        else()
+            set(MGHTTP_BROTLI_AVAILABLE OFF)
+            message(STATUS "brotli not available; MGHTTP_ENABLE_BROTLI is ON but "
+                           "no prebuilt library was found. Brotli decoding will "
+                           "report ContentEncodingUnsupported.")
+        endif()
+    endif()
+else()
+    set(MGHTTP_BROTLI_AVAILABLE OFF)
 endif()
 
 # Create interface target
@@ -389,11 +434,14 @@ if(MGHTTP_TLS_MBEDTLS)
     endif()
 endif()
 
-if(MGHTTP_ENABLE_GZIP)
+# A coding is only advertised as available when its library was actually found:
+# defining the flag without the library would make Accept-Encoding promise gzip
+# or br and then fail to decode what the server sends back.
+if(MGHTTP_ENABLE_GZIP AND MGHTTP_ZLIB_AVAILABLE)
     target_compile_definitions(megohttp INTERFACE MGHTTP_ENABLE_GZIP=1)
 endif()
 
-if(MGHTTP_ENABLE_BROTLI)
+if(MGHTTP_ENABLE_BROTLI AND MGHTTP_BROTLI_AVAILABLE)
     target_compile_definitions(megohttp INTERFACE MGHTTP_ENABLE_BROTLI=1)
 endif()
 
@@ -427,8 +475,8 @@ endif()
 
 # Feature test macros
 target_compile_definitions(megohttp INTERFACE
-    MGHTTP_HAS_FEATURE_GZIP=$<BOOL:${MGHTTP_ENABLE_GZIP}>
-    MGHTTP_HAS_FEATURE_BROTLI=$<BOOL:${MGHTTP_ENABLE_BROTLI}>
+    MGHTTP_HAS_FEATURE_GZIP=$<BOOL:${MGHTTP_ZLIB_AVAILABLE}>
+    MGHTTP_HAS_FEATURE_BROTLI=$<BOOL:${MGHTTP_BROTLI_AVAILABLE}>
     MGHTTP_HAS_FEATURE_SSE=$<BOOL:${MGHTTP_ENABLE_SSE}>
     MGHTTP_HAS_FEATURE_WEBSOCKET=$<BOOL:${MGHTTP_ENABLE_WEBSOCKET}>
     MGHTTP_HAS_FEATURE_WEBSOCKET_DEFLATE=$<BOOL:${MGHTTP_ENABLE_WEBSOCKET_DEFLATE}>
@@ -602,8 +650,13 @@ if((MGHTTP_ENABLE_GZIP OR MGHTTP_ENABLE_WEBSOCKET_DEFLATE) AND MGHTTP_ZLIB_AVAIL
         target_include_directories(megohttp INTERFACE
             $<BUILD_INTERFACE:${ZLIB_ROOT}>
             $<BUILD_INTERFACE:${ZLIB_ROOT}/${MGHTTP_DEP_BUILD}>)
-        target_link_libraries(megohttp INTERFACE "${ZLIB_LIB}")
+        target_link_libraries(megohttp INTERFACE
+            "$<BUILD_INTERFACE:${ZLIB_LIB_PATH}>")
     endif()
+endif()
+
+if(MGHTTP_ENABLE_BROTLI AND MGHTTP_BROTLI_AVAILABLE AND TARGET Brotli::Decoder)
+    target_link_libraries(megohttp INTERFACE Brotli::Decoder)
 endif()
 
 # Tests

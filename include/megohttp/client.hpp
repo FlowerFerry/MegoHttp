@@ -8,6 +8,7 @@
 // come later; nothing here pretends to have them.
 #include <megohttp/config.hpp>
 #include <megohttp/connection_pool.hpp>
+#include <megohttp/content_decoder.hpp>
 #include <megohttp/proxy.hpp>
 #include <megohttp/error.hpp>
 #include <megohttp/executor.hpp>
@@ -60,6 +61,12 @@ namespace megohttp {
 
         // Parser limits applied to every response.
         ParserLimits parser_limits{};
+
+        // Limits for the Content-Encoding decoder chain (gzip / brotli).
+        // Kept separate from the parser limits on purpose: the compressed size,
+        // the intermediate buffers and the decompressed size are three different
+        // things, and only the last one is bounded by max_response_body.
+        DecoderLimits decoder_limits{};
 
         // Connection pool (phase 5, task book 8.1). Defaults reproduce the
         // pre-phase-5 behaviour exactly: no limits and no queueing, so every

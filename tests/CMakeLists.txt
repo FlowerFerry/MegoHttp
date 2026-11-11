@@ -24,6 +24,8 @@ set(MGHTTP_TEST_SOURCES
     test_streaming.cpp
     test_streaming_integration.cpp
     test_streaming_network.cpp
+    test_content_decoder.cpp
+    test_content_encoding.cpp
     test_multipart.cpp
     test_multipart_response.cpp
     test_multipart_continuous.cpp
@@ -71,6 +73,15 @@ foreach(test_src IN LISTS MGHTTP_TEST_SOURCES)
         MEGOHTTP_TLS_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tls_fixtures")
     mghttp_copy_runtime_dll(${test_name})
     mghttp_copy_tls_runtime_dll(${test_name})
+    # The content-decoding test builds its fixtures with the matching ENCODER,
+    # which the library itself never links (decoding only).
+    if(test_name STREQUAL "test_content_decoder" AND MGHTTP_BROTLI_AVAILABLE)
+        if(MSVC)
+            set(_br_dir "${BROTLI_ROOT}/${MGHTTP_DEP_BUILD}/Release")
+            target_link_libraries(${test_name} PRIVATE
+                "${_br_dir}/brotlienc.lib" "${_br_dir}/brotlicommon.lib")
+        endif()
+    endif()
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
 

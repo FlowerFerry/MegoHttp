@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 namespace megohttp {
@@ -673,6 +674,30 @@ namespace megohttp {
                     buffer_sink_ = std::make_unique<BufferSink>(std::move(rh),
                                                          state_->options.max_response_body);
                 }
+                // Build the content-decoding chain from the header, in decode
+                // order. A response that carries Accept-Encoding-negotiated
+                // compression is decoded here so the sink and the buffered body
+                // both see plain bytes; the header itself is kept verbatim.
+                if (state_->request.decode_response_body()) {
+                    if (auto ce = head.headers.get("content-encoding")) {
+                        auto encodings = parse_content_encoding_header(*ce);
+                        if (!encodings.empty()) {
+                            std::optional<Error> chain_err;
+                            std::weak_ptr<Exchange> weak_self = shared_from_this();
+                            decoder_ = make_content_decoder_chain(
+                                encodings,
+                                [weak_self](const uint8_t* d, size_t n) -> bool {
+                                    auto self = weak_self.lock();
+                                    if (!self) return false;
+                                    return self->deliver_decoded(d, n);
+                                },
+                                state_->options.decoder_limits,
+                                &chain_err);
+                            if (chain_err) { return *chain_err; }
+                        }
+                    }
+                }
+
                 // Framing fact needed later to decide whether this connection may
                 // be reused: Connection: close (or HTTP/1.0 without keep-alive)
                 // means the server will not carry a second exchange on it.
@@ -682,6 +707,44 @@ namespace megohttp {
             }
 
             VoidResult on_body_data(const uint8_t* data, size_t size) override {
+                // Wire bytes, before any content decoding. Response::
+                // wire_body_length() reports this so a caller cannot mistake a
+                // compressed length for the decoded one.
+                wire_body_bytes_ += size;
+
+                if (decoder_) {
+                    // Encoded body: the decoder cascade re-enters through
+                    // deliver_decoded(), which is where delivery actually
+                    // happens. Nothing below runs for this chunk.
+                    auto r = decoder_->feed(data, size);
+                    if (!r) return r;
+                    if (decoder_error_) {
+                        // A downstream sink refused the decoded bytes; the
+                        // decoder can only report that through its callback, so
+                        // the real error was stashed there.
+                        auto e = std::move(*decoder_error_);
+                        decoder_error_.reset();
+                        return e;
+                    }
+                    return VoidResult{};
+                }
+                return deliver_decoded_checked(data, size);
+            }
+
+            // Delivers plain (post-decoding) body bytes to whichever consumer is
+            // configured. Also the target of the decoder cascade.
+            bool deliver_decoded(const uint8_t* data, size_t size) {
+                auto r = deliver_decoded_checked(data, size);
+                if (!r) {
+                    // The decoder callback cannot return an Error, so the
+                    // failure is stashed and re-raised by the enclosing feed().
+                    decoder_error_ = r.error();
+                    return false;
+                }
+                return true;
+            }
+
+            VoidResult deliver_decoded_checked(const uint8_t* data, size_t size) {
                 // "Delivered" means the CALLER has bytes. In buffered mode the
                 // body accumulates internally and the caller sees nothing until
                 // finish(), so a retry would not re-deliver anything -- that is
@@ -751,6 +814,20 @@ namespace megohttp {
                 complete_ = true;
                 disarm_recv_timer();
 
+                // The decoder may still hold output (a trailing block, or a
+                // truncated stream it only notices now). Flush before reporting
+                // completion so a truncated body fails instead of looking short
+                // but successful.
+                if (decoder_) {
+                    auto fr = decoder_->flush();
+                    if (!fr) return fr;
+                    if (decoder_error_) {
+                        auto e = std::move(*decoder_error_);
+                        decoder_error_.reset();
+                        return e;
+                    }
+                }
+
                 if (redirect_pending_) {
                     // The 3xx was consumed; the next hop is the Client's job.
                     // Report through the state so the connection is returned to
@@ -787,6 +864,7 @@ namespace megohttp {
 
                 if (buffer_sink_) {
                     auto response = buffer_sink_->finish();
+                    apply_encoding_facts(response);
                     state_->finish(std::move(response));
                 } else if (body_sink_complete_) {
                     // S3.2-02: Streaming mode complete. The caller gets the head
@@ -808,12 +886,28 @@ namespace megohttp {
                     ResponseHead rh = head_ ? std::move(*head_) : ResponseHead{};
                     Response out(std::move(rh), {});
                     out.set_body_streamed();
+                    apply_encoding_facts(out);
                     state_->finish(std::move(out));
                 } else {
                     ResponseHead rh = head_ ? std::move(*head_) : ResponseHead{};
-                    state_->finish(Response(std::move(rh), {}));
+                    Response out(std::move(rh), {});
+                    apply_encoding_facts(out);
+                    state_->finish(std::move(out));
                 }
                 return VoidResult{};
+            }
+
+            // Records whether the body arrived encoded and was decoded, plus the
+            // wire length. Without this a caller holding a 40-byte gzip body that
+            // decompressed to 4 KB has no way to tell which number it is looking
+            // at.
+            void apply_encoding_facts(Response& r) {
+                const bool decoded = decoder_ != nullptr;
+                if (decoded) {
+                    r.set_encoding_facts(true, wire_body_bytes_);
+                } else if (wire_body_bytes_ != 0) {
+                    r.set_encoding_facts(false, wire_body_bytes_);
+                }
             }
         private:
             // Feeds bytes to the parser and decides what happens next.
@@ -944,6 +1038,12 @@ namespace megohttp {
             // here so the terminal path can cancel it; an uncancelled timer
             // would call the user's BodySource after the request finished.
             std::shared_ptr<Timer> source_retry_timer_;
+            // Content-Encoding decoder. Null when the response is not encoded or
+            // the caller asked for raw bytes.
+            std::unique_ptr<ContentDecoderChain> decoder_;
+            // Wire (compressed) byte count for Response::wire_body_length().
+            uint64_t wire_body_bytes_{0};
+            std::optional<Error> decoder_error_;
             // Buffered mode: accumulates body into a vector.
             std::unique_ptr<BufferSink> buffer_sink_;
             // Streaming mode: user-provided callbacks. Mutually exclusive with buffer_sink_.
@@ -1590,6 +1690,27 @@ namespace megohttp {
             }
 
             st->phase = detail::RequestPhase::BuildHead;
+
+            // Content coding negotiation (S5.6). Accept-Encoding advertises
+            // exactly the codings this build can decode -- promising one we
+            // cannot decode would turn every response into a decoding error.
+            // A caller who set the header themselves keeps it: they may have a
+            // reason to ask for a subset.
+            if (st->request.decode_response_body() &&
+                !st->request.headers().contains("accept-encoding")) {
+                const bool gz = MEGOHTTP_HAS_GZIP != 0;
+                const bool br = MEGOHTTP_HAS_BROTLI != 0;
+                const char* value = nullptr;
+                if (gz && br)      value = "gzip, br";
+                else if (gz)       value = "gzip";
+                else if (br)       value = "br";
+                if (value) {
+                    st->request.headers().set(
+                        "accept-encoding",
+                        string_view(value, std::char_traits<char>::length(value)));
+                }
+            }
+
             // Cookies (S5.5). Applied here rather than inside build_request_head
             // because the jar needs the resolved Url and the Request is the thing
             // that carries the headers. The jar decides what to send:
