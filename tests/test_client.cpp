@@ -1622,9 +1622,11 @@ TEST_CASE("expect continue is off by default", "[client][expect]") {
     CHECK(wait_until([&] { return done.load(); }));
     CHECK(ok);
     CHECK(!srv.saw_expect_header());
-    // Without Expect the body is pipelined into the very first write, so it is
-    // already present when the server reads the head.
-    CHECK(srv.body_in_first_recv());
+    // Deliberately NOT asserting body_in_first_recv() here. The client writes the
+    // head and the body as two separate operations, and TCP is free to deliver
+    // them in one recv() or two -- nothing in the protocol promises coalescing.
+    // Asserting it made this case fail whenever the segments happened to split,
+    // which says nothing about whether Expect was (correctly) left off.
     CHECK(srv.body() == "payload-12345");
 
     client.shutdown();

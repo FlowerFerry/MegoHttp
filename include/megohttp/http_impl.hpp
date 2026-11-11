@@ -323,6 +323,11 @@ namespace megohttp {
                 return VoidResult{};
             }
 
+            // Reset leftover for THIS feed. A stale value from an earlier paused
+            // feed would otherwise make the caller copy the wrong byte range out
+            // of a buffer that is already gone.
+            leftover_ = 0;
+
             size_t i = 0;
             while (i < size) {
                 if (state_ == State::Complete) { leftover_ = size - i; return VoidResult{}; }
@@ -372,6 +377,14 @@ namespace megohttp {
                         auto r = cb_.on_body_data(data + i, take);
                         if (!r) return fail_from(r.error());
                         i += take;
+                        if (cb_.pause_requested()) {
+                            // Stop consuming, but the rest of this buffer belongs
+                            // to the same message and its view dies when feed()
+                            // returns. Report it as leftover so the caller can
+                            // re-feed it instead of losing the bytes.
+                            leftover_ = size - i;
+                            return VoidResult{};
+                        }
                     }
                     if (body_received_ == content_length_) {
                         state_ = State::Complete;
@@ -392,6 +405,10 @@ namespace megohttp {
                         auto r = cb_.on_body_data(data + i, avail);
                         if (!r) return fail_from(r.error());
                         i += avail;
+                        if (cb_.pause_requested()) {
+                            leftover_ = size - i;
+                            return VoidResult{};
+                        }
                     }
                     // Completion is signalled by feed_eof(); nothing else can end it.
                     break;
@@ -439,6 +456,12 @@ namespace megohttp {
                         auto r = cb_.on_body_data(data + i, take);
                         if (!r) return fail_from(r.error());
                         i += take;
+                        if (cb_.pause_requested()) {
+                            // As above: the chunk CRLF and any following chunk
+                            // share this buffer, so it must survive the call.
+                            leftover_ = size - i;
+                            return VoidResult{};
+                        }
                     }
                     if (chunk_remaining_ == 0) state_ = State::Body_Chunk_DataCrlf;
                     break;

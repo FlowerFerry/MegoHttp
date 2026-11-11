@@ -115,6 +115,14 @@ namespace megohttp {
             // only for the duration of the call.
             virtual VoidResult on_body_data(const uint8_t* data, size_t size) = 0;
 
+            // Asked after every on_body_data delivery. Returning true stops the
+            // current feed() from delivering further body bytes: without it a
+            // single feed() containing several segments would keep calling a
+            // sink that already asked to pause. The bytes are not lost -- the
+            // parser's offset stops where delivery stopped, so a later feed()
+            // resumes from there.
+            virtual bool pause_requested() const { return false; }
+
             // Trailers, delivered once after the last body byte (chunked only).
             virtual VoidResult on_trailers(const Headers& trailers) = 0;
 

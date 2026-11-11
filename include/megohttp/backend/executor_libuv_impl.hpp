@@ -288,6 +288,15 @@ namespace libuv_backend {
         uv_async_init(loop_, &async_, &UvExecutor::on_async);
         async_.data = this;
         async_initialized_ = true;
+        // Tasks may already be queued: post() before the wake handle existed
+        // left them sitting in q_ with nothing to signal the loop. Flush the
+        // wake now so that first batch is not stranded until some later post.
+        bool has_work = false;
+        {
+            std::lock_guard<std::mutex> lk(q_m_);
+            has_work = !q_.empty();
+        }
+        if (has_work) uv_async_send(&async_);
     }
 
     inline void UvExecutor::drain_pending() {

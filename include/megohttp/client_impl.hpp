@@ -371,8 +371,22 @@ namespace megohttp {
                 if (body_sent_) return;
                 body_sent_ = true;
                 expect_continue_pending_ = false;
+
+                // Streaming mode: pull from BodySource.
+                if (state_->request.body_source()) {
+                    send_body_streaming();
+                    return;
+                }
+
+                // Buffered mode: single write of the whole buffer.
                 const auto& body = state_->request.body_bytes();
-                if (body.empty()) return;
+                if (body.empty()) {
+                    // No buffered body: proceed to reading response.
+                    disarm_send_timer();
+                    arm_recv_timer();
+                    read_more();
+                    return;
+                }
                 auto self = shared_from_this();
                 auto stream = state_->stream;
                 stream->async_write(body.data(), body.size(),
@@ -445,10 +459,23 @@ namespace megohttp {
                 auto& [data, eof] = r.value();
                 if (data.empty() && !eof) {
                     // Backpressure: Source not ready. Retry shortly.
+                    //
+                    // The timer is stored on the Exchange so a cancel, timeout
+                    // or error can disarm it. Without that, the timer would
+                    // outlive the terminal state and call the user's BodySource
+                    // after the request was already reported finished -- a
+                    // callback after the terminal result, which the contract
+                    // forbids, and a write to a retired stream.
                     auto self = shared_from_this();
-                    state_->executor->schedule_after(
+                    source_retry_timer_ = state_->executor->schedule_after(
                         std::chrono::milliseconds(10),
-                        [self]() { self->send_body_streaming(); });
+                        [self]() {
+                            self->source_retry_timer_.reset();
+                            // Re-check: the terminal may have happened between
+                            // the timer firing and this callback running.
+                            if (self->state_->finished.load()) return;
+                            self->send_body_streaming();
+                        });
                     return;
                 }
 
@@ -671,12 +698,17 @@ namespace megohttp {
                 // S3.2-02: Streaming mode
                 if (body_sink_) {
                     auto sv = string_view(reinterpret_cast<const char*>(data), size);
-                    // A throwing sink must not unwind through the parser/loop.
+                    // A throwing sink must not unwind through the parser/loop,
+                    // and it must not be mistaken for "pause" either: pausing
+                    // quietly would let the request continue and report success
+                    // after the caller's callback had already blown up. Turn it
+                    // into a real terminal error instead.
                     bool keep_going = true;
                     try {
                         keep_going = (*body_sink_)(sv);
                     } catch (...) {
-                        keep_going = false;
+                        return Error{ErrorCode::Unknown, ErrorPhase::Receive,
+                                     string("response body sink threw an exception")};
                     }
                     if (!keep_going) {
                         // The sink asked to pause. With a flow attached the read
@@ -695,9 +727,23 @@ namespace megohttp {
                 return VoidResult{};
             }
 
+            // Told to the parser after every body delivery: when the sink has
+            // paused, feed() must stop here instead of walking on to further
+            // segments in the same buffer. sink_paused_ alone only gated the
+            // NEXT read, so a single feed() carrying several body segments kept
+            // calling a sink that had already asked to wait.
+            bool pause_requested() const override { return sink_paused_; }
+
             VoidResult on_trailers(const Headers& tr) override {
-                if (buffer_sink_) buffer_sink_->set_trailers(tr);
-                // In streaming mode, trailers are dropped (not supported yet).
+                if (buffer_sink_) {
+                    buffer_sink_->set_trailers(tr);
+                } else if (head_) {
+                    // Streaming mode: keep them on the saved head so the caller
+                    // sees the same ResponseHead a buffered request delivers.
+                    // Dropping them silently made trailer delivery depend on
+                    // which body mode the caller happened to pick.
+                    head_->trailers = tr;
+                }
                 return VoidResult{};
             }
 
@@ -746,7 +792,19 @@ namespace megohttp {
                     // S3.2-02: Streaming mode complete. The caller gets the head
                     // it was promised; the body went to its sink, so body_bytes()
                     // stays empty and body_is_buffered() is false.
-                    (*body_sink_complete_)(VoidResult{});
+                    //
+                    // A throwing completion callback must not unwind through the
+                    // parser/event loop. The body callback already has the same
+                    // protection; this one is the terminal notification, so a throw
+                    // here would skip the request's own finish() and strand the
+                    // caller. Swallow it and still deliver the response.
+                    auto complete = std::move(*body_sink_complete_);
+                    body_sink_complete_.reset();
+                    try {
+                        if (complete) complete(VoidResult{});
+                    } catch (...) {
+                        // Nothing useful to report: the request itself succeeded.
+                    }
                     ResponseHead rh = head_ ? std::move(*head_) : ResponseHead{};
                     Response out(std::move(rh), {});
                     out.set_body_streamed();
@@ -758,7 +816,51 @@ namespace megohttp {
                 return VoidResult{};
             }
         private:
+            // Feeds bytes to the parser and decides what happens next.
+            //
+            // The bytes live in a view owned by the stream and are gone the
+            // moment this function returns, so anything the parser did NOT
+            // consume (leftover_offset() > 0) has to be copied here. The two
+            // cases that produce leftover are a paused sink and a message that
+            // completed with bytes of the next message behind it.
+            void feed_and_continue(string_view sv) {
+                auto res = parser_->feed(
+                    reinterpret_cast<const uint8_t*>(sv.data()), sv.size());
+                if (!res) { fail(res.error()); return; }
+                if (complete_) return;
+
+                const size_t left = parser_->leftover_offset();
+                if (left > 0) {
+                    // Keep the unconsumed tail for the resume path. A paused
+                    // sink is the reason it is still there.
+                    pending_.assign(
+                        reinterpret_cast<const uint8_t*>(sv.data()) + (sv.size() - left),
+                        reinterpret_cast<const uint8_t*>(sv.data()) + sv.size());
+                }
+                if (sink_paused_) return;
+                read_more();
+            }
+
             void read_more() {
+                // A paused sink must be resumed first; feeding more bytes now
+                // would deliver them before the caller asked for them.
+                if (sink_paused_) return;
+                // Replay the tail the parser could not consume last time before
+                // reading anything new. Without this the CRLF and any following
+                // chunk that shared the same socket read were dropped.
+                if (!pending_.empty()) {
+                    // Raw bytes, not text: keep them in a byte buffer owned by the
+                    // posted lambda so the view stays valid until it runs.
+                    auto tail = std::make_shared<std::vector<uint8_t>>();
+                    tail->swap(pending_);
+                    auto self = shared_from_this();
+                    state_->executor->post([self, tail]() {
+                        if (self->state_->finished.load()) return;
+                        self->feed_and_continue(string_view(
+                            reinterpret_cast<const char*>(tail->data()), tail->size()));
+                    });
+                    return;
+                }
                 auto self = shared_from_this();
                 auto stream = state_->stream;
                 stream->async_read_some(
@@ -798,20 +900,16 @@ namespace megohttp {
                         }
 
                         self->state_->phase = detail::RequestPhase::Receive;
-                        auto res = self->parser_->feed(
-                            reinterpret_cast<const uint8_t*>(sv.data()), sv.size());
-                        if (!res) { self->fail(res.error()); return; }
-                        if (self->complete_) return;
-                        // A sink that paused inside this feed() must not be
-                        // handed more data. Resume restarts the loop.
-                        if (self->sink_paused_) return;
-                        self->read_more();
+                        self->feed_and_continue(sv);
                     });
             }
 
             void fail(const Error& e) {
                 disarm_send_timer();
                 disarm_recv_timer();
+                // A pending BodySource backpressure retry must not fire after the
+                // terminal result: it would call user code post-completion.
+                if (source_retry_timer_) { source_retry_timer_->cancel(); source_retry_timer_.reset(); }
                 // A streaming caller was promised exactly one completion
                 // notification. A cancel, timeout, EOF or parse error used to
                 // leave it waiting forever, because only the success path called
@@ -821,17 +919,31 @@ namespace megohttp {
             }
 
             // Delivers the streaming-mode terminal error, at most once.
+            //
+            // Guarded the same way as the success path: this runs inside a
+            // parser/executor handler, and an exception escaping from here would
+            // unwind through libuv/Asio. A user callback that throws must not
+            // take the event loop down with it -- the request is already
+            // terminal, so there is nothing left to report.
             void notify_sink_failed(const Error& e) {
                 if (!body_sink_complete_) return;
                 auto cb = std::move(*body_sink_complete_);
                 body_sink_complete_.reset();
-                if (cb) cb(VoidResult{e});
+                if (!cb) return;
+                try {
+                    cb(VoidResult{e});
+                } catch (...) {
+                }
             }
 
             std::shared_ptr<RequestState> state_;
             std::unique_ptr<ResponseParser> parser_;
             std::shared_ptr<Timer> send_timer_;
             std::shared_ptr<Timer> recv_timer_;
+            // Backpressure retry for a BodySource that is not ready yet. Owned
+            // here so the terminal path can cancel it; an uncancelled timer
+            // would call the user's BodySource after the request finished.
+            std::shared_ptr<Timer> source_retry_timer_;
             // Buffered mode: accumulates body into a vector.
             std::unique_ptr<BufferSink> buffer_sink_;
             // Streaming mode: user-provided callbacks. Mutually exclusive with buffer_sink_.
@@ -842,6 +954,10 @@ namespace megohttp {
             // ever resume it), so delivery continues as before.
             std::shared_ptr<Request::BodySinkFlow> sink_flow_;
             bool sink_paused_{false};
+            // Bytes a paused feed() could not consume. The stream's read view is
+            // only valid for that callback, so the tail is copied here and
+            // replayed on resume.
+            std::vector<uint8_t> pending_;
             // Head kept for the streaming path, where there is no BufferSink to
             // carry it to the caller.
             std::optional<ResponseHead> head_;
@@ -1048,7 +1164,13 @@ namespace megohttp {
                 std::lock_guard<std::mutex> lk(m_);
                 for (auto& w : in_flight_)
                     if (auto sp = w.lock()) live.push_back(std::move(sp));
-                in_flight_.clear();
+                // Do NOT clear in_flight_ here.  Every retirement job calls
+                // finish() → retired() → maybe_notify_drained(), which scans
+                // in_flight_ to see if anything is still alive.  Clearing it
+                // prematurely would make a naturally-completing request see an
+                // empty list and fire the drained callback BEFORE the shutdown
+                // retirements above have actually run (the drained callback is
+                // the caller's promise that all request callbacks have fired).
             }
 
             // Retire on the I/O thread, not on the caller's. finish() runs the
@@ -1069,13 +1191,36 @@ namespace megohttp {
                     // here would abandon every retirement queued ahead of it.
                     auto done = std::make_shared<std::promise<void>>();
                     auto fut = done->get_future();
-                    for (size_t i = 0; i < live.size(); ++i) {
-                        auto st = live[i];
-                        const bool is_last = (i + 1 == live.size());
-                        ex->post([st, is_last, done] {
-                            st->finish(Error{ErrorCode::Cancelled, ErrorPhase::None,
-                                             string("client is shutting down")});
-                            if (is_last) done->set_value();
+                    // Count the retirement jobs.  While they are pending the
+                    // drained callback must not fire: a queued job still holds
+                    // its RequestState alive, so weak_ptr liveness alone cannot
+                    // tell "finished" from "not yet run".
+                    retiring.store(static_cast<int>(live.size()));
+                    for (size_t idx = 0; idx < live.size(); ++idx) {
+                        auto st = std::move(live[idx]);
+                        // Do NOT use "this is the last element of the vector":
+                        // post() is a queue, and the jobs may run in ANY order.
+                        // The last index could run first and then stop the
+                        // executor while other retirements are still queued, so
+                        // those requests would never get their terminal
+                        // callback. The counter reaching zero is the only honest
+                        // "all retirements have run" signal.
+                        ex->post([this, held = std::move(st), done]() mutable {
+                            held->finish(Error{ErrorCode::Cancelled, ErrorPhase::None,
+                                               string("client is shutting down")});
+                            // finish() ran the user callback and the retirement
+                            // notice; this job is done, so open the gate. The
+                            // strong reference must go before the liveness scan,
+                            // otherwise this very job keeps its state alive and
+                            // the request never looks retired.
+                            held.reset();
+                            if (retiring.fetch_sub(1) == 1) {
+                                // Truly last: every posted retirement has run.
+                                std::lock_guard<std::mutex> lk(m_);
+                                in_flight_.clear();
+                                done->set_value();
+                            }
+                            maybe_notify_drained();
                         });
                     }
                     if (owns_executor && !ex->is_in_loop_thread()) {
@@ -1088,6 +1233,10 @@ namespace megohttp {
                         st->finish(Error{ErrorCode::Cancelled, ErrorPhase::None,
                                          string("client is shutting down")});
                     }
+                    // No executor to post to: every retirement above already ran
+                    // synchronously on this thread.
+                    std::lock_guard<std::mutex> lk(m_);
+                    in_flight_.clear();
                 }
             }
 
@@ -1104,9 +1253,20 @@ namespace megohttp {
         }
 
         void shutdown(std::function<void()> on_drained) {
+            bool was_stopped = false;
             {
                 std::lock_guard<std::mutex> lk(m_);
+                was_stopped = stopped.load();
                 if (!drained_cb) drained_cb = std::move(on_drained);
+            }
+            if (was_stopped) {
+                // shutdown() already ran, so nothing below will call
+                // maybe_notify_drained() again. Without this the callback just
+                // stored stays in drained_cb forever and a caller waiting for it
+                // hangs. Everything is drained at this point (that is what stopped
+                // means), so the notification can be delivered straight away.
+                maybe_notify_drained();
+                return;
             }
             shutdown();
         }
@@ -1148,6 +1308,13 @@ namespace megohttp {
             if (retired_here) {
                 // Deliver the terminal result without enqueueing work on a
                 // stopped executor.
+                //
+                // DOCUMENTED EXCEPTION to "every callback runs on the I/O
+                // context": this one runs on the submitting thread. The executor
+                // is already stopped, so posting would enqueue work nothing will
+                // ever run, and the caller would get no terminal callback at all.
+                // A callback on the wrong thread is recoverable; a missing
+                // terminal result is not.
                 auto cb = std::move(st->on_complete);
                 st->finished.store(true);
                 st->self_hold.reset();
@@ -2124,15 +2291,28 @@ namespace megohttp {
         // In-flight request tracking for shutdown(S2.6-02/04).
         std::mutex m_;
         std::vector<std::weak_ptr<detail::RequestState>> in_flight_;
+        // Number of shutdown retirement jobs that have been posted but not yet
+        // run.  While this is non-zero the drained callback must not fire, even
+        // if every RequestState already looks finished.
+        std::atomic<int> retiring{0};
         std::function<void()> drained_cb;
 
         void maybe_notify_drained() {
             std::function<void()> cb;
             {
                 std::lock_guard<std::mutex> lk(m_);
-                bool empty = true;
-                for (auto& w : in_flight_) { if (w.lock()) { empty = false; break; } }
-                if (empty && drained_cb) { cb = std::move(drained_cb); drained_cb = nullptr; }
+                // Only shutdown() arms the drained callback, so a natural
+                // completion must not fire it early. Requiring `stopped` makes
+                // that intent explicit rather than incidental.
+                if (!stopped.load()) return;
+                // A retirement job in flight still holds its RequestState alive,
+                // and shutdown() itself keeps a strong reference in its local
+                // vector while it waits, so weak_ptr liveness cannot answer
+                // "have the retirements run yet". The counter is the only honest
+                // signal: it reaches zero when the last posted retirement job has
+                // executed its finish().
+                if (retiring.load() != 0) return;
+                if (drained_cb) { cb = std::move(drained_cb); drained_cb = nullptr; }
             }
             if (cb) cb();
         }
@@ -2154,6 +2334,13 @@ namespace megohttp {
     inline CancelHandle Client::request(const Request& req, ResponseCallback on_complete) {
         auto state = std::make_shared<CancelState>(impl_->executor);
         CancelHandle handle(state);
+        // SYNCHRONOUS REJECTION -- this callback runs on the CALLING thread, not
+        // on the executor. That is deliberate and allowed by the task book
+        // (5.3: "distinguish a synchronously rejected submission from an
+        // accepted request"). An accepted request owes exactly one terminal
+        // callback on the I/O context; a submission that was never accepted
+        // owes the caller an immediate answer, and posting it to an executor
+        // that is stopped (or was never usable) would mean it never arrives.
         if (impl_->options_error) {
             if (on_complete) on_complete(Result<Response>(*impl_->options_error));
             return handle;

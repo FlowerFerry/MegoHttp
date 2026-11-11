@@ -882,6 +882,15 @@ inline void TlsStream::Impl::on_underlying_read(Result<string_view> r) {
         }
         state_ = State::Closed;
         if (read_cb_) finish_read(Result<string_view>{string_view{}});
+        // A pending write must also reach a terminal state: a clean EOF means
+        // the peer is gone, so those bytes were never acknowledged. Leaving the
+        // callback unserviced would hang the writer forever -- fail() already
+        // covers the error paths, this is the clean-EOF one.
+        if (write_cb_) {
+            finish_write(Result<size_t>{Error{ErrorCode::ConnectionClosed,
+                                              protocol_phase_,
+                                              string("connection closed with a write pending")}});
+        }
         notify_closed();
         return;
     }
@@ -1024,13 +1033,24 @@ inline void TlsStream::async_close(CloseCallback cb) {
     impl_->close_cb_ = std::move(cb);
     impl_->close_requested_ = true;
 
-    if (impl_->state_ == Impl::State::Failed) {
+    // A TlsStream may be constructed over a null underlying stream (the
+    // constructor accepts null so a caller can build one and hand it a stream
+    // later, and start() reports InvalidArgument in that case). Closing such a
+    // stream must complete directly: there is nothing to close underneath, and
+    // dereferencing underlying_ would crash.
+    const bool no_underlying = !impl_->underlying_;
+
+    if (impl_->state_ == Impl::State::Failed || no_underlying) {
         impl_->state_ = Impl::State::Closed;
         // The callback is delivered even when self_ is empty. A TlsStream that
         // was never start()ed (or whose start failed) has no self-reference, and
         // gating notify_closed() on lock() silently dropped the caller's close
         // completion in exactly that case.
         std::weak_ptr<TlsStream> w = impl_->self_;
+        if (no_underlying) {
+            impl_->notify_closed();
+            return;
+        }
         impl_->underlying_->async_close([w] {
             if (auto s = w.lock()) s->impl_->notify_closed();
         });

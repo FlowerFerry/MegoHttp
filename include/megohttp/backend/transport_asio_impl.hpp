@@ -256,11 +256,40 @@ namespace megohttp {
     }
 
     inline void TcpStream::async_close(CloseCallback cb) {
+        if (closing_) {
+            // Already closing: the existing path will notify. Drop the new cb
+            // to avoid a double callback; the caller must not rely on
+            // a second close delivering a second notification.
+            return;
+        }
         closing_ = true;
         close_cb_ = std::move(cb);
         open_ = false;
-        close_socket_on_strand();
-        if (close_cb_) close_cb_();
+
+        // Close on the strand and fire the callback there, exactly once.
+        auto self = shared_from_this();
+        auto ex = std::dynamic_pointer_cast<asio_backend::AsioExecutor>(asio_executor_);
+        if (ex && !ex->is_in_loop_thread()) {
+            ex->post([self]() {
+                if (self->socket_ && self->socket_->is_open()) {
+                    asio::error_code ec;
+                    self->socket_->close(ec);
+                }
+                if (self->close_cb_) {
+                    auto c = std::move(self->close_cb_);
+                    c();
+                }
+            });
+        } else {
+            if (socket_ && socket_->is_open()) {
+                asio::error_code ec;
+                socket_->close(ec);
+            }
+            if (close_cb_) {
+                auto c = std::move(close_cb_);
+                c();
+            }
+        }
     }
 
     inline bool TcpStream::is_open() const noexcept { return open_; }

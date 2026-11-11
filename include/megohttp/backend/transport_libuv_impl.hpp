@@ -285,8 +285,15 @@ namespace detail {
     }
 
     inline void TcpStream::async_close(CloseCallback cb) {
+        if (closing_) {
+            // Already closing: the existing path will notify. Drop the new cb
+            // to avoid a double callback; the caller must not rely on
+            // a second close delivering a second notification.
+            return;
+        }
         close_cb_ = std::move(cb);
-        if (loop_ == nullptr || closing_ || !node_) {
+        if (loop_ == nullptr || !node_) {
+            // No handle to close: fire the callback immediately.
             if (close_cb_) { auto c = std::move(close_cb_); c(); }
             return;
         }

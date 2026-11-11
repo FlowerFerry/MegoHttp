@@ -396,6 +396,51 @@ TEST_CASE("leftover", "[http]") {
     CHECK(p.leftover_offset() <= raw.size());
 }
 
+TEST_CASE("leftover does not leak between feeds", "[http][pause]") {
+    // leftover_offset() must describe THIS feed only. If a paused feed leaves a
+    // stale value behind, the next feed -- which consumes everything and does
+    // not pause -- would still report leftover > 0, and the caller would copy a
+    // bogus tail out of a buffer that is already gone.
+    struct Pauser : ResponseParser::Callbacks {
+        std::string body;
+        int complete_count{0};
+        bool pause_now{false};
+
+        VoidResult on_head(const ParsedResponse&) override { return VoidResult{}; }
+        VoidResult on_body_data(const uint8_t* d, size_t n) override {
+            body.append(reinterpret_cast<const char*>(d), n);
+            return VoidResult{};
+        }
+        VoidResult on_trailers(const Headers&) override { return VoidResult{}; }
+        VoidResult on_complete() override { ++complete_count; return VoidResult{}; }
+        bool pause_requested() const override { return pause_now; }
+    };
+
+    const std::string raw = RESP_CHUNKED;
+    Pauser cb;
+    ResponseParser p(cb);
+
+    // Feed 1: pause on the first chunk, so the rest of this buffer is leftover.
+    cb.pause_now = true;
+    auto r1 = p.feed(reinterpret_cast<const uint8_t*>(raw.data()), raw.size());
+    REQUIRE(r1);
+    CHECK(cb.body == "hello");
+    const size_t left1 = p.leftover_offset();
+    REQUIRE(left1 > 0);
+    REQUIRE(left1 <= raw.size());
+
+    // Feed 2: resume and feed the tail. This one consumes to completion with no
+    // pause, so leftover_offset() must come back as 0 -- a carried-over value
+    // would make the caller think bytes are still pending.
+    cb.pause_now = false;
+    auto r2 = p.feed(
+        reinterpret_cast<const uint8_t*>(raw.data()) + (raw.size() - left1), left1);
+    REQUIRE(r2);
+    CHECK(cb.complete_count == 1);
+    CHECK(cb.body == "hello world");
+    CHECK(p.leftover_offset() == 0);
+}
+
 TEST_CASE("eof errors", "[http]") {
     // EOF in the middle of the head
     {

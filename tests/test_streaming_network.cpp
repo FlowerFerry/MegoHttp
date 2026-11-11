@@ -381,6 +381,41 @@ TEST_CASE("a truncated streamed response reports the error to the sink",
     CHECK(saw_error);
 }
 
+// A throwing BodySinkComplete must not take the event loop with it. The error
+// path (notify_sink_failed) used to be a bare call: an exception there unwound
+// through the parser handler. The request must still reach its terminal state.
+TEST_CASE("a throwing completion callback does not escape the error path",
+          "[streaming][network][terminal]") {
+    ScriptedServer srv;
+    REQUIRE(srv.start());
+    ScriptedServer::Response resp;
+    resp.head = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n";
+    resp.body = "short";            // truncated: forces the error path
+    srv.set_response(resp);
+
+    Client c;
+    Request req(Method::Get, to_owning(url_for(srv.port())));
+
+    std::atomic<int> completions{0};
+    req.set_body_sink(
+        [](string_view) { return true; },
+        [&completions](VoidResult) {
+            ++completions;
+            throw std::runtime_error("sink completion blew up");
+        });
+
+    // The throw is swallowed; the request still reports its own failure.
+    auto r = c.request_sync(req);
+    CHECK_FALSE(r.has_value());
+    CHECK(completions.load() == 1);   // notified exactly once, despite throwing
+
+    // The loop survived the throw: a plain request on the same Client still
+    // works. This is the part that would hang or crash if the exception had
+    // unwound through the executor handler.
+    auto again = c.request_sync(Request(Method::Get, to_owning(url_for(srv.port()))));
+    CHECK_FALSE(again.has_value());   // same truncated server: fails, but answers
+}
+
 // ---------------------------------------------------------------------------
 // defect #4: a sink that returns false actually stops delivery.
 //
@@ -388,6 +423,111 @@ TEST_CASE("a truncated streamed response reports the error to the sink",
 // assertion is that no second chunk is delivered while paused, i.e. the client
 // stopped reading instead of buffering and pushing everything through.
 // ---------------------------------------------------------------------------
+// A single socket read can contain several chunks. Pausing after the first one
+// must not drop the rest of that read: the CRLF that follows the paused chunk
+// and every chunk behind it live in the same buffer, and the buffer dies when
+// feed() returns. This is the case the two-write test above cannot reach.
+TEST_CASE("a pause mid-read keeps the rest of the same buffer",
+          "[streaming][network][backpressure]") {
+    ScriptedServer srv;
+    REQUIRE(srv.start());
+    ScriptedServer::Response resp;
+    resp.head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    // Three chunks, all in one write: 5 "first", 6 "second", 5 "third".
+    resp.body = "5\r\nfirst\r\n6\r\nsecond\r\n5\r\nthird\r\n0\r\n\r\n";
+    resp.split_body = false;
+    srv.set_response(resp);
+
+    Client c;
+    Request req(Method::Get, to_owning(url_for(srv.port())));
+
+    auto flow = std::make_shared<Request::BodySinkFlow>();
+    std::atomic<int> chunks{0};
+    std::atomic<bool> paused_once{false};
+    std::string collected;
+
+    req.set_body_sink(
+        [&](string_view chunk) {
+            collected.append(chunk.data(), static_cast<size_t>(chunk.size()));
+            if (++chunks == 1) {
+                paused_once.store(true);
+                return false;      // stop right after the first chunk
+            }
+            return true;
+        },
+        [](VoidResult) {},
+        flow);
+
+    std::thread resumer([&] {
+        for (int i = 0; i < 200; ++i) {
+            if (paused_once.load()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        flow->resume();
+    });
+
+    auto r = c.request_sync(req);
+    resumer.join();
+
+    REQUIRE(r);
+    // Every byte must survive, including the ones that shared the paused read.
+    CHECK(collected == "firstsecondthird");
+    CHECK(chunks.load() >= 2);   // the pause really did stop delivery
+}
+
+// Several pauses inside ONE read. Each pause stores a leftover tail; the next
+// feed() must start from a clean leftover, otherwise a stale value makes the
+// client copy bytes past the end of the new buffer (or copy the wrong range).
+// This is the multi-round counterpart of the single-pause test above.
+TEST_CASE("repeated pauses inside one read keep every byte",
+          "[streaming][network][backpressure]") {
+    ScriptedServer srv;
+    REQUIRE(srv.start());
+    ScriptedServer::Response resp;
+    resp.head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    // Five chunks in a single write.
+    resp.body = "1\r\na\r\n1\r\nb\r\n1\r\nc\r\n1\r\nd\r\n1\r\ne\r\n0\r\n\r\n";
+    resp.split_body = false;
+    srv.set_response(resp);
+
+    Client c;
+    Request req(Method::Get, to_owning(url_for(srv.port())));
+
+    auto flow = std::make_shared<Request::BodySinkFlow>();
+    std::atomic<int> chunks{0};
+    std::atomic<bool> started{false};
+    std::string collected;
+
+    req.set_body_sink(
+        [&](string_view chunk) {
+            collected.append(chunk.data(), static_cast<size_t>(chunk.size()));
+            started.store(true);
+            // Pause after the first three chunks, in three separate rounds.
+            return ++chunks > 3;
+        },
+        [](VoidResult) {},
+        flow);
+
+    std::thread resumer([&] {
+        for (int i = 0; i < 200 && !started.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        // Resume three times, letting each pause settle in between.
+        for (int round = 0; round < 3; ++round) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            flow->resume();
+        }
+    });
+
+    auto r = c.request_sync(req);
+    resumer.join();
+
+    REQUIRE(r);
+    CHECK(collected == "abcde");   // nothing lost across three pause rounds
+    CHECK(chunks.load() == 5);     // and nothing delivered twice
+}
+
 TEST_CASE("a paused sink stops delivery until it resumes",
           "[streaming][network][backpressure]") {
     ScriptedServer srv;

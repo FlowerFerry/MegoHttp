@@ -521,6 +521,23 @@ TEST_CASE("tls stream refuses to start without an open underlying stream", "[tls
     CHECK(code == ErrorCode::InvalidArgument);
 }
 
+TEST_CASE("tls close before start still reports exactly once", "[tls]") {
+    // async_close() before start(): self_ was never established, so the close
+    // notification cannot come from the self-holding weak_ptr. It has to fire
+    // directly, exactly once, and a second close must not fire again.
+    auto tls = make_tls_stream(nullptr, make_config("localhost", "ca.pem"));
+    REQUIRE(tls != nullptr);
+
+    int calls = 0;
+    tls->async_close([&] { ++calls; });
+    CHECK(calls == 1);
+
+    tls->async_close([&] { ++calls; });
+    CHECK(calls == 1);          // second close: no extra notification
+
+    CHECK(!tls->is_open());
+}
+
 TEST_CASE("tls write before the handshake is rejected", "[tls]") {
     PythonTlsServer srv;
     REQUIRE(srv.start("server-cert.pem", "server-key.pem"));
