@@ -127,6 +127,32 @@ namespace megohttp {
             std::shared_ptr<Timer> dns_timer;
             CancelHandle dns_cancel;
 
+            // ONE connection-stage deadline covering DNS, TCP, proxy TLS,
+            // CONNECT and the target TLS handshake (S5.8-01). Armed once per
+            // attempt and never re-armed, so a proxy that accepts TCP and then
+            // stalls mid-handshake cannot buy itself a fresh connect_timeout.
+            //
+            // Errors report the phase that was actually running when it fired,
+            // which is what makes "the proxy handshake timed out" distinguishable
+            // from "the target handshake timed out".
+            std::shared_ptr<Timer> connect_stage_timer;
+            bool connect_stage_done{false};
+            // Wall point the whole connection stage must be finished by. Kept
+            // so sub-stages can be handed the REMAINING time instead of a fresh
+            // full budget -- connect_race arms its own timer, and without this
+            // TCP would silently get a second connect_timeout after DNS had
+            // already spent part of the first one.
+            TimePoint connect_stage_deadline{};
+
+            // Milliseconds left in the connection stage. Zero means "no budget"
+            // (unlimited), which is also what a disabled connect_timeout means.
+            Duration connect_stage_remaining() const {
+                if (connect_stage_done) return Duration::zero();
+                const auto now = Clock::now();
+                if (connect_stage_deadline <= now) return Duration::zero();
+                return connect_stage_deadline - now;
+            }
+
             RequestPhase phase{RequestPhase::Idle};
 
             // True when the request head carried Expect: 100-continue and the body
@@ -219,6 +245,7 @@ namespace megohttp {
                 if (finished.exchange(true)) return;
                 if (total_timer) total_timer->cancel();
                 if (dns_timer) dns_timer->cancel();
+                if (connect_stage_timer) { connect_stage_timer->cancel(); connect_stage_timer.reset(); }
                 if (retry_timer) { retry_timer->cancel(); retry_timer.reset(); }
                 dns_cancel.cancel();   // stop a late DNS answer from firing the callback
 
@@ -1867,6 +1894,13 @@ namespace megohttp {
                 s->pooled_clean = false;   // the 3xx body may not have been drained
                 s->stream.reset();
                 s->tls_stream.reset();
+                // A new hop is a new connection stage. The previous one was
+                // already disarmed when its exchange started, so re-arm it here
+                // or the next connect would be unbounded (S5.8-01).
+                //
+                // NOTE: total_timeout is deliberately NOT re-armed -- it spans
+                // the whole logical request, redirects included (S5.2-04).
+                s->connect_stage_done = false;
 
                 // Restart the pipeline for the new URL.
                 begin(s);
@@ -1902,6 +1936,11 @@ namespace megohttp {
                 s->stream.reset();
                 s->tls_stream.reset();
                 s->pooled_stream.reset();
+                // Same reasoning as the redirect path: a retry reconnects, so it
+                // needs its own connection stage. total_timeout still spans the
+                // whole logical request (S5.3-02), which is what the cross-retry
+                // deadline test asserts.
+                s->connect_stage_done = false;
 
                 // Wait out the backoff on the loop thread. The timer lives on the
                 // state so finish() can cancel it; without that a request retired
@@ -2103,6 +2142,13 @@ namespace megohttp {
                             return;
                         }
                         // Reused a pooled connection: it is already connected.
+                        //
+                        // No connection stage to bound here. The stream came out
+                        // of the pool already established, so there is no DNS,
+                        // TCP, proxy or TLS work left -- arming connect_timeout
+                        // would kill a perfectly healthy request on a slow
+                        // exchange (S5.8-01).
+                        s->connect_stage_done = true;
                         s->stream = conn.value().stream;
                         s->pooled_stream = conn.value().stream;
                         s->pooled_clean = false;  // not clean until framing completes
@@ -2115,10 +2161,70 @@ namespace megohttp {
             start_connect(st, std::move(head.value()));
         }
 
+        // -------------------------------------------------------------------
+        // Connection-stage deadline (S5.8-01)
+        //
+        // DNS + TCP + proxy TLS + CONNECT + SOCKS5 + target TLS share ONE
+        // deadline, armed when the connection stage begins and disarmed when the
+        // exchange takes over. Without it every proxy sub-stage was unbounded:
+        // connect_timeout only reached connect_race, and a proxy that accepted
+        // TCP and then stalled mid-TLS would hold the request forever whenever
+        // total_timeout was left at its default of 0.
+        //
+        // The error names the phase that was actually in flight, so "the proxy
+        // handshake hung" stays distinguishable from "the target handshake hung".
+        // -------------------------------------------------------------------
+        static void arm_connect_stage(const std::shared_ptr<detail::RequestState>& st) {
+            if (st->connect_stage_done) return;   // already over; never re-arm
+            const Duration d = st->options.connect_timeout;
+            if (d == Duration::zero()) return;
+            st->connect_stage_deadline = Clock::now() + d;
+            std::weak_ptr<detail::RequestState> tw = st;
+            st->connect_stage_timer = st->executor->schedule_after(d, [tw] {
+                auto s = tw.lock();
+                if (!s || s->finished.load()) return;
+                s->connect_stage_timer.reset();
+                const ErrorPhase p = connect_stage_phase(s->phase);
+                s->finish(Error{ErrorCode::TimeoutConnect, p,
+                                string("connection stage timed out")});
+            });
+        }
+
+        static void disarm_connect_stage(const std::shared_ptr<detail::RequestState>& st) {
+            st->connect_stage_done = true;
+            if (st->connect_stage_timer) {
+                st->connect_stage_timer->cancel();
+                st->connect_stage_timer.reset();
+            }
+        }
+
+        // Maps the in-flight RequestPhase onto the phase a caller sees. The
+        // proxy stages keep their own names on purpose: telling a caller that a
+        // proxy handshake timed out as "TcpConnect" would hide which hop broke.
+        static ErrorPhase connect_stage_phase(detail::RequestPhase p) {
+            switch (p) {
+            case detail::RequestPhase::ProxyResolve:       return ErrorPhase::ProxyResolve;
+            case detail::RequestPhase::ProxyConnect:       return ErrorPhase::ProxyConnect;
+            case detail::RequestPhase::ProxyTls:           return ErrorPhase::ProxyTls;
+            case detail::RequestPhase::ProxyAuth:          return ErrorPhase::ProxyAuth;
+            case detail::RequestPhase::ProxyConnectTunnel: return ErrorPhase::ProxyConnectTunnel;
+            case detail::RequestPhase::TlsHandshake:       return ErrorPhase::TargetTls;
+            case detail::RequestPhase::SendHead:
+            case detail::RequestPhase::SendBody:           return ErrorPhase::Send;
+            case detail::RequestPhase::Receive:            return ErrorPhase::Receive;
+            default:                                       return ErrorPhase::TcpConnect;
+            }
+        }
         // Resolve, race the addresses, then continue to TLS/exchange. Split out so
         // the pooled path can reach the same code after the pool says "open one".
         static void start_connect(const std::shared_ptr<detail::RequestState>& st,
                                   string head) {
+            // A real connection is about to be made: DNS, TCP, every proxy
+            // handshake and the target TLS all fall under this one deadline.
+            // Armed once and never re-armed by the proxy stages below, which is
+            // what stops a proxy from buying a fresh budget at each sub-step.
+            arm_connect_stage(st);
+
             std::weak_ptr<detail::RequestState> weak = st;
 
             // With a proxy in play the TCP connection goes to the PROXY. The
@@ -2166,8 +2272,14 @@ namespace megohttp {
                 }
             }
 
-            // DNS timeout: covers the resolve stage only. Cancelling the resolve
-            // handle tells the resolver to drop its late answer (S2.3-02).
+            // DNS timeout: covers ONLY the resolve stage, as a sub-deadline of
+            // the connection stage. Cancelling the resolve handle tells the
+            // resolver to drop its late answer (S2.3-02).
+            //
+            // This stays a separate timer from the connection-stage one because
+            // it must report TimeoutResolve -- a resolver that never answers is a
+            // different failure from a TCP connect that never completes, and the
+            // caller may want to retry the two differently.
             if (st->options.dns_timeout != Duration::zero()) {
                 std::weak_ptr<detail::RequestState> tw = st;
                 st->dns_timer = st->executor->schedule_after(st->options.dns_timeout, [tw] {
@@ -2180,6 +2292,10 @@ namespace megohttp {
                                     string("DNS resolution timed out")});
                 });
             }
+
+            // The connection-stage deadline is armed in start_connect(), not here:
+            // a request served out of the pool never reaches that function and has
+            // no connect work to bound (S5.8-01).
 
             auto dns_handle = st->resolver->resolve(host, port, [weak, head = std::move(head)](
                                            Result<AddressList> resolved) mutable {
@@ -2197,7 +2313,17 @@ namespace megohttp {
                 s->phase = s->proxy.is_set() ? detail::RequestPhase::ProxyConnect
                                              : detail::RequestPhase::Connect;
                 ConnectOptions copts;
+                // The race arms its OWN deadline, so hand it what is LEFT of the
+                // connection stage rather than the configured timeout again. A
+                // fresh budget here would let DNS + TCP together exceed
+                // connect_timeout (S5.8-01).
                 copts.connect_timeout = s->options.connect_timeout;
+                if (!s->connect_stage_done) {
+                    const Duration left = s->connect_stage_remaining();
+                    if (left != Duration::zero() && left < copts.connect_timeout) {
+                        copts.connect_timeout = left;
+                    }
+                }
                 auto addresses = std::move(resolved.value());
 
                 std::weak_ptr<detail::RequestState> w2 = s;
@@ -2701,6 +2827,12 @@ namespace megohttp {
         // Free of `this` so it can run from a detached async callback: the
         // request state carries everything the exchange needs.
         static void begin_exchange(const std::shared_ptr<detail::RequestState>& st, string head) {
+            // The connection stage is over: DNS, TCP, every proxy handshake and
+            // the target TLS are done. From here send_timeout / recv_timeout take
+            // over, so the connect deadline must not fire against a healthy
+            // exchange (S5.8-01).
+            disarm_connect_stage(st);
+
             // Order matters: the Exchange must exist before the parser (which
             // stores a reference to it), and the Exchange must keep itself alive
             // while the exchange is in flight. It does so via shared_from_this().

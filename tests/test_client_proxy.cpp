@@ -885,4 +885,48 @@ TEST_CASE("layered TLS: a wrong proxy CA fails at the proxy layer",
     CHECK(r.error().phase() == ErrorPhase::ProxyTls);
 }
 
+// ---------------------------------------------------------------------------
+// S5.8-01: the connection-stage deadline covers the PROXY handshake.
+//
+// The proxy accepts the TCP connection and then says nothing for 30 s. Because
+// TCP succeeded, no per-stage timeout can catch this: only a deadline spanning
+// DNS -> TCP -> proxy TLS -> CONNECT -> target TLS can. Before this the request
+// hung until the Client was destroyed whenever total_timeout was left at 0.
+//
+// The phase assertion is what keeps the diagnostic honest: the caller must be
+// told the PROXY handshake timed out, not "TcpConnect".
+// ---------------------------------------------------------------------------
+TEST_CASE("a stalled proxy TLS handshake is bounded by connect_timeout",
+          "[proxy][client][https_proxy][deadline]") {
+    ProxyServer proxy;
+    REQUIRE(proxy.start("connect", std::string("--tls-cert \"") + fixture("server-cert.pem") +
+                                       "\" --tls-key \"" + fixture("server-key.pem") +
+                                       "\" --tls-handshake-delay 30"));
+
+    ClientOptions o;
+    o.proxy.proxy.type = ProxyType::Https;
+    o.proxy.proxy.host = string("127.0.0.1");
+    o.proxy.proxy.port = proxy.port();
+    o.proxy.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.proxy.tls.hostname = string("localhost");
+    o.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.tls.hostname = string("localhost");
+    // Short connect budget. total_timeout stays disabled on purpose: the
+    // connection stage must bound this on its own.
+    o.connect_timeout = std::chrono::milliseconds(400);
+    o.total_timeout = std::chrono::milliseconds(0);
+
+    Client c(o);
+    const auto t0 = std::chrono::steady_clock::now();
+    auto r = c.request_sync(Request(Method::Get, to_owning("https://localhost:1/")));
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0);
+
+    REQUIRE_FALSE(r);
+    CHECK(r.error().code() == ErrorCode::TimeoutConnect);
+    CHECK(r.error().phase() == ErrorPhase::ProxyTls);
+    // Fired on the 400 ms budget, not after the 30 s stall.
+    CHECK(elapsed < std::chrono::milliseconds(5000));
+}
+
 #endif // !MGHTTP_TLS_NONE

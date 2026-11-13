@@ -204,8 +204,8 @@ TEST_CASE("client validates a certificate signed by an intermediate CA",
 
 TEST_CASE("handshake timeout aborts a stalled server", "[tls][client][timeout]") {
     // The server accepts the TCP connection but then waits 30 s before ever
-    // touching TLS. A 1 s handshake timeout must expire first and return a
-    // TimeoutTotal error.
+    // touching TLS. Nothing but a bounded connection stage can escape this:
+    // TCP succeeded, so a per-TCP timeout is not in play.
     HttpsServer srv;
     REQUIRE(srv.start("server-cert.pem", "server-key.pem",
                       "--handshake-delay 30"));
@@ -217,20 +217,25 @@ TEST_CASE("handshake timeout aborts a stalled server", "[tls][client][timeout]")
 
     ClientOptions opt;
     opt.tls = std::move(tls);
-    // 1 s total timeout, short enough to fire before the 30 s handshake delay.
-    opt.total_timeout = std::chrono::seconds(1);
+    // connect_timeout covers DNS + TCP + target TLS. total_timeout stays off so
+    // this test cannot pass on the general backstop instead of the stage
+    // deadline (S5.8-01).
+    opt.connect_timeout = std::chrono::milliseconds(500);
+    opt.total_timeout = std::chrono::milliseconds(0);
     Client c(opt);
     Request req(Method::Get, to_s(url_for(srv.port())));
 
+    const auto t0 = std::chrono::steady_clock::now();
     auto r = c.request_sync(req);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0);
     REQUIRE(!r);
-    // The deadline can land in different stages depending on timing, so accept
-    // any of the timeout codes rather than pinning one that may flap.
-    const ErrorCode code = r.error().code();
-    const bool is_timeout = code == ErrorCode::TimeoutTotal ||
-                            code == ErrorCode::TimeoutConnect ||
-                            code == ErrorCode::TimeoutSend;
-    CHECK(is_timeout);
+    // The phase is now pinned rather than accepted as "one of several": the
+    // connection stage reports the handshake it was actually in.
+    CHECK(r.error().code() == ErrorCode::TimeoutConnect);
+    CHECK(r.error().phase() == ErrorPhase::TargetTls);
+    // Fired well before the 30 s stall would have ended.
+    CHECK(elapsed < std::chrono::milliseconds(5000));
 }
 
 #endif // MGHTTP_TLS_NONE
