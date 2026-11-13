@@ -293,6 +293,87 @@ namespace megohttp {
 
         };
 
+        // Bridges MultipartResponseParser to the caller's MultipartSink.
+        //
+        // A separate class rather than letting Exchange implement both callback
+        // interfaces: both declare on_complete(), so one class cannot be both.
+        //
+        // The two completion conditions stay apart on purpose. The parser's
+        // on_complete here only RECORDS that the closing boundary was seen; the
+        // sink's on_complete fires later, from the Exchange, once the HTTP
+        // message has also completed. A closing boundary says nothing about the
+        // epilogue that may follow, and nothing about the framing being intact.
+        class MultipartBridge final : public MultipartResponseParser::Callbacks {
+        public:
+            explicit MultipartBridge(std::shared_ptr<MultipartSink> sink)
+                : sink_(std::move(sink)) {}
+
+            VoidResult on_part_start(const Headers& headers) override {
+                MultipartPartHead h;
+                h.headers = headers;
+                h.index = index_++;
+                // A throwing sink must not unwind through the parser/loop, and it
+                // must become a terminal error rather than a silently skipped part.
+                try {
+                    sink_->on_part_begin(h);
+                } catch (...) {
+                    return Error{ErrorCode::Unknown, ErrorPhase::MultipartParse,
+                                 string("multipart sink threw from on_part_begin")};
+                }
+                return VoidResult{};
+            }
+
+            bool on_part_data(string_view data) override {
+                try {
+                    // Any byte that reaches the caller makes a retry unsafe: it
+                    // would re-deliver the same part data.
+                    if (data.size() > 0) delivered_ = true;
+                    const bool keep_going = sink_->on_part_data(
+                        reinterpret_cast<const uint8_t*>(data.data()), data.size());
+                    if (!keep_going) paused_ = true;
+                    return keep_going;
+                } catch (...) {
+                    threw_ = true;
+                    throw_error_ = Error{ErrorCode::Unknown, ErrorPhase::MultipartParse,
+                                         string("multipart sink threw from on_part_data")};
+                    return false;   // stop the parser; the Exchange re-raises threw()
+                }
+            }
+
+            VoidResult on_part_end() override {
+                try {
+                    sink_->on_part_end();
+                } catch (...) {
+                    return Error{ErrorCode::Unknown, ErrorPhase::MultipartParse,
+                                 string("multipart sink threw from on_part_end")};
+                }
+                return VoidResult{};
+            }
+
+            // Closing boundary found. NOT the terminal event the caller receives.
+            VoidResult on_complete() override {
+                multipart_complete = true;
+                return VoidResult{};
+            }
+
+            bool threw() const noexcept { return threw_; }
+            const Error& throw_error() const noexcept { return throw_error_; }
+            void clear_threw() noexcept { threw_ = false; }
+            bool paused() const noexcept { return paused_; }
+            void clear_paused() noexcept { paused_ = false; }
+            bool multipart_complete{false};
+            // True once ANY part data reached the sink, so a retry policy knows
+            // the caller has seen payload bytes.
+            bool delivered() const noexcept { return delivered_; }
+
+        private:
+            std::shared_ptr<MultipartSink> sink_;
+            size_t index_{0};
+            bool threw_{false};
+            bool paused_{false};
+            bool delivered_{false};
+            Error throw_error_{};
+        };
         // Drives one response over a connected stream: write the head, then feed
         // every byte to the ResponseParser until on_complete.
         class Exchange final : public ResponseParser::Callbacks,
@@ -642,7 +723,98 @@ namespace megohttp {
                 rh.informational_status_codes = head.informational;
 
                 // S3.2-02: Choose buffered or streaming mode based on request.
-                if (auto& bs = state_->request.body_sink()) {
+                //
+                // Three consumers exist and exactly one is chosen:
+                //   multipart sink -> bytes go to the multipart parser only
+                //   body sink      -> bytes go to the caller's sink
+                //   neither        -> bytes accumulate in BufferSink
+                // Request itself guarantees the sinks are mutually exclusive, so
+                // this is a priority chain rather than a validation.
+                if (auto& ms = state_->request.multipart_sink()) {
+                    head_ = std::move(rh);
+                    // The parser needs the boundary, which may live in the
+                    // response Content-Type. Resolving it here means the ordinary
+                    // case needs no extra code from the caller.
+                    MultipartResponseOptions mopt = state_->request.multipart_options();
+                    string boundary = mopt.boundary;
+                    if (boundary.empty()) {
+                        if (!head_->content_type) {
+                            return Error{ErrorCode::MultipartMediaTypeInvalid,
+                                         ErrorPhase::Receive,
+                                         string("multipart response has no Content-Type")};
+                        }
+                        std::vector<string> subtypes;
+                        if (!mopt.basic_parse_unvalidated) {
+                            subtypes.push_back(string("mixed"));
+                            subtypes.push_back(string("related"));
+                            subtypes.push_back(string("byteranges"));
+                            subtypes.push_back(string("x-mixed-replace"));
+                        }
+                        auto parsed = parse_multipart_boundary(
+                            to_view(*head_->content_type), subtypes);
+                        if (!parsed) { return parsed.error(); }
+                        boundary = std::move(parsed.value());
+                    }
+                    mopt.limits.allow_continuous_stream = mopt.allow_continuous_stream;
+
+                    multipart_sink_ = ms;
+                    multipart_bridge_ = std::make_shared<MultipartBridge>(ms);
+                    multipart_parser_ = std::make_unique<MultipartResponseParser>(
+                        *multipart_bridge_, to_view(boundary), mopt.limits);
+
+                    // Backpressure, same shape as the BodySink path below:
+                    // resume() comes from the caller's thread, so it posts back
+                    // onto the executor before touching the stream.
+                    multipart_flow_ = state_->request.multipart_flow();
+                    if (multipart_flow_) {
+                        multipart_paused_ = multipart_flow_->is_paused();
+                        std::weak_ptr<Exchange> weak = shared_from_this();
+                        auto exec = state_->executor;
+                        multipart_flow_->set_wake([weak, exec]() {
+                            if (!exec) return;
+                            exec->post([weak]() {
+                                auto self = weak.lock();
+                                if (!self) return;
+                                // complete_ may already be true: the HTTP message
+                                // can finish while the sink is parked, and the
+                                // deferred terminal is exactly what this wake-up
+                                // exists to deliver.
+                                if (!self->multipart_paused_ && !self->deferred_complete_) return;
+                                if (!self->multipart_paused_) return;
+                                self->multipart_paused_ = false;
+                                if (self->multipart_bridge_) self->multipart_bridge_->clear_paused();
+                                // The multipart parser still holds the block it
+                                // paused on (paused_skip_ is only cleared by the
+                                // next feed). Kick it with an empty feed first:
+                                // feed_eof() against a buffer that still has real
+                                // payload would report a spurious truncation.
+                                if (self->multipart_parser_) {
+                                    auto rr = self->multipart_parser_->feed(nullptr, 0);
+                                    if (!rr) { self->fail(rr.error()); return; }
+                                    if (self->multipart_bridge_->threw()) {
+                                        auto e = self->multipart_bridge_->throw_error();
+                                        self->multipart_bridge_->clear_threw();
+                                        self->fail(e);
+                                        return;
+                                    }
+                                    if (self->multipart_bridge_->paused()) {
+                                        // Paused again on the replayed block.
+                                        self->multipart_paused_ = true;
+                                        self->multipart_flow_->pause();
+                                        return;
+                                    }
+                                }
+                                if (self->deferred_complete_) {
+                                    self->deferred_complete_ = false;
+                                    auto fr = self->finish_complete_side();
+                                    if (!fr) self->fail(fr.error());
+                                } else {
+                                    self->read_more();
+                                }
+                            });
+                        });
+                    }
+                } else if (auto& bs = state_->request.body_sink()) {
                     body_sink_ = bs;
                     body_sink_complete_ = state_->request.body_sink_complete();
                     // The caller still needs the status line, headers and framing
@@ -745,6 +917,35 @@ namespace megohttp {
             }
 
             VoidResult deliver_decoded_checked(const uint8_t* data, size_t size) {
+                // multipart parsing sits at the END of the pipeline: HTTP framing
+                // -> content decoding -> here. Fed after decoding, so a gzipped
+                // multipart response is parsed identically to a plain one.
+                if (multipart_parser_) {
+                    // Data reaching the parser will reach the caller's sink as
+                    // parts, so "delivered" becomes true as soon as a part has
+                    // bytes -- the same rule that stops a retry re-delivering.
+                    auto r = multipart_parser_->feed(data, size);
+                    if (!r) return r;
+                    if (multipart_bridge_->threw()) {
+                        auto e = multipart_bridge_->throw_error();
+                        multipart_bridge_->clear_threw();
+                        return e;
+                    }
+                    if (multipart_bridge_->delivered()) state_->body_delivered = true;
+                    if (multipart_bridge_->paused()) {
+                        // The sink asked to pause. With a flow attached the read
+                        // loop stops here and only restarts on resume(); without
+                        // one there is no way to signal a resume, so the
+                        // historical "keep going" behaviour is the only
+                        // non-hanging option.
+                        if (multipart_flow_) {
+                            multipart_paused_ = true;
+                            multipart_flow_->pause();
+                        }
+                    }
+                    return VoidResult{};
+                }
+
                 // "Delivered" means the CALLER has bytes. In buffered mode the
                 // body accumulates internally and the caller sees nothing until
                 // finish(), so a retry would not re-deliver anything -- that is
@@ -795,6 +996,17 @@ namespace megohttp {
             // segments in the same buffer. sink_paused_ alone only gated the
             // NEXT read, so a single feed() carrying several body segments kept
             // calling a sink that had already asked to wait.
+            // Told to the parser after every body delivery: when the sink has
+            // paused, feed() must stop here instead of walking on to further
+            // segments in the same buffer. sink_paused_ alone only gated the
+            // NEXT read, so a single feed() carrying several body segments kept
+            // calling a sink that had already asked to wait.
+            //
+            // A paused MULTIPART stream is deliberately NOT included. The
+            // multipart parser keeps its own buffer and reports its own
+            // progress, so rolling the HTTP parser back as well would hand the
+            // same bytes to the multipart parser twice. Its pause only gates the
+            // socket read (read_more / feed_and_continue).
             bool pause_requested() const override { return sink_paused_; }
 
             VoidResult on_trailers(const Headers& tr) override {
@@ -811,7 +1023,6 @@ namespace megohttp {
             }
 
             VoidResult on_complete() override {
-                complete_ = true;
                 disarm_recv_timer();
 
                 // The decoder may still hold output (a trailing block, or a
@@ -828,6 +1039,50 @@ namespace megohttp {
                     }
                 }
 
+                // A paused multipart stream means the caller has not consumed the
+                // last block yet. The HTTP message is complete, but reporting the
+                // terminal now would hand the caller a "success" while its own
+                // callback is still parked mid-part.
+                //
+                // This check comes BEFORE the completeness check below, and the
+                // order matters: feed_eof() on a parser that is still parked
+                // mid-block reports a truncation that does not exist.
+                //
+                // NOTE: `complete_` must NOT be set here. feed_and_continue()
+                // uses it to decide whether to save the unconsumed tail into
+                // pending_; setting it early dropped exactly the bytes this
+                // pause produced. The deferred path is guarded by
+                // deferred_complete_ instead.
+                if (multipart_paused_) {
+                    deferred_complete_ = true;
+                    return VoidResult{};
+                }
+
+                return finish_complete_side();
+            }
+
+            // Everything on_complete does once the pause question is settled.
+            // Split out so a deferred completion can be replayed from the
+            // resume path without re-running the decoder flush.
+            //
+            // Sets complete_ itself: the deferred caller reaches here directly,
+            // and without this the Exchange kept reading a message that was
+            // already over (the request then hung until the Client was
+            // destroyed and answered "client is shutting down").
+            VoidResult finish_complete_side() {
+                complete_ = true;
+
+                // multipart completeness is INDEPENDENT of HTTP framing
+                // completeness. The HTTP message can end while the multipart
+                // message never saw its closing boundary (close-delimited framing
+                // that stops after a part, or a body truncated at a matching
+                // Content-Length). That is a failure, and the connection must not
+                // be pooled: the caller would believe it has a complete message.
+                if (multipart_parser_ && !multipart_bridge_->multipart_complete) {
+                    auto eof = multipart_parser_->feed_eof();
+                    if (!eof) return eof;
+                }
+
                 if (redirect_pending_) {
                     // The 3xx was consumed; the next hop is the Client's job.
                     // Report through the state so the connection is returned to
@@ -841,6 +1096,12 @@ namespace megohttp {
                 // The response framing reached its end. Whether the connection may
                 // be reused is a separate question: the server must not have asked
                 // to close, and the message must not have been delimited by close.
+                //
+                // A multipart message that did not complete already failed in
+                // on_complete() above, and every failure goes through fail(), which
+                // skips this block entirely. An extra `multipart_ok &&` guard was
+                // written and then removed -- it was unreachable, and a guard that
+                // cannot run is not a defence.
                 if (state_->pooled_stream) {
                     const bool framed_fully = parser_->leftover_offset() == 0;
                     state_->pooled_clean = framed_fully && !head_connection_close_;
@@ -866,6 +1127,17 @@ namespace megohttp {
                     auto response = buffer_sink_->finish();
                     apply_encoding_facts(response);
                     state_->finish(std::move(response));
+                } else if (multipart_sink_) {
+                    // Both halves are settled: the HTTP message completed and the
+                    // multipart message saw its closing boundary (checked above).
+                    // Only now is the caller told the whole thing succeeded -- a
+                    // part ending says nothing about this.
+                    notify_multipart_complete();
+                    ResponseHead rh = head_ ? std::move(*head_) : ResponseHead{};
+                    Response out(std::move(rh), {});
+                    out.set_body_streamed();
+                    apply_encoding_facts(out);
+                    state_->finish(std::move(out));
                 } else if (body_sink_complete_) {
                     // S3.2-02: Streaming mode complete. The caller gets the head
                     // it was promised; the body went to its sink, so body_bytes()
@@ -932,6 +1204,7 @@ namespace megohttp {
                         reinterpret_cast<const uint8_t*>(sv.data()) + sv.size());
                 }
                 if (sink_paused_) return;
+                if (multipart_paused_) return;
                 read_more();
             }
 
@@ -939,6 +1212,7 @@ namespace megohttp {
                 // A paused sink must be resumed first; feeding more bytes now
                 // would deliver them before the caller asked for them.
                 if (sink_paused_) return;
+                if (multipart_paused_) return;
                 // Replay the tail the parser could not consume last time before
                 // reading anything new. Without this the CRLF and any following
                 // chunk that shared the same socket read were dropped.
@@ -1009,7 +1283,35 @@ namespace megohttp {
                 // leave it waiting forever, because only the success path called
                 // it.
                 notify_sink_failed(e);
+                // Same promise for a multipart caller: on_error exactly once,
+                // and no part callback after it.
+                notify_multipart_failed(e);
                 state_->fail(e);
+            }
+
+            // Delivers the terminal success/failure to the MultipartSink.
+            // Exactly one of on_complete or on_error is delivered.
+            void notify_multipart_complete() {
+                if (!multipart_sink_) return;
+                auto sink = std::move(multipart_sink_);
+                multipart_parser_.reset();
+                multipart_bridge_.reset();
+                try {
+                    sink->on_complete();
+                } catch (...) {
+                    // Request is already terminal; nothing else to report.
+                }
+            }
+
+            void notify_multipart_failed(const Error& e) {
+                if (!multipart_sink_) return;
+                auto sink = std::move(multipart_sink_);
+                multipart_parser_.reset();
+                multipart_bridge_.reset();
+                try {
+                    sink->on_error(e);
+                } catch (...) {
+                }
             }
 
             // Delivers the streaming-mode terminal error, at most once.
@@ -1062,6 +1364,20 @@ namespace megohttp {
             // carry it to the caller.
             std::optional<ResponseHead> head_;
             bool complete_{false};
+            // S5.7-01: multipart response. Mutually exclusive with buffer_sink_
+            // and body_sink_. When set, decoded body bytes go to the parser
+            // instead of being buffered or delivered raw.
+            std::shared_ptr<MultipartSink> multipart_sink_;
+            std::unique_ptr<MultipartResponseParser> multipart_parser_;
+            std::shared_ptr<MultipartBridge> multipart_bridge_;
+            // Cross-thread pause/resume for the multipart stream. When attached,
+            // the sink can return false to pause delivery and a later resume()
+            // wakes the I/O thread to continue.
+            std::shared_ptr<Request::MultipartSinkFlow> multipart_flow_;
+            bool multipart_paused_{false};
+            // When on_complete fires while multipart_paused_ is true, the
+            // terminal notification must wait for resume().
+            bool deferred_complete_{false};
             // Expect: 100-continue bookkeeping (S3.1-09).
             bool expect_continue_pending_{false};
             bool body_sent_{false};

@@ -20,6 +20,13 @@ namespace megohttp {
         std::optional<Request::BodySink> body_sink;
         std::optional<Request::BodySinkComplete> body_sink_complete;
         std::shared_ptr<Request::BodySinkFlow> body_sink_flow;
+        // S5.7-01: multipart response parser attached to this request. Null
+        // means the body is delivered raw (buffer or BodySink).
+        std::shared_ptr<MultipartSink> multipart_sink;
+        MultipartResponseOptions multipart_options;
+        // Pause/resume for the multipart stream. Null means a `false` from
+        // on_part_data cannot be honoured (nothing could resume it).
+        std::shared_ptr<Request::MultipartSinkFlow> multipart_flow;
         // Content coding. Upload compression is opt-in; response decoding is on
         // by default because Accept-Encoding is sent by this library.
         Request::Compression compress{Request::Compression::None};
@@ -184,6 +191,9 @@ namespace megohttp {
         impl_->body_sink = std::move(sink);
         impl_->body_sink_complete = std::move(complete);
         impl_->body_sink_flow.reset();
+        // One consumer per body. Leaving the multipart sink attached would make
+        // the Client pick one of two pipelines by accident.
+        impl_->multipart_sink.reset();
     }
 
     inline void Request::set_body_sink(BodySink sink, BodySinkComplete complete,
@@ -191,6 +201,31 @@ namespace megohttp {
         impl_->body_sink = std::move(sink);
         impl_->body_sink_complete = std::move(complete);
         impl_->body_sink_flow = std::move(flow);
+        impl_->multipart_sink.reset();
+    }
+
+    inline void Request::set_multipart_sink(std::shared_ptr<MultipartSink> sink,
+                                            MultipartResponseOptions options,
+                                            std::shared_ptr<MultipartSinkFlow> flow) {
+        impl_->multipart_sink = std::move(sink);
+        impl_->multipart_options = std::move(options);
+        impl_->multipart_flow = std::move(flow);
+        // Mutually exclusive with the raw-sink path; see set_body_sink.
+        impl_->body_sink.reset();
+        impl_->body_sink_complete.reset();
+        impl_->body_sink_flow.reset();
+    }
+
+    inline const std::shared_ptr<MultipartSink>& Request::multipart_sink() const noexcept {
+        return impl_->multipart_sink;
+    }
+
+    inline const MultipartResponseOptions& Request::multipart_options() const noexcept {
+        return impl_->multipart_options;
+    }
+
+    inline const std::shared_ptr<Request::MultipartSinkFlow>& Request::multipart_flow() const noexcept {
+        return impl_->multipart_flow;
     }
 
     inline const std::shared_ptr<Request::BodySinkFlow>& Request::body_sink_flow() const noexcept {

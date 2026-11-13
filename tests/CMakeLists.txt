@@ -29,6 +29,7 @@ set(MGHTTP_TEST_SOURCES
     test_multipart.cpp
     test_multipart_response.cpp
     test_multipart_continuous.cpp
+    test_multipart_client.cpp
     test_content_range.cpp
     test_content_type.cpp
     test_fuzz_parsers.cpp

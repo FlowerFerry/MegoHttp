@@ -5,6 +5,7 @@
 #include <megohttp/error.hpp>
 #include <megohttp/headers.hpp>
 #include <megohttp/http.hpp>
+#include <megohttp/multipart_sink.hpp>
 #include <megohttp/string_adapter.hpp>
 #include <megohttp/url.hpp>
 
@@ -120,6 +121,32 @@ namespace megohttp {
         const std::optional<BodySink>& body_sink() const noexcept;
         const std::optional<BodySinkComplete>& body_sink_complete() const noexcept;
         const std::shared_ptr<BodySinkFlow>& body_sink_flow() const noexcept;
+
+        // Pause/resume handle for a streaming multipart download. Same state
+        // machine as BodySinkFlow -- an alias rather than a second class, because
+        // a copy of the mechanics would only be a place for the two to drift.
+        using MultipartSinkFlow = BodySinkFlow;
+
+        // --- multipart response (S5.7-01) ---
+        // Attach a streaming multipart parser for the response body. The body is
+        // then parsed instead of delivered raw: Content-Encoding is still decoded
+        // first (HTTP framing -> decoding -> multipart), so a gzipped multipart
+        // response works unchanged.
+        //
+        // Mutually exclusive with BodySink: a request delivers body bytes to
+        // exactly one consumer, and setting one clears the other. Silently
+        // delivering the same bytes twice would duplicate part data.
+        //
+        // Pass a flow to get real backpressure: `on_part_data` returning false
+        // then stops the socket read until the flow is resumed. Without one the
+        // return value cannot be acted on (nothing could ever resume it) and the
+        // parser's internal buffer keeps absorbing data up to its byte caps.
+        void set_multipart_sink(std::shared_ptr<MultipartSink> sink,
+                                MultipartResponseOptions options = {},
+                                std::shared_ptr<MultipartSinkFlow> flow = nullptr);
+        const std::shared_ptr<MultipartSink>& multipart_sink() const noexcept;
+        const MultipartResponseOptions& multipart_options() const noexcept;
+        const std::shared_ptr<MultipartSinkFlow>& multipart_flow() const noexcept;
 
         // --- Content coding ---
         // Request body compression. OFF by default: compressing an upload

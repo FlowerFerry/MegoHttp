@@ -9,6 +9,8 @@
 #include <megohttp/config.hpp>
 #include <megohttp/connection_pool.hpp>
 #include <megohttp/content_decoder.hpp>
+#include <megohttp/content_type.hpp>
+#include <megohttp/multipart_sink.hpp>
 #include <megohttp/proxy.hpp>
 #include <megohttp/error.hpp>
 #include <megohttp/executor.hpp>
