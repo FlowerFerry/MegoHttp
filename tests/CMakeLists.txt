@@ -50,13 +50,15 @@ set(MGHTTP_TEST_SOURCES
     test_sse_session.cpp
     test_websocket.cpp
     test_websocket_deflate.cpp
-    test_websocket_reconnect.cpp
     test_reconnect.cpp
 )
 
-# The session test drives a real TcpStream + UvExecutor, so it is libuv-only.
+# These tests drive a real TcpStream through UvExecutor (directly, or through
+# Client::open_websocket's stream provider), so they are libuv-only. The Asio
+# backend has its own connect_race/resolver coverage in test_asio.
 if(MGHTTP_BACKEND_LIBUV)
     list(APPEND MGHTTP_TEST_SOURCES test_websocket_session.cpp)
+    list(APPEND MGHTTP_TEST_SOURCES test_websocket_reconnect.cpp)
 endif()
 
 if(MGHTTP_BACKEND_LIBUV)
