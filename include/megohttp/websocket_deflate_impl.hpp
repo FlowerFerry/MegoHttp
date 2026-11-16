@@ -1,0 +1,275 @@
+#ifndef MEGOHTTP_WEBSOCKET_DEFLATE_IMPL_HPP
+#define MEGOHTTP_WEBSOCKET_DEFLATE_IMPL_HPP
+
+#include <megohttp/websocket_deflate.hpp>
+#include <megohttp/format.hpp>
+#include <megohttp/string_adapter.hpp>
+
+#include <algorithm>
+#include <charconv>
+#include <cstring>
+
+#include <zlib.h>
+
+namespace megohttp {
+
+    using detail::ascii_iequals;
+    using detail::sb_append;
+    using detail::sb_release;
+
+    namespace websocket_deflate_detail {
+
+        inline string_view trim(string_view s) {
+            size_t b = 0, e = s.size();
+            while (b < e && (s[b] == ' ' || s[b] == '\t')) ++b;
+            while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t')) --e;
+            return s.substr(b, e - b);
+        }
+
+        inline std::vector<string_view> split_commas(string_view v) {
+            std::vector<string_view> out;
+            size_t pos = 0;
+            for (;;) {
+                const size_t comma = v.find(',', pos);
+                const size_t end = (comma == string_view::npos) ? v.size() : comma;
+                const string_view piece = trim(v.substr(pos, end - pos));
+                if (!piece.empty()) out.push_back(piece);
+                if (comma == string_view::npos) break;
+                pos = comma + 1;
+            }
+            return out;
+        }
+
+        inline bool ieq(string_view a, string_view b) {
+            return ascii_iequals(a, b);
+        }
+
+        inline bool parse_int(string_view v, int& out) {
+            if (v.empty()) return false;
+            int value = 0;
+            const auto fr = std::from_chars(v.data(), v.data() + v.size(), value);
+            if (fr.ec != std::errc{} || fr.ptr != v.data() + v.size()) return false;
+            out = value;
+            return true;
+        }
+
+    } // namespace websocket_deflate_detail
+
+    // -----------------------------------------------------------------------
+    // Negotiation
+    // -----------------------------------------------------------------------
+
+    inline std::optional<DeflateOptions> parse_deflate_offer(const Headers& headers) {
+        const auto hdr = headers.get("sec-websocket-extensions");
+        if (!hdr) return std::nullopt;
+
+        for (const string_view ext : websocket_deflate_detail::split_commas(*hdr)) {
+            const size_t semi = ext.find(';');
+            const string_view name = websocket_deflate_detail::trim(
+                semi == string_view::npos ? ext : ext.substr(0, semi));
+            if (!websocket_deflate_detail::ieq(name, "permessage-deflate")) continue;
+
+            DeflateOptions opts;
+            opts.enabled = true;
+
+            size_t pos = (semi == string_view::npos) ? ext.size() : semi + 1;
+            while (pos < ext.size()) {
+                size_t next = ext.find(';', pos);
+                if (next == string_view::npos) next = ext.size();
+                const string_view param =
+                    websocket_deflate_detail::trim(ext.substr(pos, next - pos));
+                pos = next + 1;
+                if (param.empty()) continue;
+
+                const size_t eq = param.find('=');
+                const string_view pname = websocket_deflate_detail::trim(
+                    eq == string_view::npos ? param : param.substr(0, eq));
+                const string_view pvalue =
+                    (eq == string_view::npos)
+                        ? string_view{}
+                        : websocket_deflate_detail::trim(param.substr(eq + 1));
+
+                if (websocket_deflate_detail::ieq(pname, "server_max_window_bits")) {
+                    int v = 0;
+                    if (websocket_deflate_detail::parse_int(pvalue, v)) {
+                        opts.server_max_window_bits = v;
+                    }
+                } else if (websocket_deflate_detail::ieq(pname, "client_max_window_bits")) {
+                    int v = 0;
+                    if (websocket_deflate_detail::parse_int(pvalue, v)) {
+                        opts.client_max_window_bits = v;
+                    }
+                } else if (websocket_deflate_detail::ieq(pname, "server_no_context_takeover")) {
+                    opts.server_no_context_takeover = true;
+                } else if (websocket_deflate_detail::ieq(pname, "client_no_context_takeover")) {
+                    opts.client_no_context_takeover = true;
+                }
+            }
+            return opts;
+        }
+        return std::nullopt;
+    }
+
+    inline string build_deflate_response(const DeflateNegotiated& params) {
+        if (!params.enabled) return string{};
+
+        string_builder b;
+        sb_append(b, "permessage-deflate");
+        // RFC 7692: omitting a window-bits parameter means 15 (the default), so
+        // only a non-default value needs to be written.
+        if (params.server_window_bits != 15) {
+            sb_append(b, "; server_max_window_bits=");
+            sb_append(b, to_view(format("{}", params.server_window_bits)));
+        }
+        if (params.client_window_bits != 15) {
+            sb_append(b, "; client_max_window_bits=");
+            sb_append(b, to_view(format("{}", params.client_window_bits)));
+        }
+        if (params.server_no_context_takeover) sb_append(b, "; server_no_context_takeover");
+        if (params.client_no_context_takeover) sb_append(b, "; client_no_context_takeover");
+        return sb_release(b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Compressor
+    // -----------------------------------------------------------------------
+
+    struct DeflateCompressor::Impl {
+        z_stream strm{};
+        DeflateNegotiated params;
+        bool initialised{false};
+
+        explicit Impl(const DeflateNegotiated& p) : params(p) {
+            // RAW deflate (negative window bits): RFC 7692 forbids the zlib or
+            // gzip wrapper on each message.
+            if (deflateInit2(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                             -params.client_window_bits, 8,
+                             Z_DEFAULT_STRATEGY) == Z_OK) {
+                initialised = true;
+            }
+        }
+        ~Impl() {
+            if (initialised) deflateEnd(&strm);
+        }
+        void reset() {
+            if (initialised) deflateReset(&strm);
+        }
+    };
+
+    inline DeflateCompressor::DeflateCompressor(const DeflateNegotiated& params)
+        : impl_(std::make_unique<Impl>(params)) {}
+
+    inline DeflateCompressor::~DeflateCompressor() = default;
+
+    inline std::vector<uint8_t> DeflateCompressor::compress(const std::vector<uint8_t>& input) {
+        // Not initialised: pass the payload through unchanged. The return type
+        // cannot carry an Error, and the caller checks the negotiated state.
+        if (!impl_->initialised) return input;
+
+        if (impl_->params.client_no_context_takeover) impl_->reset();
+
+        // Generous buffer: deflateBound assumes a fresh stream, which is wrong
+        // for the second message when context takeover keeps the state alive.
+        std::vector<uint8_t> out(input.size() + input.size() / 2 + 256);
+
+        impl_->strm.next_in = const_cast<Bytef*>(input.data());
+        impl_->strm.avail_in = static_cast<uInt>(input.size());
+        impl_->strm.next_out = out.data();
+        impl_->strm.avail_out = static_cast<uInt>(out.size());
+
+        const int rc = deflate(&impl_->strm, Z_SYNC_FLUSH);
+        if (rc != Z_OK && rc != Z_BUF_ERROR) return input;
+
+        out.resize(out.size() - impl_->strm.avail_out);
+        // RFC 7692 7.2.1: Z_SYNC_FLUSH leaves a trailing 0x00 0x00 0xFF 0xFF on
+        // the wire, and the sender must REMOVE it (the receiver re-appends it).
+        // Keeping it would put two markers in the stream.
+        if (out.size() >= 4 && out[out.size() - 4] == 0x00 && out[out.size() - 3] == 0x00 &&
+            out[out.size() - 2] == 0xFF && out[out.size() - 1] == 0xFF) {
+            out.resize(out.size() - 4);
+        }
+        return out;
+    }
+
+    // -----------------------------------------------------------------------
+    // Decompressor
+    // -----------------------------------------------------------------------
+
+    struct DeflateDecompressor::Impl {
+        z_stream strm{};
+        DeflateNegotiated params;
+        bool initialised{false};
+
+        explicit Impl(const DeflateNegotiated& p) : params(p) {
+            if (inflateInit2(&strm, -params.server_window_bits) == Z_OK) {
+                initialised = true;
+            }
+        }
+        ~Impl() {
+            if (initialised) inflateEnd(&strm);
+        }
+        void reset() {
+            if (initialised) inflateReset(&strm);
+        }
+    };
+
+    inline DeflateDecompressor::DeflateDecompressor(const DeflateNegotiated& params)
+        : impl_(std::make_unique<Impl>(params)) {}
+
+    inline DeflateDecompressor::~DeflateDecompressor() = default;
+
+    inline Result<std::vector<uint8_t>> DeflateDecompressor::decompress(
+        const std::vector<uint8_t>& input) {
+        if (!impl_->initialised) {
+            return Error{ErrorCode::WsCompressionNotCompiled, ErrorPhase::Receive,
+                         string("permessage-deflate is not available in this build")};
+        }
+
+        if (impl_->params.server_no_context_takeover) impl_->reset();
+
+        // The sender strips the 0x00 0x00 0xFF 0xFF tail; restore it, because
+        // that is what lets zlib finish the block.
+        std::vector<uint8_t> data = input;
+        if (data.size() >= 4 && data[data.size() - 4] == 0x00 &&
+            data[data.size() - 3] == 0x00 && data[data.size() - 2] == 0xFF &&
+            data[data.size() - 1] == 0xFF) {
+            data.resize(data.size() - 4);
+        }
+        data.push_back(0x00);
+        data.push_back(0x00);
+        data.push_back(0xFF);
+        data.push_back(0xFF);
+
+        std::vector<uint8_t> out(std::max<size_t>(input.size() * 4, 1024));
+
+        impl_->strm.next_in = data.data();
+        impl_->strm.avail_in = static_cast<uInt>(data.size());
+
+        size_t written = 0;
+        for (;;) {
+            if (written == out.size()) out.resize(out.size() * 2);
+            impl_->strm.next_out = out.data() + written;
+            impl_->strm.avail_out = static_cast<uInt>(out.size() - written);
+            const size_t before = written;
+
+            const int rc = inflate(&impl_->strm, Z_SYNC_FLUSH);
+            written = out.size() - impl_->strm.avail_out;
+
+            if (rc == Z_STREAM_END) break;
+            // permessage-deflate never ends the stream: a message ends when the
+            // input is consumed and inflate produced nothing more.
+            if (impl_->strm.avail_in == 0) {
+                if (rc == Z_BUF_ERROR || written == before) break;
+            }
+            if (rc == Z_OK || rc == Z_BUF_ERROR) continue;
+            return Error{ErrorCode::WsCompressionMalformedData, ErrorPhase::Receive,
+                         string("permessage-deflate payload could not be decoded")};
+        }
+
+        out.resize(written);
+        return out;
+    }
+
+} // namespace megohttp
+
+#endif // MEGOHTTP_WEBSOCKET_DEFLATE_IMPL_HPP
