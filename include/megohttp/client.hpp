@@ -24,6 +24,7 @@
 #include <megohttp/string_adapter.hpp>
 #include <megohttp/transport.hpp>
 #include <megohttp/tls_stream.hpp>
+#include <megohttp/websocket_reconnect.hpp>
 
 #include <chrono>
 #include <future>
@@ -245,6 +246,17 @@ namespace megohttp {
         // from the last event ID.
         std::shared_ptr<SseSession> request_sse(Request request,
                                                 SseReconnectPolicy policy);
+
+        // WebSocket logical session (S6.2). Establishes the TCP/TLS connection
+        // through this Client's options (proxy, timeouts, trust store), then
+        // layers the Upgrade handshake and the frame protocol on top. When
+        // `policy.enabled` is true the session reconnects on a dropped
+        // connection; each reconnect re-runs the whole connect + handshake
+        // path, so the security policy is never bypassed.
+        std::shared_ptr<ReconnectingWebSocket> open_websocket(
+            string_view url,
+            WebSocketOptions ws_options,
+            WebSocketReconnectPolicy policy);
 
         // Stop accepting new work and retire every in-flight request with
         // ErrorCode::Cancelled. Idempotent. The executor is shut down only when

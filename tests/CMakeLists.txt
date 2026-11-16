@@ -50,6 +50,7 @@ set(MGHTTP_TEST_SOURCES
     test_sse_session.cpp
     test_websocket.cpp
     test_websocket_deflate.cpp
+    test_websocket_reconnect.cpp
     test_reconnect.cpp
 )
 

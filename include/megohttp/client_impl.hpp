@@ -3050,6 +3050,105 @@ namespace megohttp {
                                             std::move(request), std::move(policy));
     }
 
+    inline std::shared_ptr<ReconnectingWebSocket> Client::open_websocket(
+        string_view url, WebSocketOptions ws_options, WebSocketReconnectPolicy policy) {
+        // Parse the ws:// or wss:// URL once, here: the provider below is called
+        // once per physical attempt, and re-parsing a fixed URL each time would
+        // only add a failure mode.
+        auto parsed = parse_url(url);
+        if (!parsed) {
+            auto bad = std::make_shared<Error>(parsed.error());
+            auto provider = [bad](string, string,
+                                  std::function<void(Result<std::shared_ptr<AsyncByteStream>>)> done) {
+                done(*bad);
+            };
+            auto fail_session = std::make_shared<ReconnectingWebSocket>(
+                impl_->executor, std::move(provider), std::move(ws_options), std::move(policy));
+            fail_session->start(string{}, string{}, Headers{});
+            return fail_session;
+        }
+
+        const Url u = parsed.value();
+        string host = to_string(to_view(u.host));
+        string path = to_string(to_view(u.request_target()));
+        const bool secure = u.is_secure();
+        const uint16_t port = (u.port != 0) ? u.port : Url::default_port(u.scheme);
+
+        Impl* impl = impl_.get();
+        auto ex = impl_->executor;
+        if (!ex) ex = detail::make_default_executor();
+
+        // One physical attempt: resolve -> race -> (TLS) -> hand the stream back.
+        // This intentionally reuses nothing from the HTTP request pipeline: a
+        // WebSocket upgrade is not an HTTP exchange after the 101, so sharing
+        // the Exchange machinery would fight the frame protocol.
+        auto provider = [impl, host, port, secure, u](
+                            string /*h*/, string /*p*/,
+                            std::function<void(Result<std::shared_ptr<AsyncByteStream>>)> done) {
+            auto exe = impl->executor;
+            if (!exe) {
+                done(Error{ErrorCode::NotImplemented, ErrorPhase::None,
+                           string("no executor available")});
+                return;
+            }
+            auto resolver = impl->resolver;
+            if (!resolver) {
+                done(Error{ErrorCode::NotImplemented, ErrorPhase::Resolve,
+                           string("no resolver available")});
+                return;
+            }
+
+            resolver->resolve(host, port, [impl, exe, secure, u, done](
+                                            Result<AddressList> resolved) {
+                if (!resolved) { done(resolved.error()); return; }
+                if (resolved.value().empty()) {
+                    done(Error{ErrorCode::DnsResolveFailed, ErrorPhase::Resolve,
+                               string("no addresses resolved")});
+                    return;
+                }
+                ConnectOptions copts;
+                copts.connect_timeout = impl->options.connect_timeout;
+                connect_race(exe, std::move(resolved.value()), copts,
+                             [impl, secure, u, done](
+                                 Result<std::shared_ptr<AsyncByteStream>> conn) {
+                                 if (!conn) { done(conn.error()); return; }
+                                 auto stream = conn.value();
+                                 if (!stream) {
+                                     done(Error{ErrorCode::ConnectFailed,
+                                                ErrorPhase::TcpConnect,
+                                                string("connect returned no stream")});
+                                     return;
+                                 }
+                                 if (!secure) { done(stream); return; }
+
+                                 // wss://: stack TLS on the connected stream. The
+                                 // config comes from ClientOptions::tls, so the
+                                 // same trust store and identity rules apply as
+                                 // for https://. The hostname must be the SERVER
+                                 // name, not the resolved address, or SNI and
+                                 // certificate validation would name the wrong
+                                 // identity.
+                                 TlsConfig cfg = impl->options.tls;
+                                 if (cfg.hostname.empty()) {
+                                     cfg.hostname = to_string(to_view(u.host));
+                                 }
+                                 auto tls = make_tls_stream(stream, cfg);
+                                 tls->set_error_phase(ErrorPhase::TargetTls,
+                                                      ErrorPhase::TargetProtocol);
+                                 tls->start([tls, done](VoidResult r) {
+                                     if (!r) { done(r.error()); return; }
+                                     done(std::static_pointer_cast<AsyncByteStream>(tls));
+                                 });
+                             });
+            });
+        };
+
+        auto session = std::make_shared<ReconnectingWebSocket>(
+            ex, std::move(provider), std::move(ws_options), std::move(policy));
+        session->start(std::move(host), std::move(path), Headers{});
+        return session;
+    }
+
 } // namespace megohttp
 
 #endif // MEGOHTTP_CLIENT_IMPL_HPP_INCLUDED
