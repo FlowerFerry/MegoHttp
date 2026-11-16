@@ -535,6 +535,38 @@ TEST_CASE("a host-only cookie stays host-only across export and import",
     CHECK(s(sub) == "wide=2");
 }
 
+// 2026-11-13 code review, defect #4: the __HostOnly marker was searched as a
+// bare substring, so a cookie VALUE that happens to contain "__HostOnly=1" was
+// misread as the marker and its Domain was stripped -- silently converting a
+// Domain cookie into a host-only one (a scope narrowing this time, but wrong
+// either way). The marker is written as "; __HostOnly=1"; matching that form
+// with an attribute boundary is what distinguishes it from payload text.
+TEST_CASE("a cookie value containing the marker text is not treated as host-only",
+          "[cookie][jar][persistence][security]") {
+    CookieJar jar;
+    // Domain cookie whose VALUE contains the marker text.
+    const std::vector<string> lines = {
+        sv("k=__HostOnly=1; Domain=example.com; Path=/"),
+    };
+    REQUIRE(jar.import_all(lines) == 1);
+
+    // Still a Domain cookie: subdomains must receive it.
+    CHECK(s(jar.cookie_header(make_url("http", "a.example.com"))) == "k=__HostOnly=1");
+}
+
+TEST_CASE("the real marker still makes a cookie host-only on import",
+          "[cookie][jar][persistence]") {
+    CookieJar jar;
+    const std::vector<string> lines = {
+        sv("sid=1; Domain=example.com; Path=/; __HostOnly=1"),
+    };
+    REQUIRE(jar.import_all(lines) == 1);
+
+    // Host-only: the subdomain must NOT receive it.
+    CHECK(s(jar.cookie_header(make_url("http", "a.example.com"))) == "");
+    CHECK(s(jar.cookie_header(make_url("http", "example.com"))) == "sid=1");
+}
+
 TEST_CASE("import skips bad lines without aborting", "[cookie][jar][persistence]") {
     CookieJar jar;
     const std::vector<string> lines = {

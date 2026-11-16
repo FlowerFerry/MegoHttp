@@ -903,7 +903,11 @@ inline VoidResult CookieJar::set(const Url& url, const SetCookie& cookie) {
         stored.path->data()[0] != '/') {
         stored.path = default_cookie_path(to_view(url.path));
     }
-    stored.is_deletion = false;   // the flag served its purpose above
+    // A stored entry is never a deletion marker, even when the call came in as
+    // one: the deletion branch below reads `cookie.is_deletion` (the caller's
+    // value) and only stores non-deletions. This line makes that explicit so the
+    // entry that goes into the bucket cannot carry a stale flag.
+    stored.is_deletion = false;
 
     if (static_cast<size_t>(stored.name.size() + stored.value.size()) >
         impl_->limits.max_cookie_bytes) {
@@ -1090,10 +1094,30 @@ inline size_t CookieJar::import_all(const std::vector<string>& lines) {
         // what distinguishes a host-only cookie from a Domain cookie that
         // happens to name the same host; without it the import would silently
         // widen the cookie to every subdomain.
+        //
+        // The marker is always written as "; __HostOnly=1" (a semicolon-space
+        // prefix) and is never part of the real Set-Cookie grammar, so matching
+        // against "; __HostOnly=1" rather than "__HostOnly=1" alone prevents a
+        // cookie whose value coincidentally contains the substring from being
+        // misclassified (2026-11-13 code review, defect #4).
         bool host_only = false;
         {
             const string_view line_v = to_view(line);
-            host_only = line_v.find("__HostOnly=1") != string_view::npos;
+            const string_view marker = "; __HostOnly=1";
+            size_t pos = 0;
+            while ((pos = line_v.find(marker, pos)) != string_view::npos) {
+                // Must be at the end of the line or followed by another "; "
+                // attribute boundary; this avoids matching inside a value that
+                // happens to contain the marker text.
+                const size_t after = pos + marker.size();
+                if (after == line_v.size() ||
+                    (after + 2 <= line_v.size() &&
+                     line_v[after] == ';' && line_v[after + 1] == ' ')) {
+                    host_only = true;
+                    break;
+                }
+                pos = after;
+            }
         }
 
         Url u;

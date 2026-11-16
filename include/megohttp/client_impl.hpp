@@ -666,10 +666,13 @@ namespace megohttp {
 
                 // Budget.
                 if (state_->hops_left == 0) {
+                    // Set the flags BEFORE failing: fail() can start a retry, and
+                    // a retry re-reads this exchange's state. Writing them after
+                    // the call is writing to a request that may already be over.
+                    redirect_pending_ = true;
+                    redirect_location_.reset();
                     fail(Error{ErrorCode::HttpInvalidResponse, ErrorPhase::Receive,
                                string("too many redirects")});
-                    redirect_pending_ = true;   // stop on_complete from reporting success
-                    redirect_location_.reset();
                     return true;
                 }
 
@@ -752,11 +755,47 @@ namespace megohttp {
                 // S3.2-02: Choose buffered or streaming mode based on request.
                 //
                 // Three consumers exist and exactly one is chosen:
+                //   sse callback -> bytes go to the SSE parser only
                 //   multipart sink -> bytes go to the multipart parser only
                 //   body sink      -> bytes go to the caller's sink
                 //   neither        -> bytes accumulate in BufferSink
                 // Request itself guarantees the sinks are mutually exclusive, so
                 // this is a priority chain rather than a validation.
+                if (auto& sse_cb = state_->request.sse_callback()) {
+                    // Check the Content-Type BEFORE moving rh into head_:
+                    // after the move rh is empty and the check would always fail.
+                    bool is_sse = false;
+                    if (rh.content_type) {
+                        is_sse = detail::ascii_iequals(
+                            to_view(*rh.content_type), string("text/event-stream"));
+                    }
+                    head_ = std::move(rh);
+                    if (is_sse) {
+                        struct SseBridge : SseParser::Callbacks {
+                            std::function<VoidResult(const SseEvent&)> user_cb;
+                            std::optional<Error>* err_slot;
+                            VoidResult on_event(const SseEvent& e) override {
+                                try { return user_cb(e); }
+                                catch (...) {
+                                    auto err = Error{ErrorCode::Unknown, ErrorPhase::Receive,
+                                                     string("SSE callback threw an exception")};
+                                    if (err_slot) *err_slot = err;
+                                    return err;
+                                }
+                            }
+                            void on_comment(string_view) override {}
+                        };
+                        auto bridge = std::make_shared<SseBridge>();
+                        bridge->user_cb = *sse_cb;
+                        bridge->err_slot = &sse_error_;
+                        sse_parser_ = std::make_unique<SseParser>(
+                            *bridge, state_->request.sse_limits());
+                        sse_bridge_ = bridge;
+                        return VoidResult{};
+                    }
+                    // Content-Type is not SSE: fall through to the normal buffered path.
+                    // The caller asked for SSE but the server sent something else.
+                }
                 if (auto& ms = state_->request.multipart_sink()) {
                     head_ = std::move(rh);
                     // The parser needs the boundary, which may live in the
@@ -973,6 +1012,18 @@ namespace megohttp {
                     return VoidResult{};
                 }
 
+                // S6.1-01: SSE
+                if (sse_parser_) {
+                    auto r = sse_parser_->feed(data, size);
+                    if (!r) return r;
+                    if (sse_error_) {
+                        auto e = std::move(*sse_error_);
+                        sse_error_.reset();
+                        return e;
+                    }
+                    return VoidResult{};
+                }
+
                 // "Delivered" means the CALLER has bytes. In buffered mode the
                 // body accumulates internally and the caller sees nothing until
                 // finish(), so a retry would not re-deliver anything -- that is
@@ -1105,6 +1156,10 @@ namespace megohttp {
                 // that stops after a part, or a body truncated at a matching
                 // Content-Length). That is a failure, and the connection must not
                 // be pooled: the caller would believe it has a complete message.
+                if (sse_parser_) {
+                    auto eof = sse_parser_->feed_eof();
+                    if (!eof) return eof;
+                }
                 if (multipart_parser_ && !multipart_bridge_->multipart_complete) {
                     auto eof = multipart_parser_->feed_eof();
                     if (!eof) return eof;
@@ -1394,6 +1449,15 @@ namespace megohttp {
             // S5.7-01: multipart response. Mutually exclusive with buffer_sink_
             // and body_sink_. When set, decoded body bytes go to the parser
             // instead of being buffered or delivered raw.
+            // S6.1-01: SSE streaming parser. Mutually exclusive with
+            // buffer_sink_, body_sink_ and multipart_sink_.
+            std::unique_ptr<SseParser> sse_parser_;
+            std::shared_ptr<SseParser::Callbacks> sse_bridge_;
+            // When the SSE parser hits an error the callback is already inside
+            // the parser's feed(), so we stash the error and re-raise in the
+            // enclosing deliver_decoded_checked.
+            std::optional<Error> sse_error_;
+
             std::shared_ptr<MultipartSink> multipart_sink_;
             std::unique_ptr<MultipartResponseParser> multipart_parser_;
             std::shared_ptr<MultipartBridge> multipart_bridge_;
@@ -1442,15 +1506,11 @@ namespace megohttp {
 
             void async_read_some(ReadCallback cb) override {
                 if (!prefix_.empty()) {
-                    const string_view sv(reinterpret_cast<const char*>(prefix_.data()),
-                                         static_cast<string_view::size_type>(prefix_.size()));
-                    // Copy out before clearing: the view must stay valid for the
-                    // duration of the callback only, which this satisfies.
+                    // Move the prefix out and deliver it in one shot. The moved-out
+                    // buffer is not used again, so no clear() is needed.
                     byte_buffer held = std::move(prefix_);
-                    prefix_.clear();
                     if (cb) cb(string_view(reinterpret_cast<const char*>(held.data()),
                                            static_cast<string_view::size_type>(held.size())));
-                    (void)sv;
                     return;
                 }
                 inner_->async_read_some(std::move(cb));
@@ -1547,15 +1607,20 @@ namespace megohttp {
             // https:// target always uses origin-form inside the CONNECT tunnel,
             // because by then the proxy is not reading anything (RFC 7230 5.3.2).
             //
-            // absolute_form_target() returns an OWNING string, so it has to be
-            // held in a local: taking to_view() of the temporary left a dangling
-            // view that encode_request_head read a moment later, and the request
-            // went out with a corrupted target the proxy could not route.
-            string absolute;
-            if (forward_proxy) absolute = url.absolute_form_target();
-            const string_view target = forward_proxy
-                                           ? to_view(absolute)
-                                           : to_view(url.request_target());
+            // Both `absolute_form_target()` and `request_target()` return OWNING
+            // strings, so each must be held in a local before taking a view.
+            // The old code called `to_view(url.request_target())` directly in
+            // the ternary's false branch: the temporary string was destroyed at
+            // the end of the full expression, leaving `target` dangling, and the
+            // request went out with a corrupted target path (defect #1 of the
+            // 2026-11-13 code review).
+            string target_str;
+            if (forward_proxy) {
+                target_str = url.absolute_form_target();
+            } else {
+                target_str = url.request_target();
+            }
+            const string_view target = to_view(target_str);
             return encode_request_head(req.method(), req.custom_method(),
                                        target, headers);
         }
@@ -2479,7 +2544,22 @@ namespace megohttp {
                             const std::string code = h.substr(sp1 + 1, sp2 == std::string::npos
                                                                         ? std::string::npos
                                                                         : sp2 - sp1 - 1);
-                            status = std::atoi(code.c_str());
+                            // from_chars, not atoi: atoi has undefined behaviour on
+                            // overflow, and the status code comes from an untrusted
+                            // proxy. A response of "999999999999" must be rejected,
+                            // not produce whatever the platform happens to do.
+                            {
+                                const char* b = code.data();
+                                const char* e = code.data() + code.size();
+                                auto fr = std::from_chars(b, e, status);
+                                if (fr.ec != std::errc{} || fr.ptr != e ||
+                                    status < 100 || status > 999) {
+                                    done(Error{ErrorCode::ProxyProtocolError,
+                                               ErrorPhase::ProxyConnectTunnel,
+                                               string("CONNECT response has invalid status code")});
+                                    return;
+                                }
+                            }
 
                             const auto outcome = proxy_detail::classify_connect_response(status);
                             if (outcome != proxy_detail::ConnectOutcome::Ok) {
@@ -2489,9 +2569,20 @@ namespace megohttp {
                             // Anything after the head already belongs to the
                             // tunnel; losing it would corrupt the target TLS
                             // handshake that starts next.
+                            //
+                            // read_proxy_head() only calls back once it has the
+                            // terminator, so npos "cannot" happen -- but relying on
+                            // a caller's invariant for an offset computation is how
+                            // an unsigned wrap becomes a huge read. Checked anyway.
                             byte_buffer leftover;
-                            const size_t end = h.find("\r\n\r\n") + 4;
-                            for (size_t i = end; i < h.size(); ++i) {
+                            const size_t header_end = h.find("\r\n\r\n");
+                            if (header_end == std::string::npos) {
+                                done(Error{ErrorCode::ProxyProtocolError,
+                                           ErrorPhase::ProxyConnectTunnel,
+                                           string("CONNECT response missing header terminator")});
+                                return;
+                            }
+                            for (size_t i = header_end + 4; i < h.size(); ++i) {
                                 leftover.push_back(static_cast<uint8_t>(h[i]));
                             }
                             done(std::move(leftover));
@@ -2937,6 +3028,27 @@ namespace megohttp {
     }
 
     inline const ClientOptions& Client::options() const noexcept { return impl_->options; }
+
+    inline std::shared_ptr<SseSession> Client::request_sse(Request request,
+                                                           SseReconnectPolicy policy) {
+        auto ex = impl_->executor;
+        if (!ex) {
+            ex = detail::make_default_executor();
+        }
+        // The submitter captures the Client by raw pointer. The session is
+        // expected to be cancelled before the Client dies (or the Client's
+        // shutdown retires it), and a dangling session past that point would be
+        // a caller error -- not something a weak_ptr can paper over here,
+        // because Client::request is called through impl_.
+        Impl* impl = impl_.get();
+        auto submitter = [impl](Request req,
+                                std::function<void(Result<Response>)> cb) {
+            impl->submit(std::move(req), std::move(cb),
+                         CancelHandle{}, std::make_shared<CancelState>(impl->executor));
+        };
+        return std::make_shared<SseSession>(ex, std::move(submitter),
+                                            std::move(request), std::move(policy));
+    }
 
 } // namespace megohttp
 

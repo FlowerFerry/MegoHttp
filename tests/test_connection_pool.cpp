@@ -201,15 +201,59 @@ TEST_CASE("total limit prevents new connections when max_total_connections is hi
     CHECK(pool.waiting_count() == 1);
     CHECK(pool.busy_count() == 2);
 
-    // Release one slot by returning a connection.
+    // Return k1's connection to the pool. It becomes IDLE -- it still owns a
+    // socket and therefore still counts against max_total_connections. Both
+    // slots are now idle (k1) plus busy (k2), so no room exists for k3, whose
+    // origin shares nothing with either.
     PooledConnection pc;
     pc.key = k1;
     pc.stream = std::make_shared<DummyStream>();
     pool.put(std::move(pc), true);
 
-    // The waiter is served synchronously inside put().
-    CHECK(pool.waiting_count() == 0);
-    CHECK(pool.busy_count() == 2);  // still 2: one slot freed, one reserved for k3
+    CHECK(pool.idle_count() == 1);          // k1 came back
+    CHECK(pool.busy_count() == 1);          // k2 is still out
+    CHECK(pool.waiting_count() == 1);       // k3 still cannot be served
+}
+
+// ---- Idle connections occupy slots too ---------------------------------------
+
+TEST_CASE("idle connections count against max_total_connections",
+          "[connection_pool][limit]") {
+    // An idle connection still holds a socket and a slot. Registering only the
+    // "handed out" count against the total limit let a pool sit at the limit in
+    // idle connections and still open more, so the real ceiling was
+    // max_total_connections + idle. (2026-11-13 code review, defect #7.)
+    auto ex = std::make_shared<NullExecutor>();
+    PoolOptions po;
+    po.max_total_connections = 2;
+    po.max_connections_per_origin = 10;
+    ConnectionPool pool(ex, po);
+
+    auto k1 = key_for("a.com", 80);
+    auto k2 = key_for("b.com", 80);
+    auto k3 = key_for("c.com", 80);
+
+    // Two live connections, both returned to the pool as idle.
+    // A fresh slot comes back as ErrorCode::NotFound (a control signal meaning
+    // "connect yourself"), not as a usable connection -- see the acquire() docs.
+    for (const auto& k : {k1, k2}) {
+        auto r = acquire_sync(pool, k);
+        REQUIRE(r.called);
+        REQUIRE(!r.ok);
+        CHECK(r.code == ErrorCode::NotFound);
+        PooledConnection pc;
+        pc.key = k;
+        pc.stream = std::make_shared<DummyStream>();
+        pool.put(std::move(pc), true);
+    }
+    CHECK(pool.idle_count() == 2);
+    CHECK(pool.busy_count() == 0);
+
+    // The pool is at its limit: two idle connections already hold both slots.
+    // A third origin must NOT be given a fresh slot.
+    auto r3 = acquire_sync(pool, k3);
+    CHECK(!r3.called);
+    CHECK(pool.waiting_count() == 1);
 }
 
 // ---- Wait queue is bounded --------------------------------------------------

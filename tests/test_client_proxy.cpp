@@ -886,6 +886,47 @@ TEST_CASE("layered TLS: a wrong proxy CA fails at the proxy layer",
 }
 
 // ---------------------------------------------------------------------------
+// 2026-11-13 code review, defect #2: the CONNECT status code was parsed with
+// std::atoi, which has undefined behaviour on overflow. The status line comes
+// straight from an untrusted proxy, so "999999999999" must be rejected as a
+// protocol error rather than producing whatever the platform does.
+// ---------------------------------------------------------------------------
+TEST_CASE("an oversized CONNECT status code is rejected",
+          "[proxy][client][connect][malformed]") {
+    ProxyServer proxy;
+    REQUIRE(proxy.start("connect", "--connect-status 999999999999"));
+
+    ClientOptions o;
+    o.proxy.proxy.type = ProxyType::Http;
+    o.proxy.proxy.host = string("127.0.0.1");
+    o.proxy.proxy.port = proxy.port();
+
+    Client c(o);
+    auto r = c.request_sync(Request(Method::Get, to_owning("https://example.test/")));
+
+    REQUIRE_FALSE(r);
+    CHECK(r.error().code() == ErrorCode::ProxyProtocolError);
+    CHECK(r.error().phase() == ErrorPhase::ProxyConnectTunnel);
+}
+
+TEST_CASE("a non-numeric CONNECT status code is rejected",
+          "[proxy][client][connect][malformed]") {
+    ProxyServer proxy;
+    REQUIRE(proxy.start("connect", "--connect-status banana"));
+
+    ClientOptions o;
+    o.proxy.proxy.type = ProxyType::Http;
+    o.proxy.proxy.host = string("127.0.0.1");
+    o.proxy.proxy.port = proxy.port();
+
+    Client c(o);
+    auto r = c.request_sync(Request(Method::Get, to_owning("https://example.test/")));
+
+    REQUIRE_FALSE(r);
+    CHECK(r.error().code() == ErrorCode::ProxyProtocolError);
+}
+
+// ---------------------------------------------------------------------------
 // S5.8-01: the connection-stage deadline covers the PROXY handshake.
 //
 // The proxy accepts the TCP connection and then says nothing for 30 s. Because

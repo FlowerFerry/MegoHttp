@@ -207,6 +207,15 @@
 #   define MEGOHTTP_HAS_WEBSOCKET_DEFLATE 0
 #endif
 
+// zlib availability. Defined by CMake as MGHTTP_HAVE_ZLIB=1 when the zlib
+// static library was found. gzip and permessage-deflate both need it, but they
+// are independent features, so the macro tracks the LIBRARY, not either feature.
+#if defined(MGHTTP_HAVE_ZLIB) && MGHTTP_HAVE_ZLIB != 0
+#   define MEGOHTTP_HAS_ZLIB 1
+#else
+#   define MEGOHTTP_HAS_ZLIB 0
+#endif
+
 #if defined(MGHTTP_ENABLE_DOT) && MGHTTP_ENABLE_DOT != 0
 #   define MEGOHTTP_HAS_DOT 1
 #else

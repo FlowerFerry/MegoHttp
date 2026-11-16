@@ -457,6 +457,12 @@ if(MGHTTP_ENABLE_WEBSOCKET_DEFLATE)
     target_compile_definitions(megohttp INTERFACE MGHTTP_ENABLE_WEBSOCKET_DEFLATE=1)
 endif()
 
+# zlib is a LIBRARY fact, not a per-feature one: both gzip and permessage-deflate
+# need it, so the header needs to know whether it is linkable at all.
+if(MGHTTP_ZLIB_AVAILABLE)
+    target_compile_definitions(megohttp INTERFACE MGHTTP_HAVE_ZLIB=1)
+endif()
+
 if(MGHTTP_ENABLE_DOT)
     target_compile_definitions(megohttp INTERFACE MGHTTP_ENABLE_DOT=1)
 endif()

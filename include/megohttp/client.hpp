@@ -20,6 +20,7 @@
 #include <megohttp/retry.hpp>
 #include <megohttp/resolver.hpp>
 #include <megohttp/response.hpp>
+#include <megohttp/sse_session.hpp>
 #include <megohttp/string_adapter.hpp>
 #include <megohttp/transport.hpp>
 #include <megohttp/tls_stream.hpp>
@@ -238,6 +239,12 @@ namespace megohttp {
 
         // Convenience: synchronous GET.
         Result<Response> get_sync(string_view url);
+
+        // SSE session (S6.1). Creates a long-lived event stream with automatic
+        // reconnection. The session persists across connection drops and resumes
+        // from the last event ID.
+        std::shared_ptr<SseSession> request_sse(Request request,
+                                                SseReconnectPolicy policy);
 
         // Stop accepting new work and retire every in-flight request with
         // ErrorCode::Cancelled. Idempotent. The executor is shut down only when

@@ -14,6 +14,7 @@
 #endif
 
 #include <atomic>
+#include <mutex>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -139,6 +140,12 @@ private:
                 if (he != std::string::npos) {
                     body_seen_.store(accum.size() - (he + 4));
                 }
+                // Capture the request line for tests that assert on the target.
+                const size_t eol = accum.find("\r\n");
+                if (eol != std::string::npos) {
+                    std::lock_guard<std::mutex> g(line_mu_);
+                    request_line_ = accum.substr(0, eol);
+                }
             }
             const char* resp =
                 "HTTP/1.1 200 OK\r\n"
@@ -169,6 +176,21 @@ private:
 
 public:
     size_t body_seen() const noexcept { return body_seen_.load(); }
+
+    // The first line the server received, captured so a test can assert on the
+    // request target the client actually put on the wire.
+    std::string request_line() const {
+        std::lock_guard<std::mutex> g(line_mu_);
+        return request_line_;
+    }
+    void reset_request_line() {
+        std::lock_guard<std::mutex> g(line_mu_);
+        request_line_.clear();
+    }
+
+private:
+    mutable std::mutex line_mu_;
+    std::string request_line_;
 };
 
 // Accepts a connection then never writes anything, so only a receive timeout
@@ -1456,6 +1478,95 @@ TEST_CASE("HEAD response with Content-Length completes without a body",
     // The server must actually have seen a HEAD, not a GET.
     CHECK(wait_until([&] { return !srv.request_line().empty(); }));
     CHECK(srv.request_line().compare(0, 5, "HEAD ") == 0);
+
+    client.shutdown();
+    srv.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 2026-11-13 code review, defect #1: the request target was a dangling view.
+//
+// build_request_head() wrote
+//     const string_view target = forward_proxy ? to_view(absolute)
+//                                              : to_view(url.request_target());
+// and `url.request_target()` returns an OWNING string. The temporary died at
+// the end of the full expression, so `target` dangled into encode_request_head.
+// Small-string contents often survived by luck, so the old GET test passed --
+// which is exactly why this test asserts the request LINE the server received
+// rather than just "a 200 came back".
+// ---------------------------------------------------------------------------
+TEST_CASE("the request line carries the exact path and query from the URL",
+          "[client][request_target]") {
+    TinyHttpServer srv;
+    if (!srv.start()) {
+        std::printf("SKIP: could not start the local server\n");
+        return;
+    }
+
+    Client client;
+    // A long path with a query, so the target does not fit any small-string
+    // buffer and a dangling view cannot survive by coincidence.
+    const std::string path =
+        "/api/v1/collection/items/with/a/deliberately/long/path"
+        "?filter=active&page=2&sort=created_desc&token=abcdef0123456789";
+
+    Request req(Method::Get, string("http://127.0.0.1:") +
+                                 format("{}", srv.port()) + string(path.c_str()));
+
+    std::atomic<bool> done{false};
+    client.request(req, [&](Result<Response> r) { (void)r; done.store(true); });
+
+    CHECK(wait_until([&] { return done.load(); }));
+
+    // The load-bearing assertion is the request LINE the server saw: that is
+    // what build_request_head() put on the wire.
+    CHECK(wait_until([&] { return !srv.request_line().empty(); }));
+    const std::string line = srv.request_line();
+    const std::string expected = "GET " + path + " HTTP/1.1";
+    CHECK(line == expected);
+
+    client.shutdown();
+    srv.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Same defect, driven hard: many requests in one process with varying path
+// lengths. A dangling view into a freed heap block is often readable by luck,
+// so a single request can pass while the bug is fully present. Repeating with
+// different allocation sizes gives the allocator a chance to hand the block back
+// out and overwrite it -- if the target were dangling, at least one iteration
+// would send the wrong request line.
+// ---------------------------------------------------------------------------
+TEST_CASE("repeated requests keep the request line intact",
+          "[client][request_target][stress]") {
+    TinyHttpServer srv;
+    if (!srv.start()) {
+        std::printf("SKIP: could not start the local server\n");
+        return;
+    }
+
+    Client client;
+    int mismatches = 0;
+    const int kIterations = 40;
+
+    for (int i = 0; i < kIterations; ++i) {
+        std::string path = "/p";
+        path.append(static_cast<size_t>(i % 61) + 24, 'x');
+        path += "/tail";
+
+        Request req(Method::Get, string("http://127.0.0.1:") +
+                                     format("{}", srv.port()) + string(path.c_str()));
+        std::atomic<bool> done{false};
+        client.request(req, [&](Result<Response> r) { (void)r; done.store(true); });
+        if (!wait_until([&] { return done.load(); })) { ++mismatches; continue; }
+
+        if (!wait_until([&] { return !srv.request_line().empty(); })) { ++mismatches; continue; }
+        const std::string expected = "GET " + path + " HTTP/1.1";
+        if (srv.request_line() != expected) ++mismatches;
+        srv.reset_request_line();
+    }
+
+    CHECK(mismatches == 0);
 
     client.shutdown();
     srv.stop();

@@ -27,6 +27,11 @@ namespace megohttp {
         // Pause/resume for the multipart stream. Null means a `false` from
         // on_part_data cannot be honoured (nothing could resume it).
         std::shared_ptr<Request::MultipartSinkFlow> multipart_flow;
+        // S6.1-01: SSE streaming parser attached to this request. When set,
+        // response body bytes are parsed as text/event-stream instead of
+        // delivered raw.
+        std::optional<Request::SseCallback> sse_callback;
+        SseParser::Limits sse_limits;
         // Content coding. Upload compression is opt-in; response decoding is on
         // by default because Accept-Encoding is sent by this library.
         Request::Compression compress{Request::Compression::None};
@@ -230,6 +235,25 @@ namespace megohttp {
 
     inline const std::shared_ptr<Request::BodySinkFlow>& Request::body_sink_flow() const noexcept {
         return impl_->body_sink_flow;
+    }
+
+    inline void Request::set_sse_callback(SseCallback cb, SseParser::Limits limits) {
+        impl_->sse_callback = std::move(cb);
+        impl_->sse_limits = limits;
+        // Mutually exclusive with BodySink and MultipartSink.
+        impl_->body_sink.reset();
+        impl_->body_sink_complete.reset();
+        impl_->body_sink_flow.reset();
+        impl_->multipart_sink.reset();
+        impl_->multipart_flow.reset();
+    }
+
+    inline const std::optional<Request::SseCallback>& Request::sse_callback() const noexcept {
+        return impl_->sse_callback;
+    }
+
+    inline const SseParser::Limits& Request::sse_limits() const noexcept {
+        return impl_->sse_limits;
     }
 
     inline const std::optional<Request::BodySink>& Request::body_sink() const noexcept {

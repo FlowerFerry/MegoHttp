@@ -6,6 +6,7 @@
 #include <megohttp/headers.hpp>
 #include <megohttp/http.hpp>
 #include <megohttp/multipart_sink.hpp>
+#include <megohttp/sse.hpp>
 #include <megohttp/string_adapter.hpp>
 #include <megohttp/url.hpp>
 
@@ -147,6 +148,16 @@ namespace megohttp {
         const std::shared_ptr<MultipartSink>& multipart_sink() const noexcept;
         const MultipartResponseOptions& multipart_options() const noexcept;
         const std::shared_ptr<MultipartSinkFlow>& multipart_flow() const noexcept;
+
+        // --- SSE (S6.1-01) ---
+        // Attach a callback for streaming SSE events. Response body is parsed
+        // as text/event-stream instead of delivered raw; Content-Encoding is
+        // still decoded first (HTTP framing -> decoding -> SSE).
+        // Mutually exclusive with BodySink and MultipartSink.
+        using SseCallback = std::function<VoidResult(const SseEvent&)>;
+        void set_sse_callback(SseCallback cb, SseParser::Limits limits = {});
+        const std::optional<SseCallback>& sse_callback() const noexcept;
+        const SseParser::Limits& sse_limits() const noexcept;
 
         // --- Content coding ---
         // Request body compression. OFF by default: compressing an upload

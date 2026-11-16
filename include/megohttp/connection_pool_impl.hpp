@@ -63,9 +63,15 @@ namespace megohttp {
     // Reserve a slot for the caller to either use an idle connection or open
     // a new one. Returns false when a limit would be exceeded.
     inline bool ConnectionPool::try_reserve(const PoolKey& key) {
-        if (options_.max_total_connections != 0 &&
-            busy_total_ >= options_.max_total_connections) {
-            return false;
+        if (options_.max_total_connections != 0) {
+            // Idle connections hold slots too: they own a socket and count
+            // against the ceiling. Comparing only busy_total_ let a pool sit at
+            // max_total_connections in idle connections and still hand out more,
+            // so the real limit became max_total_connections + idle.
+            // (2026-11-13 code review, defect #7.)
+            size_t total = busy_total_;
+            for (const auto& kv : idle_) total += kv.second.size();
+            if (total >= options_.max_total_connections) return false;
         }
         if (options_.max_connections_per_origin != 0) {
             auto it = busy_per_key_.find(key);
