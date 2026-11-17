@@ -761,16 +761,35 @@ namespace megohttp {
                 //   neither        -> bytes accumulate in BufferSink
                 // Request itself guarantees the sinks are mutually exclusive, so
                 // this is a priority chain rather than a validation.
+#if MEGOHTTP_HAS_SSE
                 if (auto& sse_cb = state_->request.sse_callback()) {
                     // Check the Content-Type BEFORE moving rh into head_:
                     // after the move rh is empty and the check would always fail.
+                    //
+                    // The media type is compared without its parameters: a
+                    // server is free to answer "text/event-stream;charset=utf-8"
+                    // (the WHATWG default is UTF-8 and stating it is common), and
+                    // an exact whole-value compare would silently fall through to
+                    // the buffered path with the caller never learning its SSE
+                    // callback was ignored.
                     bool is_sse = false;
                     if (rh.content_type) {
+                        const string_view ct = to_view(*rh.content_type);
+                        const size_t semi = ct.find(';');
                         is_sse = detail::ascii_iequals(
-                            to_view(*rh.content_type), string("text/event-stream"));
+                            (semi == string_view::npos) ? ct
+                                                        : ct.substr(0, semi),
+                            "text/event-stream");
                     }
                     head_ = std::move(rh);
-                    if (is_sse) {
+                    if (!is_sse) {
+                        // The caller asked for SSE and the server sent something
+                        // else. Silently buffering the body would make the
+                        // callback look like it produced no events; report it.
+                        return Error{ErrorCode::SseInvalidContentType, ErrorPhase::Receive,
+                                     string("response is not text/event-stream")};
+                    }
+                    {
                         struct SseBridge : SseParser::Callbacks {
                             std::function<VoidResult(const SseEvent&)> user_cb;
                             std::optional<Error>* err_slot;
@@ -793,9 +812,8 @@ namespace megohttp {
                         sse_bridge_ = bridge;
                         return VoidResult{};
                     }
-                    // Content-Type is not SSE: fall through to the normal buffered path.
-                    // The caller asked for SSE but the server sent something else.
                 }
+#endif
                 if (auto& ms = state_->request.multipart_sink()) {
                     head_ = std::move(rh);
                     // The parser needs the boundary, which may live in the
@@ -1013,6 +1031,7 @@ namespace megohttp {
                 }
 
                 // S6.1-01: SSE
+#if MEGOHTTP_HAS_SSE
                 if (sse_parser_) {
                     auto r = sse_parser_->feed(data, size);
                     if (!r) return r;
@@ -1023,6 +1042,7 @@ namespace megohttp {
                     }
                     return VoidResult{};
                 }
+#endif
 
                 // "Delivered" means the CALLER has bytes. In buffered mode the
                 // body accumulates internally and the caller sees nothing until
@@ -1156,10 +1176,12 @@ namespace megohttp {
                 // that stops after a part, or a body truncated at a matching
                 // Content-Length). That is a failure, and the connection must not
                 // be pooled: the caller would believe it has a complete message.
+#if MEGOHTTP_HAS_SSE
                 if (sse_parser_) {
                     auto eof = sse_parser_->feed_eof();
                     if (!eof) return eof;
                 }
+#endif
                 if (multipart_parser_ && !multipart_bridge_->multipart_complete) {
                     auto eof = multipart_parser_->feed_eof();
                     if (!eof) return eof;
@@ -1451,12 +1473,14 @@ namespace megohttp {
             // instead of being buffered or delivered raw.
             // S6.1-01: SSE streaming parser. Mutually exclusive with
             // buffer_sink_, body_sink_ and multipart_sink_.
+#if MEGOHTTP_HAS_SSE
             std::unique_ptr<SseParser> sse_parser_;
             std::shared_ptr<SseParser::Callbacks> sse_bridge_;
             // When the SSE parser hits an error the callback is already inside
             // the parser's feed(), so we stash the error and re-raise in the
             // enclosing deliver_decoded_checked.
             std::optional<Error> sse_error_;
+#endif
 
             std::shared_ptr<MultipartSink> multipart_sink_;
             std::unique_ptr<MultipartResponseParser> multipart_parser_;
@@ -1782,13 +1806,14 @@ namespace megohttp {
         void submit(const Request& req,
                     Client::ResponseCallback on_complete,
                     const CancelHandle& handle,
-                    std::shared_ptr<CancelState> cancel_state) {
+                    std::shared_ptr<CancelState> cancel_state,
+                    const ClientOptions* opt_override = nullptr) {
             auto st = std::make_shared<detail::RequestState>();
             st->self_hold = st;
             st->executor = executor;
             st->resolver = resolver;
             st->cookie_jar = options.cookie_jar;
-            st->options = options;
+            st->options = opt_override ? *opt_override : options;
             st->pool = pool;
 
             // Redirect budget (S5.2). Only counts when the caller opted in;
@@ -3029,6 +3054,7 @@ namespace megohttp {
 
     inline const ClientOptions& Client::options() const noexcept { return impl_->options; }
 
+#if MEGOHTTP_HAS_SSE
     inline std::shared_ptr<SseSession> Client::request_sse(Request request,
                                                            SseReconnectPolicy policy) {
         auto ex = impl_->executor;
@@ -3041,15 +3067,30 @@ namespace megohttp {
         // a caller error -- not something a weak_ptr can paper over here,
         // because Client::request is called through impl_.
         Impl* impl = impl_.get();
-        auto submitter = [impl](Request req,
-                                std::function<void(Result<Response>)> cb) {
+
+        // An SSE stream is long-lived by definition. Inheriting the Client's
+        // recv_timeout / total_timeout would kill every stream that is simply
+        // quiet for a while (heartbeat intervals can exceed 30s), and the task
+        // book (11) requires a long-lived SSE connection to be able to disable
+        // the total timeout. The connect/DNS budgets are kept: establishing the
+        // connection is still bounded work.
+        ClientOptions sse_options = impl_->options;
+        sse_options.recv_timeout = Duration::zero();
+        sse_options.send_timeout = Duration::zero();
+        sse_options.total_timeout = Duration::zero();
+
+        auto submitter = [impl, sse_options](Request req,
+                                             std::function<void(Result<Response>)> cb) {
             impl->submit(std::move(req), std::move(cb),
-                         CancelHandle{}, std::make_shared<CancelState>(impl->executor));
+                         CancelHandle{}, std::make_shared<CancelState>(impl->executor),
+                         &sse_options);
         };
         return std::make_shared<SseSession>(ex, std::move(submitter),
                                             std::move(request), std::move(policy));
     }
+#endif
 
+#if MEGOHTTP_HAS_WEBSOCKET
     inline std::shared_ptr<ReconnectingWebSocket> Client::open_websocket(
         string_view url, WebSocketOptions ws_options, WebSocketReconnectPolicy policy) {
         // Parse the ws:// or wss:// URL once, here: the provider below is called
@@ -3076,13 +3117,36 @@ namespace megohttp {
 
         Impl* impl = impl_.get();
         auto ex = impl_->executor;
-        if (!ex) ex = detail::make_default_executor();
+        if (!ex) {
+            ex = detail::make_default_executor();
+            // The provider below runs on a later attempt and reads
+            // impl->executor, not this local. Leaving it null made every
+            // attempt fail with NotImplemented before it ever resolved a name.
+            impl_->executor = ex;
+        }
+        // Same for the resolver: the provider reads impl->resolver.
+        if (!impl_->resolver) {
+            impl_->resolver = std::make_shared<SystemResolver>(ex);
+        }
 
-        // One physical attempt: resolve -> race -> (TLS) -> hand the stream back.
-        // This intentionally reuses nothing from the HTTP request pipeline: a
-        // WebSocket upgrade is not an HTTP exchange after the 101, so sharing
-        // the Exchange machinery would fight the frame protocol.
-        auto provider = [impl, host, port, secure, u](
+        // Proxy routing: when a proxy is configured the TCP connection goes to
+        // the PROXY, and the tunnel (CONNECT / SOCKS5, plus the proxy's own TLS
+        // layer when it is an HTTPS proxy) is what reaches the target. The
+        // target TLS handshake then runs on top of the tunnel, exactly as it
+        // does for https:// requests (task book 10.2 / 12.1).
+        const ProxyOptions proxy = impl_->options.proxy;
+        const bool use_proxy = proxy.proxy.is_set();
+        const string dial_host = use_proxy ? proxy.proxy.host : host;
+        const uint16_t dial_port = use_proxy ? proxy.proxy.port : port;
+        const string user_agent = impl_->options.user_agent;
+
+        // One physical attempt: resolve -> race -> (proxy tunnel) -> (TLS) ->
+        // hand the stream back. This intentionally reuses nothing from the HTTP
+        // request pipeline: a WebSocket upgrade is not an HTTP exchange after
+        // the 101, so sharing the Exchange machinery would fight the frame
+        // protocol.
+        auto provider = [impl, host, port, secure, u, dial_host, dial_port,
+                         use_proxy, proxy, user_agent](
                             string /*h*/, string /*p*/,
                             std::function<void(Result<std::shared_ptr<AsyncByteStream>>)> done) {
             auto exe = impl->executor;
@@ -3098,9 +3162,13 @@ namespace megohttp {
                 return;
             }
 
-            resolver->resolve(host, port, [impl, exe, secure, u, done](
+            resolver->resolve(dial_host, dial_port, [impl, exe, secure, u, done,
+                                                     host, port, use_proxy, proxy,
+                                                     user_agent](
                                             Result<AddressList> resolved) {
-                if (!resolved) { done(resolved.error()); return; }
+                if (!resolved) {
+                    done(resolved.error()); return;
+                }
                 if (resolved.value().empty()) {
                     done(Error{ErrorCode::DnsResolveFailed, ErrorPhase::Resolve,
                                string("no addresses resolved")});
@@ -3109,9 +3177,12 @@ namespace megohttp {
                 ConnectOptions copts;
                 copts.connect_timeout = impl->options.connect_timeout;
                 connect_race(exe, std::move(resolved.value()), copts,
-                             [impl, secure, u, done](
+                             [impl, secure, u, done, host, port, use_proxy, proxy,
+                              user_agent](
                                  Result<std::shared_ptr<AsyncByteStream>> conn) {
-                                 if (!conn) { done(conn.error()); return; }
+                                 if (!conn) {
+                                     done(conn.error()); return;
+                                 }
                                  auto stream = conn.value();
                                  if (!stream) {
                                      done(Error{ErrorCode::ConnectFailed,
@@ -3119,26 +3190,62 @@ namespace megohttp {
                                                 string("connect returned no stream")});
                                      return;
                                  }
-                                 if (!secure) { done(stream); return; }
 
-                                 // wss://: stack TLS on the connected stream. The
-                                 // config comes from ClientOptions::tls, so the
-                                 // same trust store and identity rules apply as
-                                 // for https://. The hostname must be the SERVER
-                                 // name, not the resolved address, or SNI and
-                                 // certificate validation would name the wrong
-                                 // identity.
-                                 TlsConfig cfg = impl->options.tls;
-                                 if (cfg.hostname.empty()) {
-                                     cfg.hostname = to_string(to_view(u.host));
+                                 // Everything after the TCP connection is a
+                                 // continuation: tunnel (when proxied), then the
+                                 // target TLS handshake, then the session.
+                                 auto after_tunnel =
+                                     [impl, secure, u, done](
+                                         Result<proxy_tunnel::TunnelResult> tr) {
+                                         if (!tr) { done(tr.error()); return; }
+                                         std::shared_ptr<AsyncByteStream> transport =
+                                             tr.value().stream;
+                                         byte_buffer leftover = std::move(tr.value().leftover);
+
+                                         // Tunnel bytes the proxy already sent for
+                                         // us belong BELOW whatever speaks next --
+                                         // for wss that is the TLS record layer, so
+                                         // the prefix must wrap the TCP/tunnel
+                                         // stream, not the TLS one.
+                                         if (!leftover.empty()) {
+                                             transport = std::make_shared<detail::PrefixedStream>(
+                                                 transport, std::move(leftover));
+                                         }
+
+                                         if (!secure) {
+                                             done(transport);
+                                             return;
+                                         }
+
+                                         TlsConfig cfg = impl->options.tls;
+                                         if (cfg.hostname.empty()) {
+                                             cfg.hostname = to_string(to_view(u.host));
+                                         }
+                                         auto tls = make_tls_stream(transport, cfg);
+                                         if (!tls) {
+                                             done(Error{ErrorCode::TlsHandshakeFailed,
+                                                        ErrorPhase::TargetTls,
+                                                        string("failed to create the target TLS stream")});
+                                             return;
+                                         }
+                                         tls->set_error_phase(ErrorPhase::TargetTls,
+                                                              ErrorPhase::TargetProtocol);
+                                         tls->start([tls, done](VoidResult r) {
+                                             if (!r) { done(r.error()); return; }
+                                             done(std::static_pointer_cast<AsyncByteStream>(tls));
+                                         });
+                                     };
+
+                                 if (!use_proxy) {
+                                     after_tunnel(proxy_tunnel::TunnelResult{stream, {}});
+                                     return;
                                  }
-                                 auto tls = make_tls_stream(stream, cfg);
-                                 tls->set_error_phase(ErrorPhase::TargetTls,
-                                                      ErrorPhase::TargetProtocol);
-                                 tls->start([tls, done](VoidResult r) {
-                                     if (!r) { done(r.error()); return; }
-                                     done(std::static_pointer_cast<AsyncByteStream>(tls));
-                                 });
+
+                                 proxy_tunnel::establish(
+                                     stream, proxy, to_view(host), port,
+                                     to_view(user_agent),
+                                     [impl](ErrorPhase p) { (void)impl; (void)p; },
+                                     after_tunnel);
                              });
             });
         };
@@ -3148,6 +3255,7 @@ namespace megohttp {
         session->start(std::move(host), std::move(path), Headers{});
         return session;
     }
+#endif
 
 } // namespace megohttp
 

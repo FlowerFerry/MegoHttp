@@ -325,6 +325,117 @@ TEST_CASE("ws session performs the upgrade handshake", "[websocket][session]") {
     CHECK(!header_value(head, "Sec-WebSocket-Key").empty());
 }
 
+TEST_CASE("ws on_before_handshake refreshes credentials before the upgrade",
+          "[websocket][session]") {
+    // D6: the hook is what lets a reconnect attach a token that was rotated
+    // while the connection was down. It must run BEFORE the request is written
+    // and must be able to both add and replace headers.
+    sock_init();
+    WsEchoServer srv;
+    REQUIRE(srv.start());
+
+    SessionFixture fx;
+    REQUIRE(fx.connect(srv.port()));
+
+    WebSocketOptions opt;
+    int calls = 0;
+    opt.on_before_handshake = [&calls](Headers& h) {
+        ++calls;
+        h.set("Authorization", "Bearer fresh-token");
+        h.set("X-Attempt", "1");
+    };
+
+    std::atomic<bool> opened{false};
+    Error open_err;
+    fx.session = std::make_shared<WebSocketSession>(fx.stream, opt, fx.exec);
+    fx.on_loop([&] {
+        fx.session->start(string("localhost"), string("/chat"), Headers{},
+                          [&](const Error& e) {
+                              open_err = e;
+                              opened.store(true);
+                          });
+    });
+
+    REQUIRE(wait_until([&] { return opened.load(); }));
+    CHECK(!open_err);
+    CHECK(calls == 1);
+
+    const std::string head = srv.request_head();
+    CHECK(header_value(head, "Authorization") == "Bearer fresh-token");
+    CHECK(header_value(head, "X-Attempt") == "1");
+}
+
+TEST_CASE("ws async_prepare_headers runs before the upgrade and can add a token",
+          "[websocket][session]") {
+    // The asynchronous form exists so a caller never has to block the I/O
+    // thread fetching a token. The attempt must wait for the completion.
+    sock_init();
+    WsEchoServer srv;
+    REQUIRE(srv.start());
+
+    SessionFixture fx;
+    REQUIRE(fx.connect(srv.port()));
+
+    WebSocketOptions opt;
+    std::atomic<bool> prepared{false};
+    opt.async_prepare_headers = [&prepared](std::function<void(VoidResult, const Headers&)> done) {
+        // Simulate an out-of-band fetch completing on another thread.
+        std::thread([&prepared, done]() {
+            Headers h;
+            h.set("Authorization", "Bearer async-token");
+            prepared.store(true);
+            done(VoidResult{}, h);
+        }).detach();
+    };
+
+    std::atomic<bool> opened{false};
+    Error open_err;
+    fx.session = std::make_shared<WebSocketSession>(fx.stream, opt, fx.exec);
+    fx.on_loop([&] {
+        fx.session->start(string("localhost"), string("/chat"), Headers{},
+                          [&](const Error& e) {
+                              open_err = e;
+                              opened.store(true);
+                          });
+    });
+
+    REQUIRE(wait_until([&] { return opened.load(); }));
+    CHECK(prepared.load());
+    CHECK(!open_err);
+    CHECK(header_value(srv.request_head(), "Authorization") == "Bearer async-token");
+}
+
+TEST_CASE("ws async_prepare_headers failure aborts the attempt", "[websocket][session]") {
+    sock_init();
+    WsEchoServer srv;
+    REQUIRE(srv.start());
+
+    SessionFixture fx;
+    REQUIRE(fx.connect(srv.port()));
+
+    WebSocketOptions opt;
+    opt.async_prepare_headers = [](std::function<void(VoidResult, const Headers&)> done) {
+        done(Error{ErrorCode::Cancelled, ErrorPhase::None, string("token fetch cancelled")},
+             Headers{});
+    };
+
+    std::atomic<bool> opened{false};
+    Error open_err;
+    fx.session = std::make_shared<WebSocketSession>(fx.stream, opt, fx.exec);
+    fx.on_loop([&] {
+        fx.session->start(string("localhost"), string("/chat"), Headers{},
+                          [&](const Error& e) {
+                              open_err = e;
+                              opened.store(true);
+                          });
+    });
+
+    REQUIRE(wait_until([&] { return opened.load(); }));
+    CHECK(open_err.code() == ErrorCode::Cancelled);
+    // The request never went out.
+    CHECK(srv.request_head().empty());
+}
+
 TEST_CASE("ws session rejects a non-101 upgrade response", "[websocket][session]") {
     sock_init();
     WsEchoServer srv;

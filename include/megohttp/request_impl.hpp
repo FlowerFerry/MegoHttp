@@ -30,8 +30,10 @@ namespace megohttp {
         // S6.1-01: SSE streaming parser attached to this request. When set,
         // response body bytes are parsed as text/event-stream instead of
         // delivered raw.
+#if MEGOHTTP_HAS_SSE
         std::optional<Request::SseCallback> sse_callback;
         SseParser::Limits sse_limits;
+#endif
         // Content coding. Upload compression is opt-in; response decoding is on
         // by default because Accept-Encoding is sent by this library.
         Request::Compression compress{Request::Compression::None};
@@ -237,6 +239,7 @@ namespace megohttp {
         return impl_->body_sink_flow;
     }
 
+#if MEGOHTTP_HAS_SSE
     inline void Request::set_sse_callback(SseCallback cb, SseParser::Limits limits) {
         impl_->sse_callback = std::move(cb);
         impl_->sse_limits = limits;
@@ -255,6 +258,7 @@ namespace megohttp {
     inline const SseParser::Limits& Request::sse_limits() const noexcept {
         return impl_->sse_limits;
     }
+#endif
 
     inline const std::optional<Request::BodySink>& Request::body_sink() const noexcept {
         return impl_->body_sink;

@@ -9,6 +9,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -87,6 +88,33 @@ TEST_CASE("ws client key is 16 random bytes in base64", "[websocket]") {
     // Two keys must not collide (random_device, not a fixed table).
     const string k2 = ws_detail::make_client_key();
     CHECK(k1 != k2);
+}
+
+TEST_CASE("ws client key can be pinned so the handshake is deterministic",
+          "[websocket]") {
+    // D11: the injected source is what lets a test assert the exact Accept
+    // value, and what proves each handshake draws fresh bytes instead of
+    // reusing a cached key.
+    const uint8_t fixed[16] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+                               0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10};
+    size_t calls = 0;
+    ws_detail::KeyRandomSource rng = [&calls, &fixed](uint8_t* out, size_t n) {
+        ++calls;
+        REQUIRE(n == 16);
+        std::memcpy(out, fixed, 16);
+    };
+
+    const string k = ws_detail::make_client_key(rng);
+    CHECK(calls == 1);
+    CHECK(k == ws_detail::make_client_key(rng));   // same bytes -> same key
+
+    // The Accept value is then a pure function of that key.
+    CHECK(str(ws_detail::accept_key_for(to_view(k))) ==
+          str(ws_detail::accept_key_for(to_view(k))));
+
+    // An empty source falls back to the platform RNG (no crash, still 16 bytes).
+    const string fallback = ws_detail::make_client_key(ws_detail::KeyRandomSource{});
+    CHECK(fallback.size() == 24);
 }
 
 TEST_CASE("ws header token matching is case-insensitive and comma-aware", "[websocket]") {

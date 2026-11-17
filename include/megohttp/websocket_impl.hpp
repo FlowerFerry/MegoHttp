@@ -146,6 +146,13 @@ namespace megohttp {
             return base64_encode_bytes(rnd, sizeof rnd);
         }
 
+        inline string make_client_key(const KeyRandomSource& rng) {
+            if (!rng) return make_client_key();
+            uint8_t rnd[16];
+            rng(rnd, sizeof rnd);
+            return base64_encode_bytes(rnd, sizeof rnd);
+        }
+
         inline string accept_key_for(string_view client_key) {
             // RFC 6455 4.2.2: the GUID is fixed by the spec.
             static const char kGuid[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";

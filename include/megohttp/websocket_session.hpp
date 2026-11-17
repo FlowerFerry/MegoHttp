@@ -30,6 +30,34 @@ namespace megohttp {
         std::vector<string> subprotocols;
         std::vector<string> extensions;
         bool require_subprotocol{false};
+
+        // --- Handshake credential refresh (task book 12.2 / 6.5) ---
+        // Runs BEFORE each handshake, including the first, and receives the
+        // header set that is about to be sent. This is the hook a reconnect
+        // uses to attach a fresh token: the old one may have expired while the
+        // connection was down, and a handshake that reuses it is rejected.
+        //
+        // Runs on the I/O thread, so it must NOT block. For a token that has to
+        // be fetched over the network use async_prepare_headers instead, which
+        // is cancellable and does not stall the loop.
+        std::function<void(Headers&)> on_before_handshake;
+
+        // Asynchronous credential preparation. Called once per connect attempt;
+        // the completion must be invoked exactly once with either the new
+        // headers or an error. A late completion after the attempt was
+        // cancelled is ignored.
+        //
+        //   prepared(prepare_done) where
+        //     prepare_done(Result<Headers>, Error) -- headers to use, or the
+        //     reason the attempt fails.
+        //
+        // Passing null means "synchronous only": on_before_handshake runs and
+        // the attempt proceeds immediately.
+        using HeadersPrepared =
+            std::function<void(VoidResult, const Headers&)>;
+        std::function<void(std::function<void(VoidResult, const Headers&)>)>
+            async_prepare_headers;
+
         // permessage-deflate (RFC 7692). Off by default; the runtime switch
         // decides whether the extension is OFFERED at all. When the build has no
         // zlib the offer is rejected at start() with WsCompressionNotCompiled,
@@ -38,8 +66,18 @@ namespace megohttp {
         DeflateOptions deflate{};
         size_t max_message_size{16 * 1024 * 1024};
         size_t max_frame_size{1 * 1024 * 1024};
+        // Total bytes allowed to sit in the send queue (compressed payload +
+        // frame header, i.e. what will actually be written). A send that would
+        // exceed it fails with WsSendQueueFull instead of growing without
+        // bound: the peer may simply stop reading, and nothing else in the
+        // library limits how much a caller can pile up behind that.
+        size_t max_send_queue_bytes{8 * 1024 * 1024};
         bool auto_pong{true};
         Duration close_timeout{std::chrono::seconds(5)};
+        // Test seam: pins the per-handshake client key. Left empty the library
+        // uses the platform RNG. A reconnect must still generate a NEW key, so
+        // this only fixes the bytes, not the "same key every time" behaviour.
+        ws_detail::KeyRandomSource client_key_rng;
     };
 
     class WebSocketSession : public std::enable_shared_from_this<WebSocketSession> {
@@ -95,7 +133,7 @@ namespace megohttp {
 
     private:
         void do_send_upgrade(const string& host, const string& path,
-                             const Headers& extra_headers);
+                             Headers& extra_headers);
         void start_reading();
         void on_read(Result<string_view> r);
         bool parse_handshake_response();
@@ -103,7 +141,6 @@ namespace megohttp {
         void finish_handshake_failure();
 
         VoidResult handle_control_frame(const WsFrame& frame);
-        VoidResult handle_data_frame(const WsFrame& frame);
 
         void send_frame(WsOpcode opcode, const std::vector<uint8_t>& payload,
                         bool fin = true, bool rsv1 = false,
@@ -142,6 +179,8 @@ namespace megohttp {
             std::function<void(const Error&)> on_complete;
         };
         std::deque<SendItem> send_queue_;
+        // Bytes currently queued (front item included while it is being written).
+        size_t send_queue_bytes_{0};
         bool sending_{false};
         mutable std::mutex send_mutex_;
 

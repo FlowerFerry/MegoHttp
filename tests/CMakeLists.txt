@@ -45,20 +45,51 @@ set(MGHTTP_TEST_SOURCES
     test_client_proxy.cpp
     test_client_retry.cpp
     test_cookie.cpp
-    test_sse.cpp
-    test_sse_client.cpp
-    test_sse_session.cpp
-    test_websocket.cpp
-    test_websocket_deflate.cpp
     test_reconnect.cpp
 )
+
+# Feature gates here use the CMake options, not the C++ MEGOHTTP_HAS_* macros:
+# those are defined by config.hpp for the compiler and are not visible to CMake.
+if(MGHTTP_ENABLE_SSE)
+    list(APPEND MGHTTP_TEST_SOURCES
+        test_sse.cpp
+        test_sse_client.cpp
+        test_sse_session.cpp
+    )
+endif()
+if(MGHTTP_ENABLE_WEBSOCKET)
+    list(APPEND MGHTTP_TEST_SOURCES
+        test_websocket.cpp
+        test_websocket_deflate.cpp
+    )
+endif()
 
 # These tests drive a real TcpStream through UvExecutor (directly, or through
 # Client::open_websocket's stream provider), so they are libuv-only. The Asio
 # backend has its own connect_race/resolver coverage in test_asio.
-if(MGHTTP_BACKEND_LIBUV)
+if(MGHTTP_BACKEND_LIBUV AND MGHTTP_ENABLE_WEBSOCKET)
     list(APPEND MGHTTP_TEST_SOURCES test_websocket_session.cpp)
     list(APPEND MGHTTP_TEST_SOURCES test_websocket_reconnect.cpp)
+endif()
+
+
+# The reconnect state machine sits above the transport, so this one runs on
+# BOTH backends: it injects a fake WsStreamProvider instead of dialling a real
+# socket. That is what gives the Asio configuration reconnect coverage (T2).
+if(MGHTTP_ENABLE_WEBSOCKET)
+    list(APPEND MGHTTP_TEST_SOURCES test_websocket_reconnect_backend.cpp)
+endif()
+
+# Interop against Python websockets: the only test that can catch a shared
+# misreading of RFC 7692. SKIPs (not fails) when Python is unavailable.
+if(MGHTTP_ENABLE_WEBSOCKET AND MGHTTP_ENABLE_WEBSOCKET_DEFLATE)
+    list(APPEND MGHTTP_TEST_SOURCES test_websocket_interop.cpp)
+endif()
+
+# WSS through a proxy CONNECT tunnel (S6.4-08). Needs the python proxy and the
+# websockets package, so it SKIPs when they are absent.
+if(MGHTTP_ENABLE_WEBSOCKET)
+    list(APPEND MGHTTP_TEST_SOURCES test_websocket_proxy.cpp)
 endif()
 
 if(MGHTTP_BACKEND_LIBUV)
@@ -115,7 +146,15 @@ add_test(NAME test_multi_tu COMMAND test_multi_tu)
 file(GLOB MGHTTP_INCLUDE_CHECK_SOURCES CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/include_check/*.cpp")
 if(MGHTTP_INCLUDE_CHECK_SOURCES)
-    add_library(mghttp_include_check OBJECT ${MGHTTP_INCLUDE_CHECK_SOURCES})
+    # SSE and WebSocket header checks are only compiled when the feature is on.
+    set(MGHTTP_IC_SOURCES ${MGHTTP_INCLUDE_CHECK_SOURCES})
+    if(NOT MGHTTP_ENABLE_SSE)
+        list(FILTER MGHTTP_IC_SOURCES EXCLUDE REGEX "h_sse\\.cpp$")
+    endif()
+    if(NOT MGHTTP_ENABLE_WEBSOCKET)
+        list(FILTER MGHTTP_IC_SOURCES EXCLUDE REGEX "h_websocket.*\\.cpp$")
+    endif()
+    add_library(mghttp_include_check OBJECT ${MGHTTP_IC_SOURCES})
     target_link_libraries(mghttp_include_check PRIVATE MegoHttp::megohttp)
     # The object library is never linked, so it needs no DLL copy step: it only
     # has to compile.

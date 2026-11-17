@@ -47,7 +47,9 @@ namespace {
     // events provided in *body, then closes.
     class TinySseServer {
     public:
-        explicit TinySseServer(std::string body) : body_(std::move(body)) {}
+        explicit TinySseServer(std::string body,
+                               std::string content_type = "text/event-stream")
+            : body_(std::move(body)), ctype_(std::move(content_type)) {}
         ~TinySseServer() { stop(); }
 
         bool start() {
@@ -104,7 +106,7 @@ namespace {
             // Send SSE response.
             std::string resp =
                 "HTTP/1.1 200 OK\r\n"
-                "Content-Type: text/event-stream\r\n"
+                "Content-Type: " + ctype_ + "\r\n"
                 "Connection: close\r\n"
                 "Content-Length: " + std::to_string(body_.size()) + "\r\n"
                 "\r\n" + body_;
@@ -113,6 +115,7 @@ namespace {
         }
 
         std::string body_;
+        std::string ctype_;
         uint16_t port_{0};
         sock_t ls_{kInvalidSock};
         std::atomic<bool> running_{false};
@@ -293,6 +296,8 @@ TEST_CASE("Client ignores non-SSE Content-Type when SSE callback is set", "[sse]
 
     int sse_count = 0;
     std::atomic<int> done{0};
+    std::atomic<int> result_had_error{0};
+    std::atomic<int> err_code{0};
 
     req.set_sse_callback(
         [&sse_count](const SseEvent& e) {
@@ -301,15 +306,67 @@ TEST_CASE("Client ignores non-SSE Content-Type when SSE callback is set", "[sse]
             return VoidResult{};
         });
 
+    cli.request(req, [&done, &result_had_error, &err_code](Result<Response> r) {
+        if (!r) {
+            result_had_error.store(1);
+            err_code.store(static_cast<int>(r.error().code()));
+        }
+        done.store(1);
+    });
+
+    CHECK(wait_until([&] { return done.load() == 1; }));
+    // The Content-Type is text/plain: the request must fail with
+    // SseInvalidContentType rather than silently buffering a body the caller
+    // will never see through its SSE callback (D12).
+    CHECK(sse_count == 0);
+    REQUIRE(result_had_error.load() == 1);
+    CHECK(err_code.load() == static_cast<int>(ErrorCode::SseInvalidContentType));
+
+    cli.shutdown();
+    srv.stop();
+}
+
+TEST_CASE("SSE is accepted when the Content-Type carries a charset parameter",
+          "[sse][client]") {
+    // "text/event-stream; charset=utf-8" is the shape real servers send. An
+    // exact whole-value compare used to reject it and silently fall through to
+    // the buffered path (D12).
+    init_winsock();
+    TinySseServer srv("data: one\n\n"
+                      "data: two\n\n",
+                      "text/event-stream; charset=utf-8");
+    if (!srv.start()) {
+        std::printf("SKIP: could not start SSE server\n");
+        return;
+    }
+
+    Client cli;
+    string url;
+    {
+        string_builder b;
+        detail::sb_append(b, "http://127.0.0.1:");
+        detail::sb_append(b, to_view(format("{}", srv.port())));
+        url = b.release();
+    }
+    Request req(Method::Get, url);
+
+    std::vector<std::string> events;
+    std::atomic<int> done{0};
+
+    req.set_sse_callback([&events](const SseEvent& e) {
+        events.emplace_back(e.data.data(), e.data.size());
+        return VoidResult{};
+    });
+
     cli.request(req, [&done](Result<Response> r) {
         (void)r;
         done.store(1);
     });
 
     CHECK(wait_until([&] { return done.load() == 1; }));
-    // The Content-Type is text/plain, so the SSE parser must never be created
-    // and the callback must never fire.
-    CHECK(sse_count == 0);
+    REQUIRE(events.size() == 2);
+    CHECK(events[0] == "one");
+    CHECK(events[1] == "two");
 
     cli.shutdown();
     srv.stop();

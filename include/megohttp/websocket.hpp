@@ -19,6 +19,7 @@
 #include <megohttp/string_adapter.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -31,8 +32,14 @@ namespace megohttp {
     namespace ws_detail {
 
         // RFC 6455 4.1: the client key is 16 random bytes, base64 encoded.
-        // The random source is injectable so a test can pin the value.
+        //
+        // The random source is injectable so a test can pin the exact key and
+        // assert the Accept value byte for byte (task book 13.7 asks for a
+        // fresh random key per handshake, which is only checkable if the test
+        // controls the input). Passing an empty function uses the platform RNG.
+        using KeyRandomSource = std::function<void(uint8_t* out, size_t size)>;
         string make_client_key();
+        string make_client_key(const KeyRandomSource& rng);
 
         // RFC 6455 4.2.2: SHA-1(key + GUID), base64 encoded.
         string accept_key_for(string_view client_key);

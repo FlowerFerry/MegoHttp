@@ -64,6 +64,13 @@ private:
 // - Strips 0x00 0x00 0xFF 0xFF tail before decompression
 // - Uses Z_SYNC_FLUSH
 // - Returns decompressed bytes
+//
+// `max_output_bytes` is enforced INCREMENTALLY, inside the inflate loop: the
+// output buffer grows only up to that cap and the call fails with
+// WsCompressionResourceExceeded as soon as the cap would be passed. Passing 0
+// disables the cap, which no caller inside this library does -- a compressed
+// message is attacker-controlled input and an unbounded inflate is a
+// decompression bomb (task book 12.1A).
 class DeflateDecompressor {
 public:
     DeflateDecompressor(const DeflateNegotiated& params);
@@ -71,7 +78,8 @@ public:
 
     // Decompress one message
     // If no_context_takeover is true, resets state after each message
-    Result<std::vector<uint8_t>> decompress(const std::vector<uint8_t>& input);
+    Result<std::vector<uint8_t>> decompress(const std::vector<uint8_t>& input,
+                                            size_t max_output_bytes);
 
 private:
     struct Impl;

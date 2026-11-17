@@ -101,6 +101,8 @@ namespace megohttp {
         std::atomic<bool> active_{false};
         std::atomic<bool> cancelled_{false};
         std::optional<string> last_event_id_;
+        // The last server-suggested retry: field, in milliseconds.
+        std::optional<int> event_retry_;
         size_t reconnect_attempts_{0};
         TimePoint session_start_;
 

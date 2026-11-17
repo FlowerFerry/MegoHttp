@@ -100,7 +100,7 @@ TEST_CASE("WebSocket deflate: compress and decompress", "[websocket][deflate]") 
         auto compressed = compressor.compress(input);
         REQUIRE(!compressed.empty());
 
-        auto decompressed = decompressor.decompress(compressed);
+        auto decompressed = decompressor.decompress(compressed, 16 * 1024 * 1024);
         REQUIRE(decompressed.has_value());
         REQUIRE(*decompressed == input);
     }
@@ -108,7 +108,7 @@ TEST_CASE("WebSocket deflate: compress and decompress", "[websocket][deflate]") 
     SECTION("empty message") {
         std::vector<uint8_t> input;
         auto compressed = compressor.compress(input);
-        auto decompressed = decompressor.decompress(compressed);
+        auto decompressed = decompressor.decompress(compressed, 16 * 1024 * 1024);
         REQUIRE(decompressed.has_value());
         REQUIRE(*decompressed == input);
     }
@@ -120,7 +120,7 @@ TEST_CASE("WebSocket deflate: compress and decompress", "[websocket][deflate]") 
         auto compressed = compressor.compress(input);
         REQUIRE(compressed.size() < input.size()); // Should compress well
 
-        auto decompressed = decompressor.decompress(compressed);
+        auto decompressed = decompressor.decompress(compressed, 16 * 1024 * 1024);
         REQUIRE(decompressed.has_value());
         REQUIRE(*decompressed == input);
     }
@@ -132,7 +132,7 @@ TEST_CASE("WebSocket deflate: compress and decompress", "[websocket][deflate]") 
         }
 
         auto compressed = compressor.compress(input);
-        auto decompressed = decompressor.decompress(compressed);
+        auto decompressed = decompressor.decompress(compressed, 16 * 1024 * 1024);
         REQUIRE(decompressed.has_value());
         REQUIRE(*decompressed == input);
     }
@@ -156,13 +156,13 @@ TEST_CASE("WebSocket deflate: no context takeover", "[websocket][deflate]") {
 
     // Compress and decompress first message
     auto compressed1 = compressor.compress(input1);
-    auto decompressed1 = decompressor.decompress(compressed1);
+    auto decompressed1 = decompressor.decompress(compressed1, 16 * 1024 * 1024);
     REQUIRE(decompressed1.has_value());
     REQUIRE(*decompressed1 == input1);
 
     // Compress and decompress second message (context should be reset)
     auto compressed2 = compressor.compress(input2);
-    auto decompressed2 = decompressor.decompress(compressed2);
+    auto decompressed2 = decompressor.decompress(compressed2, 16 * 1024 * 1024);
     REQUIRE(decompressed2.has_value());
     REQUIRE(*decompressed2 == input2);
 }
@@ -191,10 +191,38 @@ TEST_CASE("WebSocket deflate: context preservation", "[websocket][deflate]") {
     REQUIRE(compressed2.size() < compressed1.size());
 
     // Both should decompress correctly
-    auto decompressed1 = decompressor.decompress(compressed1);
-    auto decompressed2 = decompressor.decompress(compressed2);
+    auto decompressed1 = decompressor.decompress(compressed1, 16 * 1024 * 1024);
+    auto decompressed2 = decompressor.decompress(compressed2, 16 * 1024 * 1024);
     REQUIRE(decompressed1.has_value());
     REQUIRE(decompressed2.has_value());
     REQUIRE(*decompressed1 == input1);
     REQUIRE(*decompressed2 == input2);
+}
+
+TEST_CASE("deflate decompressor enforces output limit (bomb protection)", "[websocket][deflate]") {
+    DeflateNegotiated params;
+    params.enabled = true;
+    DeflateCompressor compressor(params);
+
+    // Create 10KB of highly compressible data (all zeros)
+    std::vector<uint8_t> input(10000, 0);
+    auto compressed = compressor.compress(input);
+    REQUIRE(compressed.size() < input.size());
+
+    SECTION("a tiny output cap fails instead of materialising the message") {
+        DeflateDecompressor decompressor(params);
+        auto r = decompressor.decompress(compressed, 10);
+        REQUIRE(!r);
+        REQUIRE(r.error().code() == ErrorCode::WsCompressionResourceExceeded);
+    }
+
+    SECTION("a generous cap decompresses normally") {
+        // A fresh decompressor: the capped attempt above drove the zlib stream
+        // part-way, and context takeover means that state belongs to that
+        // attempt, not to this one.
+        DeflateDecompressor decompressor(params);
+        auto r = decompressor.decompress(compressed, 16 * 1024 * 1024);
+        REQUIRE(r.has_value());
+        REQUIRE(r.value() == input);
+    }
 }

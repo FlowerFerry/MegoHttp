@@ -76,7 +76,48 @@ namespace megohttp {
             return;
         }
 
-        do_send_upgrade(host, path, extra_headers);
+        // A local copy: on_before_handshake and async_prepare_headers mutate the
+        // header set for THIS attempt only, and the caller's Headers must not be
+        // changed behind its back (a reconnect would then carry the previous
+        // attempt's token twice).
+        Headers hdrs = extra_headers;
+
+        // Asynchronous credential preparation. It is called on the I/O thread
+        // and must complete exactly once; a completion arriving after the
+        // session was stopped or moved on is dropped, which is what keeps a
+        // slow token fetch from resurrecting a dead attempt.
+        if (opts_.async_prepare_headers) {
+            auto self = shared_from_this();
+            opts_.async_prepare_headers(
+                [self, host, path, hdrs](VoidResult r, const Headers& prepared) mutable {
+                    // The completion may arrive on ANY thread (an auth service
+                    // call is exactly the case this hook exists for), but the
+                    // handshake touches the stream, which is loop-confined.
+                    auto exec = self->executor_;
+                    auto apply = [self, r, prepared, hdrs, host, path]() mutable {
+                        if (self->state() != WebSocketState::Connecting) return;
+                        if (!r) {
+                            auto cb = std::move(self->open_cb_);
+                            self->open_cb_ = nullptr;
+                            self->state_.store(WebSocketState::Closed);
+                            if (cb) {
+                                try { cb(r.error()); } catch (...) {}
+                            }
+                            return;
+                        }
+                        Headers use = prepared.empty() ? hdrs : prepared;
+                        self->do_send_upgrade(host, path, use);
+                    };
+                    if (exec) {
+                        exec->post([apply]() mutable { apply(); });
+                    } else {
+                        apply();
+                    }
+                });
+            return;
+        }
+
+        do_send_upgrade(host, path, hdrs);
     }
 
     inline void WebSocketSession::terminate() {
@@ -86,6 +127,7 @@ namespace megohttp {
         if (stream_) stream_->async_close(nullptr);
         std::lock_guard<std::mutex> lk(send_mutex_);
         send_queue_.clear();
+        send_queue_bytes_ = 0;
     }
 
     inline void WebSocketSession::close(uint16_t code, const string& reason) {
@@ -104,8 +146,15 @@ namespace megohttp {
     // Upgrade handshake
     // -----------------------------------------------------------------------
     inline void WebSocketSession::do_send_upgrade(const string& host, const string& path,
-                                                  const Headers& extra_headers) {
-        ws_key_ = ws_detail::make_client_key();
+                                                  Headers& extra_headers) {
+        // Credential refresh runs before the key is generated so the callback
+        // can see (and replace) whatever the caller supplied. It runs on every
+        // handshake, first one included: a token may already have been rotated.
+        if (opts_.on_before_handshake) {
+            try { opts_.on_before_handshake(extra_headers); } catch (...) {}
+        }
+
+        ws_key_ = ws_detail::make_client_key(opts_.client_key_rng);
 
         string_builder b;
         sb_append(b, "GET ");
@@ -375,8 +424,21 @@ namespace megohttp {
             msg = sb_release(b);
         }
         const Error e{ErrorCode::WsHandshakeFailed, ErrorPhase::TargetProtocol, msg};
-        if (open_cb_) { auto cb = std::move(open_cb_); open_cb_ = nullptr; cb(e); }
-        if (error_cb_) error_cb_(e);
+        // Exactly ONE terminal notification. open_cb_ is the negotiated
+        // handshake result, and the connection never opened, so that is the
+        // right channel; firing error_cb_ as well made ReconnectingWebSocket
+        // see one failure twice (once through its start() callback, once
+        // through on_error) and run two reconnect schedules for it.
+        ErrorCallback err_cb;
+        err_cb = std::move(error_cb_);
+        error_cb_ = nullptr;
+        if (open_cb_) {
+            auto cb = std::move(open_cb_);
+            open_cb_ = nullptr;
+            try { cb(e); } catch (...) {}
+        } else if (err_cb) {
+            try { err_cb(e); } catch (...) {}
+        }
         state_.store(WebSocketState::Closed);
         if (stream_) stream_->async_close(nullptr);
     }
@@ -444,8 +506,23 @@ namespace megohttp {
         const bool allow_rsv1 = rsv1 && !ws_is_control_opcode(opcode);
         ws_encode_frame(frame, opcode, payload.data(), payload.size(), fin, allow_rsv1);
 
+        // Bounded send queue: a frame that would exceed the cap is refused
+        // with WsSendQueueFull. The already-in-flight frame is excluded from
+        // the counter because it is being written right now and cannot grow.
+        // This cap exists alongside per-message / per-frame caps because the
+        // peer may simply stop reading, and nothing else limits how much a
+        // caller can pile up behind that.
         {
             std::lock_guard<std::mutex> lk(send_mutex_);
+            if (opts_.max_send_queue_bytes > 0 &&
+                send_queue_bytes_ + frame.size() > opts_.max_send_queue_bytes) {
+                if (on_complete) {
+                    on_complete(Error{ErrorCode::WsSendQueueFull, ErrorPhase::TargetProtocol,
+                                      string("send queue is full")});
+                }
+                return;
+            }
+            send_queue_bytes_ += frame.size();
             send_queue_.push_back(SendItem{std::move(frame), std::move(on_complete)});
         }
         pump_send_queue();
@@ -471,6 +548,8 @@ namespace megohttp {
                 {
                     std::lock_guard<std::mutex> lk(send_mutex_);
                     sending_ = false;
+                    // The frame left the queue: release its share of the cap.
+                    send_queue_bytes_ -= (std::min)(send_queue_bytes_, buf->size());
                 }
                 if (cb) {
                     if (!r) cb(r.error());
@@ -485,7 +564,14 @@ namespace megohttp {
     // -----------------------------------------------------------------------
     inline VoidResult WebSocketSession::on_frame(const WsFrame& frame) {
         if (ws_is_control_opcode(frame.opcode)) return handle_control_frame(frame);
-        return handle_data_frame(frame);
+        // Data frames reach us through the decoder bridge's on_message (which
+        // already reassembled fragments and carries the RSV1 flag); this path
+        // exists only so a stray data frame is still handled rather than
+        // silently dropped.
+        const WsMessageType type = (frame.opcode == WsOpcode::Text)
+                                       ? WsMessageType::Text
+                                       : WsMessageType::Binary;
+        return on_message(type, frame.payload, frame.rsv1);
     }
 
     inline VoidResult WebSocketSession::on_message(WsMessageType type,
@@ -506,7 +592,7 @@ namespace megohttp {
                 report_error(e);
                 return e;
             }
-            auto inflated = deflate_in_->decompress(payload);
+            auto inflated = deflate_in_->decompress(payload, opts_.max_message_size);
             if (!inflated) {
                 report_error(inflated.error());
                 return inflated.error();
@@ -577,16 +663,6 @@ namespace megohttp {
         }
     }
 
-    inline VoidResult WebSocketSession::handle_data_frame(const WsFrame& frame) {
-        // Data frames normally arrive through the WsFrameDecoder bridge, which
-        // already reassembled fragments and reports the RSV1 flag. This entry
-        // point exists for completeness; it passes RSV1 through unchanged.
-        const WsMessageType type = (frame.opcode == WsOpcode::Text)
-                                       ? WsMessageType::Text
-                                       : WsMessageType::Binary;
-        return on_message(type, frame.payload, frame.rsv1);
-    }
-
     // -----------------------------------------------------------------------
     // State transitions
     // -----------------------------------------------------------------------
@@ -615,10 +691,21 @@ namespace megohttp {
         if (stream_) stream_->async_close(nullptr);
         std::lock_guard<std::mutex> lk(send_mutex_);
         send_queue_.clear();
+        send_queue_bytes_ = 0;
     }
 
     inline void WebSocketSession::report_error(const Error& err) {
-        if (error_cb_) error_cb_(err);
+        // The error callback is a TERMINAL notification and must fire exactly
+        // once. Calling it unconditionally meant a second failure arriving
+        // during teardown (a close frame racing a read error, say) reported two
+        // terminals for one connection. Clear the callback first so any later
+        // report_error in the same connection is a no-op.
+        ErrorCallback cb;
+        cb = std::move(error_cb_);
+        error_cb_ = nullptr;
+        if (cb) {
+            try { cb(err); } catch (...) {}
+        }
         terminate();
     }
 

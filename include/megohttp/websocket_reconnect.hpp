@@ -128,6 +128,9 @@ namespace megohttp {
 
         // Stable-connection bookkeeping for the budget reset rule.
         TimePoint connected_at_{};
+        // Start of the LOGICAL session; the total-duration budget is measured
+        // from here and never refreshed by a reconnect.
+        TimePoint session_start_{};
         bool ever_connected_{false};
 
         mutable std::mutex mutex_;

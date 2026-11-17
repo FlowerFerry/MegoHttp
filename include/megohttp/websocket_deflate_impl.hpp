@@ -219,7 +219,7 @@ namespace megohttp {
     inline DeflateDecompressor::~DeflateDecompressor() = default;
 
     inline Result<std::vector<uint8_t>> DeflateDecompressor::decompress(
-        const std::vector<uint8_t>& input) {
+        const std::vector<uint8_t>& input, size_t max_output_bytes) {
         if (!impl_->initialised) {
             return Error{ErrorCode::WsCompressionNotCompiled, ErrorPhase::Receive,
                          string("permessage-deflate is not available in this build")};
@@ -240,14 +240,33 @@ namespace megohttp {
         data.push_back(0xFF);
         data.push_back(0xFF);
 
-        std::vector<uint8_t> out(std::max<size_t>(input.size() * 4, 1024));
+        // Start small and grow. The buffer never exceeds max_output_bytes, so a
+        // 1000:1 expansion is refused while it is still small instead of after
+        // the whole message has been materialised.
+        const size_t cap = (max_output_bytes == 0) ? 0 : max_output_bytes;
+        size_t initial = input.size() * 4;
+        if (initial < 1024) initial = 1024;
+        if (cap != 0 && initial > cap) initial = cap;
+        std::vector<uint8_t> out(initial);
 
         impl_->strm.next_in = data.data();
         impl_->strm.avail_in = static_cast<uInt>(data.size());
 
         size_t written = 0;
         for (;;) {
-            if (written == out.size()) out.resize(out.size() * 2);
+            if (written == out.size()) {
+                if (cap != 0 && out.size() >= cap) {
+                    // The cap is reached and inflate still wants to write: this
+                    // is the bomb case, refuse it now.
+                    return Error{ErrorCode::WsCompressionResourceExceeded,
+                                 ErrorPhase::Compression,
+                                 string("decompressed message exceeded the output limit")};
+                }
+                size_t next = out.size() * 2;
+                if (next == 0) next = 1024;
+                if (cap != 0 && next > cap) next = cap;
+                out.resize(next);
+            }
             impl_->strm.next_out = out.data() + written;
             impl_->strm.avail_out = static_cast<uInt>(out.size() - written);
             const size_t before = written;

@@ -335,3 +335,47 @@ TEST_CASE("ws reconnect stops after a local close", "[websocket][reconnect]") {
     client.shutdown();
     srv.stop();
 }
+
+TEST_CASE("ws reconnect total-duration budget runs from the session start",
+          "[websocket][reconnect]") {
+    // D13: the total-duration budget used to be measured from the last
+    // successful connect (connected_at_), which is refreshed on every
+    // successful handshake. A server that accepts and immediately drops could
+    // therefore retry forever. The budget must run from the logical session
+    // start, and this test only exercises that path: max_attempts is left
+    // unlimited so the duration is the only thing that can stop the loop.
+    sock_init();
+    WsHandshakeServer srv;
+    REQUIRE(srv.start(/*drop_count=*/100000));   // every connection drops
+
+    Client client;
+    WebSocketOptions wopt;
+    WebSocketReconnectPolicy policy;
+    policy.enabled = true;
+    policy.backoff.initial_delay = std::chrono::milliseconds(10);
+    policy.backoff.max_delay = std::chrono::milliseconds(20);
+    policy.backoff.max_attempts = 0;                       // unlimited attempts
+    policy.backoff.max_total_duration = std::chrono::milliseconds(250);
+    policy.backoff.jitter_ratio = 0.0;
+    // A stable connection would decay the attempt counter; every connection
+    // here is dropped immediately, so nothing decays.
+    policy.minimum_stable_connection_duration = std::chrono::seconds(30);
+
+    string_builder ub;
+    detail::sb_append(ub, "ws://127.0.0.1:");
+    detail::sb_append(ub, to_view(format("{}", srv.port())));
+    detail::sb_append(ub, "/ws");
+    const string url = ub.release();
+
+    std::atomic<bool> ended{false};
+    auto ws = client.open_websocket(to_view(url), wopt, policy);
+    ws->on_session_end([&](const Error*) { ended.store(true); });
+
+    // The session must stop on its own within a small multiple of the budget.
+    // Without the fix the counter resets on each handshake and this never ends.
+    CHECK(wait_until([&] { return ended.load(); }, 8000));
+    CHECK(ws->reconnect_attempts() > 0);
+
+    client.shutdown();
+    srv.stop();
+}

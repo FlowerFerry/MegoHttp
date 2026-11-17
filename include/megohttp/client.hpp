@@ -12,6 +12,7 @@
 #include <megohttp/content_type.hpp>
 #include <megohttp/multipart_sink.hpp>
 #include <megohttp/proxy.hpp>
+#include <megohttp/proxy_tunnel.hpp>
 #include <megohttp/error.hpp>
 #include <megohttp/executor.hpp>
 #include <megohttp/redirect.hpp>
@@ -20,11 +21,15 @@
 #include <megohttp/retry.hpp>
 #include <megohttp/resolver.hpp>
 #include <megohttp/response.hpp>
+#if MEGOHTTP_HAS_SSE
 #include <megohttp/sse_session.hpp>
+#endif
 #include <megohttp/string_adapter.hpp>
 #include <megohttp/transport.hpp>
 #include <megohttp/tls_stream.hpp>
+#if MEGOHTTP_HAS_WEBSOCKET
 #include <megohttp/websocket_reconnect.hpp>
+#endif
 
 #include <chrono>
 #include <future>
@@ -241,12 +246,15 @@ namespace megohttp {
         // Convenience: synchronous GET.
         Result<Response> get_sync(string_view url);
 
+#if MEGOHTTP_HAS_SSE
         // SSE session (S6.1). Creates a long-lived event stream with automatic
         // reconnection. The session persists across connection drops and resumes
         // from the last event ID.
         std::shared_ptr<SseSession> request_sse(Request request,
                                                 SseReconnectPolicy policy);
+#endif
 
+#if MEGOHTTP_HAS_WEBSOCKET
         // WebSocket logical session (S6.2). Establishes the TCP/TLS connection
         // through this Client's options (proxy, timeouts, trust store), then
         // layers the Upgrade handshake and the frame protocol on top. When
@@ -257,6 +265,7 @@ namespace megohttp {
             string_view url,
             WebSocketOptions ws_options,
             WebSocketReconnectPolicy policy);
+#endif
 
         // Stop accepting new work and retire every in-flight request with
         // ErrorCode::Cancelled. Idempotent. The executor is shut down only when

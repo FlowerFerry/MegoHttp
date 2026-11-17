@@ -98,6 +98,9 @@ namespace megohttp {
             if (event.id.has_value() && !event.id->empty()) {
                 last_event_id_ = event.id;
             }
+            if (event.retry_ms.has_value()) {
+                event_retry_ = event.retry_ms;
+            }
             reconnect_attempts_ = 0;
         }
 
@@ -143,7 +146,8 @@ namespace megohttp {
         Request req = request_;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (last_event_id_ && !last_event_id_->empty()) {
+            if (reconnect_policy_.send_last_event_id &&
+                last_event_id_ && !last_event_id_->empty()) {
                 req.headers().set("Last-Event-ID", *last_event_id_);
             }
         }
@@ -207,15 +211,35 @@ namespace megohttp {
                 return;
             }
             if (status < 200 || status >= 300) {
-                terminate(Error{ErrorCode::HttpInvalidResponse, ErrorPhase::Receive,
-                                format("SSE server returned status {}", status)});
+                const Error status_err{ErrorCode::HttpInvalidResponse, ErrorPhase::Receive,
+                                       format("SSE server returned status {}", status)};
+                // stop_on_http_error == false lets the caller treat a non-2xx
+                // answer as a transient failure worth retrying (a proxy 502, a
+                // 429 with no Retry-After). With the flag on -- the default --
+                // an HTTP error is an answer, and retrying it just repeats it.
+                if (!reconnect_policy_.stop_on_http_error) {
+                    schedule_reconnect(status_err);
+                } else {
+                    terminate(status_err);
+                }
                 return;
             }
 
-            // Content-Type must be text/event-stream.
+            // Content-Type must be text/event-stream. Parameters (a charset,
+            // typically) are ignored: WHATWG fixes SSE to UTF-8, and servers do
+            // state it. Comparing the whole header value would reject the most
+            // common real-world response.
             const auto ct = response.head().headers.get("content-type");
-            if (!ct || ct->find("text/event-stream") == string::npos) {
-                terminate(Error{ErrorCode::HttpInvalidResponse, ErrorPhase::Receive,
+            bool is_sse = false;
+            if (ct) {
+                const string_view v = *ct;
+                const size_t semi = v.find(';');
+                is_sse = detail::ascii_iequals(
+                    (semi == string_view::npos) ? v : v.substr(0, semi),
+                    "text/event-stream");
+            }
+            if (!is_sse) {
+                terminate(Error{ErrorCode::SseInvalidContentType, ErrorPhase::Receive,
                                 string("SSE server did not return text/event-stream")});
                 return;
             }
@@ -247,8 +271,28 @@ namespace megohttp {
             return;
         }
 
-        const Duration delay = reconnect_detail::backoff_delay(
-            reconnect_policy_.backoff, reconnect_attempts_ + 1, 0);
+        size_t next_attempt = reconnect_attempts_ + 1;
+        Duration delay = reconnect_detail::backoff_delay(
+            reconnect_policy_.backoff, next_attempt,
+            static_cast<uint32_t>(next_attempt * 7919u));
+
+        // If the server sent a retry field (and we honour it), override the
+        // backoff seed for this reconnect only. The server value is in
+        // milliseconds, and is clamped by max_delay.
+        std::optional<int> server_retry;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            server_retry = event_retry_;
+        }
+        if (reconnect_policy_.honor_server_retry && server_retry.has_value() &&
+            *server_retry >= 0) {
+            Duration sv = std::chrono::duration_cast<Duration>(
+                std::chrono::milliseconds(*server_retry));
+            if (sv > reconnect_policy_.backoff.max_delay)
+                sv = reconnect_policy_.backoff.max_delay;
+            delay = sv;
+        }
+
         ++reconnect_attempts_;
 
         if (!executor_) {

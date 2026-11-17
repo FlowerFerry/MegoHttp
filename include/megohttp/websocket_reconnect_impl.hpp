@@ -48,6 +48,10 @@ namespace megohttp {
         host_ = std::move(host);
         path_ = std::move(path);
         extra_headers_ = std::move(extra_headers);
+        // The total-duration budget runs from the start of the LOGICAL session.
+        // It is deliberately not refreshed on reconnect: a server that accepts
+        // and immediately drops would otherwise reset the budget every time.
+        session_start_ = Clock::now();
         attempt_connect();
     }
 
@@ -94,7 +98,11 @@ namespace megohttp {
                                               return;
                                           }
                                           self->reconnecting_.store(false);
-                                          self->generation_.fetch_add(1);
+                                          // The generation was already assigned
+                                          // in attach(); bumping it again here
+                                          // would make the is_current() check
+                                          // in this connection's own callbacks
+                                          // fail immediately.
                                           self->connected_at_ = Clock::now();
                                           const bool first = !self->ever_connected_;
                                           self->ever_connected_ = true;
@@ -129,6 +137,12 @@ namespace megohttp {
     }
 
     inline void ReconnectingWebSocket::attach(std::shared_ptr<WebSocketSession> session) {
+        // Every physical connection gets its own generation. All callbacks
+        // captured below carry this number and drop themselves when it is no
+        // longer the CURRENT generation: a late error or close frame from a
+        // retired connection must not drive a reconnect that a newer
+        // connection already owns (task book 12.2).
+        const uint64_t gen = generation_.fetch_add(1) + 1;
         {
             std::lock_guard<std::mutex> lk(session_mutex_);
             session_ = session;
@@ -136,8 +150,13 @@ namespace megohttp {
 
         auto self = shared_from_this();
 
-        session->on_message([self](WsMessageType t, const std::vector<uint8_t>& d) {
-            if (self->stopped_.load()) return;
+        // True when this callback's connection is still the active one.
+        auto is_current = [self, gen]() {
+            return !self->stopped_.load() && self->generation_.load() == gen;
+        };
+
+        session->on_message([self, is_current](WsMessageType t, const std::vector<uint8_t>& d) {
+            if (!is_current()) return;
             MessageCallback cb;
             {
                 std::lock_guard<std::mutex> lk(self->mutex_);
@@ -146,15 +165,19 @@ namespace megohttp {
             if (cb) { try { cb(t, d); } catch (...) {} }
         });
 
-        session->on_close([self](uint16_t code, const string& reason) {
-            CloseCallback cb;
+        session->on_close([self, is_current](uint16_t code, const string& reason) {
             {
-                std::lock_guard<std::mutex> lk(self->mutex_);
-                cb = self->close_cb_;
+                CloseCallback cb;
+                {
+                    std::lock_guard<std::mutex> lk(self->mutex_);
+                    cb = self->close_cb_;
+                }
+                if (cb) { try { cb(code, reason); } catch (...) {} }
             }
-            if (cb) { try { cb(code, reason); } catch (...) {} }
 
-            if (self->stopped_.load()) return;
+            // Late close from a retired connection: the caller already saw the
+            // terminal for it, and a newer connection owns the session now.
+            if (!is_current()) return;
             // A deliberate close from the local side already stopped us; any
             // other close frame means the peer ended the connection. Whether
             // that is retryable is a CLOSE-CODE question, not an Error one.
@@ -169,8 +192,8 @@ namespace megohttp {
                                           string("peer closed the connection")});
         });
 
-        session->on_error([self](const Error& e) {
-            if (self->stopped_.load()) return;
+        session->on_error([self, is_current](const Error& e) {
+            if (!is_current()) return;
             // Per-connection error notification; the session-level decision
             // happens in handle_disconnect below.
             ErrorCallback cb;
@@ -215,8 +238,24 @@ namespace megohttp {
             return;
         }
 
+        // The FIRST connect failure is a separate policy question (task book
+        // 12.2): a caller may want a bad URL or a refused port to fail at once
+        // instead of being retried. "First" means no attempt has ever reached
+        // the open state and no retry has been counted yet.
+        const bool first_connect_failure =
+            !ever_connected_ && attempts_.load() == 0;
+        if (first_connect_failure && !policy_.retry_initial_connect_failure) {
+            finish_session(err);
+            return;
+        }
+
         const size_t done = attempts_.load();
-        const Duration elapsed = Clock::now() - connected_at_;
+        // The total-duration budget is measured from the START of the logical
+        // session, not from the last successful connect: connected_at_ is
+        // refreshed on every successful handshake, so using it here made
+        // max_total_duration restart with each reconnect and a flapping server
+        // could retry forever. session_start_ is set once in start().
+        const Duration elapsed = Clock::now() - session_start_;
         if (reconnect_detail::budget_exhausted(policy_.backoff, done, elapsed)) {
             ReconnectEvents ev;
             {
