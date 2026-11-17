@@ -151,6 +151,36 @@ namespace megohttp {
     // across fragments.
     size_t ws_utf8_incomplete_tail(const uint8_t* data, size_t size);
 
+    // ---------------------------------------------------------------------
+    // Incremental UTF-8 validation (task book 12.1A).
+    //
+    // A decompressed message arrives in output chunks whose boundaries fall
+    // wherever zlib happened to stop, not on code-point boundaries. Validating
+    // the whole message after inflating it works, but only reports an error
+    // once the entire payload has been materialised; this validator lets the
+    // caller reject a bad message at the chunk that made it bad.
+    //
+    // Feed arbitrary splits. `complete()` says whether the stream ended on a
+    // code-point boundary; a trailing partial sequence is an error at EOF, not
+    // before it, because the next chunk may finish it.
+    // ---------------------------------------------------------------------
+    class WsUtf8Validator {
+    public:
+        // Returns false as soon as the bytes seen so far cannot be valid UTF-8.
+        bool feed(const uint8_t* data, size_t size);
+
+        // True when every fed byte formed complete sequences.
+        bool complete() const noexcept { return pending_len_ == 0; }
+
+        void reset() noexcept { pending_len_ = 0; }
+
+    private:
+        // Bytes of a sequence that started in an earlier chunk.
+        uint8_t pending_[4]{};
+        size_t pending_len_{0};
+    };
+
+
 } // namespace megohttp
 
 #include <megohttp/websocket_impl.hpp>

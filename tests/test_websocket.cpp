@@ -478,3 +478,88 @@ TEST_CASE("ws utf8 incomplete tail reports the partial sequence", "[websocket]")
     const uint8_t ascii[] = {'a', 'b'};
     CHECK(ws_utf8_incomplete_tail(ascii, sizeof ascii) == 0);
 }
+
+TEST_CASE("ws incremental utf8 validator agrees with the one-shot validator",
+          "[websocket][utf8]") {
+    // D10: the streaming validator must accept exactly what the whole-message
+    // validator accepts. A streaming one that is merely close enough would let
+    // a message through in the streaming path that the one-shot path rejects.
+    struct Case {
+        std::vector<uint8_t> bytes;
+        bool valid;
+        const char* what;
+    };
+    const std::vector<Case> cases = {
+        {{'a', 'b', 'c'}, true, "ascii"},
+        {{0xC3, 0xA9}, true, "2-byte e-acute"},
+        {{0xE2, 0x82, 0xAC}, true, "3-byte euro"},
+        {{0xF4, 0x8F, 0xBF, 0xBF}, true, "U+10FFFF"},
+        {{0xC3}, false, "lone 2-byte lead"},
+        {{0xE2, 0x82}, false, "truncated 3-byte"},
+        {{0xC0, 0x80}, false, "overlong NUL"},
+        {{0xE0, 0x80, 0x80}, false, "overlong 3-byte"},
+        {{0xED, 0xA0, 0x80}, false, "surrogate"},
+        {{0xF4, 0x90, 0x80, 0x80}, false, "above U+10FFFF"},
+        {{0x80}, false, "bare continuation"},
+        {{0xFF}, false, "illegal lead"},
+    };
+
+    for (const auto& c : cases) {
+        const bool one_shot = ws_is_valid_utf8(c.bytes.data(), c.bytes.size());
+
+        // Same bytes fed one at a time.
+        WsUtf8Validator v;
+        bool ok = true;
+        for (uint8_t b : c.bytes) {
+            if (!v.feed(&b, 1)) { ok = false; break; }
+        }
+        if (ok) ok = v.complete();
+
+        INFO(c.what);
+        CHECK(one_shot == c.valid);
+        CHECK(ok == c.valid);
+
+        // And in two arbitrary splits.
+        for (size_t cut = 0; cut <= c.bytes.size(); ++cut) {
+            WsUtf8Validator v2;
+            bool ok2 = true;
+            if (cut > 0 && !v2.feed(c.bytes.data(), cut)) ok2 = false;
+            if (ok2 && cut < c.bytes.size() &&
+                !v2.feed(c.bytes.data() + cut, c.bytes.size() - cut)) {
+                ok2 = false;
+            }
+            if (ok2) ok2 = v2.complete();
+            INFO(c.what << " split at " << cut);
+            CHECK(ok2 == c.valid);
+        }
+    }
+}
+
+TEST_CASE("ws incremental utf8 validator carries a split multi-byte sequence",
+          "[websocket][utf8]") {
+    // The euro sign split across three feeds: each call sees one byte, and only
+    // the third completes it. This is the shape a decompressor produces.
+    const uint8_t euro[] = {0xE2, 0x82, 0xAC};
+    WsUtf8Validator v;
+    CHECK(v.feed(euro, 1));
+    CHECK(!v.complete());
+    CHECK(v.feed(euro + 1, 1));
+    CHECK(!v.complete());
+    CHECK(v.feed(euro + 2, 1));
+    CHECK(v.complete());
+
+    // A message ending mid-sequence is incomplete, not invalid-until-EOF.
+    WsUtf8Validator v2;
+    CHECK(v2.feed(euro, 2));
+    CHECK(!v2.complete());
+}
+
+TEST_CASE("ws incremental utf8 validator rejects a bad continuation late",
+          "[websocket][utf8]") {
+    // Lead byte of a 3-byte sequence, then an ASCII byte where a continuation
+    // was required: this must fail at the second feed, not at the end.
+    const uint8_t bad[] = {0xE2, 'x'};
+    WsUtf8Validator v;
+    CHECK(v.feed(bad, 1));
+    CHECK(!v.feed(bad + 1, 1));
+}

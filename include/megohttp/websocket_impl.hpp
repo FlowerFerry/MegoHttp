@@ -281,6 +281,73 @@ namespace megohttp {
     }
 
     // ---------------------------------------------------------------------
+    // Incremental UTF-8 validation
+    //
+    // The pending buffer holds the bytes of a sequence that began in an earlier
+    // chunk. Each feed first tries to finish that sequence, then walks whole
+    // sequences, then parks a new partial tail. The validation rules are the
+    // same ones ws_is_valid_utf8 applies (no overlong forms, no surrogates,
+    // nothing above U+10FFFF) -- a streaming validator that accepted input the
+    // one-shot validator rejects would be worse than not having it.
+    // ---------------------------------------------------------------------
+    inline bool WsUtf8Validator::feed(const uint8_t* data, size_t size) {
+        size_t i = 0;
+
+        // 1. Try to complete the sequence carried over from the last chunk.
+        while (pending_len_ != 0 && i < size) {
+            const uint8_t c = data[i];
+            if ((c & 0xC0) != 0x80) {
+                // Not a continuation byte: the carried sequence is malformed.
+                return false;
+            }
+            pending_[pending_len_++] = c;
+            ++i;
+
+            const uint8_t lead = pending_[0];
+            size_t need = 0;
+            if ((lead & 0xE0) == 0xC0) need = 2;
+            else if ((lead & 0xF0) == 0xE0) need = 3;
+            else if ((lead & 0xF8) == 0xF0) need = 4;
+            else return false;
+
+            if (pending_len_ < need) continue;
+
+            // Complete: judge the code point, then reset.
+            if (ws_detail::utf8_seq_len(pending_, need) != need) return false;
+            pending_len_ = 0;
+        }
+
+        // 2. Whole sequences straight out of this chunk.
+        while (i < size) {
+            const size_t n = ws_detail::utf8_seq_len(data + i, size - i);
+            if (n != 0) {
+                i += n;
+                continue;
+            }
+            // Not enough bytes for a sequence that is otherwise well-formed:
+            // park them. A genuinely invalid lead byte reports 0 as well, so
+            // tell the two apart by checking whether the tail could still be
+            // completed from this chunk.
+            const size_t avail = size - i;
+            const uint8_t lead = data[i];
+            size_t need = 0;
+            if ((lead & 0xE0) == 0xC0) need = 2;
+            else if ((lead & 0xF0) == 0xE0) need = 3;
+            else if ((lead & 0xF8) == 0xF0) need = 4;
+            else return false;   // neither ASCII, nor a legal lead byte
+
+            if (avail >= need) {
+                // The whole sequence was present and still failed: invalid.
+                return false;
+            }
+            for (size_t k = 0; k < avail; ++k) pending_[k] = data[i + k];
+            pending_len_ = avail;
+            return true;
+        }
+        return true;
+    }
+
+    // ---------------------------------------------------------------------
     // Frame encoder
     // ---------------------------------------------------------------------
 

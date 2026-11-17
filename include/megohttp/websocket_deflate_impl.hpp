@@ -289,6 +289,79 @@ namespace megohttp {
         return out;
     }
 
+    inline VoidResult DeflateDecompressor::decompress_streaming(
+        const std::vector<uint8_t>& input, size_t max_output_bytes,
+        const ChunkSink& on_chunk) {
+        if (!impl_->initialised) {
+            return Error{ErrorCode::WsCompressionNotCompiled, ErrorPhase::Receive,
+                         string("permessage-deflate is not available in this build")};
+        }
+
+        if (impl_->params.server_no_context_takeover) impl_->reset();
+
+        // The sender strips the 0x00 0x00 0xFF 0xFF tail; restore it, because
+        // that is what lets zlib finish the block.
+        std::vector<uint8_t> data = input;
+        if (data.size() >= 4 && data[data.size() - 4] == 0x00 &&
+            data[data.size() - 3] == 0x00 && data[data.size() - 2] == 0xFF &&
+            data[data.size() - 1] == 0xFF) {
+            data.resize(data.size() - 4);
+        }
+        data.push_back(0x00);
+        data.push_back(0x00);
+        data.push_back(0xFF);
+        data.push_back(0xFF);
+
+        const size_t cap = (max_output_bytes == 0) ? 0 : max_output_bytes;
+        size_t initial = input.size() * 4;
+        if (initial < 1024) initial = 1024;
+        if (cap != 0 && initial > cap) initial = cap;
+        std::vector<uint8_t> out(initial);
+
+        impl_->strm.next_in = data.data();
+        impl_->strm.avail_in = static_cast<uInt>(data.size());
+
+        size_t written = 0;
+        for (;;) {
+            if (written == out.size()) {
+                if (cap != 0 && out.size() >= cap) {
+                    return Error{ErrorCode::WsCompressionResourceExceeded,
+                                 ErrorPhase::Compression,
+                                 string("decompressed message exceeded the output limit")};
+                }
+                size_t next = out.size() * 2;
+                if (next == 0) next = 1024;
+                if (cap != 0 && next > cap) next = cap;
+                out.resize(next);
+            }
+            impl_->strm.next_out = out.data() + written;
+            impl_->strm.avail_out = static_cast<uInt>(out.size() - written);
+            const size_t before = written;
+
+            const int rc = inflate(&impl_->strm, Z_SYNC_FLUSH);
+            written = out.size() - impl_->strm.avail_out;
+
+            // Hand the newly-produced bytes to the caller's sink.
+            if (written > before) {
+                if (!on_chunk(out.data() + before, written - before)) {
+                    return Error{ErrorCode::WsCompressionResourceExceeded,
+                                 ErrorPhase::Compression,
+                                 string("decompressed message exceeded the output limit")};
+                }
+            }
+
+            if (rc == Z_STREAM_END) break;
+            if (impl_->strm.avail_in == 0) {
+                if (rc == Z_BUF_ERROR || written == before) break;
+            }
+            if (rc == Z_OK || rc == Z_BUF_ERROR) continue;
+            return Error{ErrorCode::WsCompressionMalformedData, ErrorPhase::Receive,
+                         string("permessage-deflate payload could not be decoded")};
+        }
+
+        return VoidResult{};
+    }
+
 } // namespace megohttp
 
 #endif // MEGOHTTP_WEBSOCKET_DEFLATE_IMPL_HPP

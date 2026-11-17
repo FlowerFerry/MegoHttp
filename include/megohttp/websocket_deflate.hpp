@@ -6,6 +6,7 @@
 #include <megohttp/headers.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -80,6 +81,20 @@ public:
     // If no_context_takeover is true, resets state after each message
     Result<std::vector<uint8_t>> decompress(const std::vector<uint8_t>& input,
                                             size_t max_output_bytes);
+
+    // Decompress one message, handing each output chunk to `on_chunk` as it is
+    // produced instead of returning one buffer. This is what lets the caller
+    // validate UTF-8, enforce limits and deliver incrementally while the
+    // payload is still being inflated (task book 12.1A).
+    //
+    // `on_chunk` returns false to abort: the message is then reported as
+    // WsCompressionResourceExceeded if the cap was hit, otherwise the caller's
+    // own error is expected to have been recorded. A complete message produces
+    // no trailing empty chunk.
+    using ChunkSink = std::function<bool(const uint8_t* data, size_t size)>;
+    VoidResult decompress_streaming(const std::vector<uint8_t>& input,
+                                    size_t max_output_bytes,
+                                    const ChunkSink& on_chunk);
 
 private:
     struct Impl;

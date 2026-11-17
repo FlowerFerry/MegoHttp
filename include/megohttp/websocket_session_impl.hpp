@@ -577,41 +577,83 @@ namespace megohttp {
     inline VoidResult WebSocketSession::on_message(WsMessageType type,
                                                    const byte_buffer& payload,
                                                    bool compressed) {
-        byte_buffer plain = payload;
-
-        if (compressed) {
-            // RSV1 was set: the payload is DEFLATE output, so it must be
-            // inflated BEFORE UTF-8 validation (validating ciphertext as UTF-8
-            // would reject every legal compressed text message).
-            if (!deflate_in_ || !deflate_negotiated_.enabled) {
-                // A compressed frame with no negotiated extension is a protocol
-                // error: accepting it would mean silently trusting RSV1 we never
-                // agreed to (RFC 6455 5.2 / RFC 7692 6).
-                const Error e{ErrorCode::WsProtocolError, ErrorPhase::TargetProtocol,
-                              string("RSV1 set but permessage-deflate was not negotiated")};
+        if (!compressed) {
+            // Uncompressed path: no inflation, but the size and UTF-8 rules are
+            // identical, so it goes through the same validators.
+            if (payload.size() > opts_.max_message_size) {
+                const Error e{ErrorCode::WsMessageTooLarge, ErrorPhase::TargetProtocol,
+                              string("message exceeded max_message_size")};
                 report_error(e);
                 return e;
             }
-            auto inflated = deflate_in_->decompress(payload, opts_.max_message_size);
-            if (!inflated) {
-                report_error(inflated.error());
-                return inflated.error();
+            if (type == WsMessageType::Text) {
+                WsUtf8Validator v;
+                if (!v.feed(payload.data(), payload.size()) || !v.complete()) {
+                    const Error e{ErrorCode::WsUtf8Invalid, ErrorPhase::TargetProtocol,
+                                  string("text message is not valid UTF-8")};
+                    report_error(e);
+                    return e;
+                }
             }
-            plain = std::move(inflated.value());
+            if (message_cb_) message_cb_(type, payload);
+            return VoidResult{};
         }
 
-        // Text must be valid UTF-8 after decompression (RFC 6455 8.1).
-        if (type == WsMessageType::Text &&
-            !ws_is_valid_utf8(plain.data(), plain.size())) {
-            const Error e{ErrorCode::WsUtf8Invalid, ErrorPhase::TargetProtocol,
-                          string("text message is not valid UTF-8")};
+        // RSV1 was set: the payload is DEFLATE output. It is inflated chunk by
+        // chunk, and each chunk is validated and size-checked as it appears, so
+        // a bad or oversized message is rejected while it is still being
+        // produced rather than after the whole thing has been materialised
+        // (task book 12.1A).
+        if (!deflate_in_ || !deflate_negotiated_.enabled) {
+            const Error e{ErrorCode::WsProtocolError, ErrorPhase::TargetProtocol,
+                          string("RSV1 set but permessage-deflate was not negotiated")};
             report_error(e);
             return e;
         }
 
-        if (plain.size() > opts_.max_message_size) {
-            const Error e{ErrorCode::WsMessageTooLarge, ErrorPhase::TargetProtocol,
-                          string("decompressed message exceeded max_message_size")};
+        byte_buffer plain;
+        WsUtf8Validator validator;
+        size_t total = 0;
+        Error sink_error;
+        bool overflow = false;
+
+        auto sink = [&](const uint8_t* data, size_t size) -> bool {
+            total += size;
+            if (total > opts_.max_message_size) {
+                overflow = true;
+                return false;
+            }
+            // Text is validated per output chunk; a multi-byte sequence may be
+            // split across chunks, which the validator carries over.
+            if (type == WsMessageType::Text && !validator.feed(data, size)) {
+                sink_error = Error{ErrorCode::WsUtf8Invalid, ErrorPhase::TargetProtocol,
+                                   string("text message is not valid UTF-8")};
+                return false;
+            }
+            plain.insert(plain.end(), data, data + size);
+            return true;
+        };
+
+        auto r = deflate_in_->decompress_streaming(payload, opts_.max_message_size, sink);
+        if (!r) {
+            // A sink abort is reported as the caller's own error, not as a
+            // compression failure: the bytes were well-formed DEFLATE.
+            const Error e = sink_error.code() != ErrorCode::Success
+                                ? sink_error
+                                : (overflow
+                                       ? Error{ErrorCode::WsMessageTooLarge,
+                                               ErrorPhase::TargetProtocol,
+                                               string("decompressed message exceeded "
+                                                      "max_message_size")}
+                                       : r.error());
+            report_error(e);
+            return e;
+        }
+
+        // A message may not end mid-code-point.
+        if (type == WsMessageType::Text && !validator.complete()) {
+            const Error e{ErrorCode::WsUtf8Invalid, ErrorPhase::TargetProtocol,
+                          string("text message ends with an incomplete UTF-8 sequence")};
             report_error(e);
             return e;
         }

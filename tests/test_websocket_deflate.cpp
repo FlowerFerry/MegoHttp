@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include <megohttp/websocket_deflate.hpp>
+#include <megohttp/websocket.hpp>
 #include <megohttp/headers.hpp>
 
 using namespace megohttp;
@@ -225,4 +226,87 @@ TEST_CASE("deflate decompressor enforces output limit (bomb protection)", "[webs
         REQUIRE(r.has_value());
         REQUIRE(r.value() == input);
     }
+}
+
+TEST_CASE("deflate streaming decompression delivers chunks as they are produced",
+          "[websocket][deflate]") {
+    // D10: the streaming path exists so a caller can validate and limit while
+    // inflating. It must deliver exactly the same bytes as the buffered path,
+    // split into one or more chunks and never a trailing empty one.
+    DeflateNegotiated params;
+    params.enabled = true;
+    DeflateCompressor compressor(params);
+
+    std::string text;
+    for (int i = 0; i < 500; ++i) text += "streaming chunk boundary test ";
+    std::vector<uint8_t> input(text.begin(), text.end());
+    auto compressed = compressor.compress(input);
+    REQUIRE(!compressed.empty());
+
+    SECTION("chunks reassemble to the original payload") {
+        DeflateDecompressor d(params);
+        std::vector<uint8_t> got;
+        int chunks = 0;
+        auto r = d.decompress_streaming(compressed, 16 * 1024 * 1024,
+            [&](const uint8_t* data, size_t size) {
+                ++chunks;
+                CHECK(size > 0);          // never a zero-length chunk
+                got.insert(got.end(), data, data + size);
+                return true;
+            });
+        REQUIRE(r);
+        CHECK(chunks >= 1);
+        CHECK(got == input);
+    }
+
+    SECTION("the sink can abort, and the abort is reported as a limit breach") {
+        DeflateDecompressor d(params);
+        size_t seen = 0;
+        auto r = d.decompress_streaming(compressed, 16 * 1024 * 1024,
+            [&](const uint8_t*, size_t size) {
+                seen += size;
+                return seen < 100;        // stop early
+            });
+        REQUIRE(!r);
+        CHECK(r.error().code() == ErrorCode::WsCompressionResourceExceeded);
+        CHECK(seen < input.size());
+    }
+
+    SECTION("the output cap is still enforced on the streaming path") {
+        DeflateDecompressor d(params);
+        auto r = d.decompress_streaming(compressed, 50,
+            [](const uint8_t*, size_t) { return true; });
+        REQUIRE(!r);
+        CHECK(r.error().code() == ErrorCode::WsCompressionResourceExceeded);
+    }
+}
+
+TEST_CASE("deflate streaming output can be UTF-8 validated per chunk",
+          "[websocket][deflate]") {
+    // The whole point of D10: validation happens on chunks whose boundaries do
+    // not respect code-point boundaries. A multi-byte character split across
+    // two inflate outputs must still validate.
+    DeflateNegotiated params;
+    params.enabled = true;
+    DeflateCompressor compressor(params);
+
+    std::string text;
+    for (int i = 0; i < 200; ++i) text += "\xE2\x82\xAC";   // euro, 3 bytes each
+    std::vector<uint8_t> input(text.begin(), text.end());
+    auto compressed = compressor.compress(input);
+
+    DeflateDecompressor d(params);
+    WsUtf8Validator v;
+    bool utf8_ok = true;
+    size_t bytes = 0;
+    auto r = d.decompress_streaming(compressed, 16 * 1024 * 1024,
+        [&](const uint8_t* data, size_t size) {
+            bytes += size;
+            if (!v.feed(data, size)) { utf8_ok = false; return false; }
+            return true;
+        });
+    REQUIRE(r);
+    CHECK(utf8_ok);
+    CHECK(v.complete());
+    CHECK(bytes == input.size());
 }
