@@ -24,8 +24,6 @@ set(MGHTTP_TEST_SOURCES
     test_streaming.cpp
     test_streaming_integration.cpp
     test_streaming_network.cpp
-    test_content_decoder.cpp
-    test_content_encoding.cpp
     test_multipart.cpp
     test_multipart_response.cpp
     test_multipart_continuous.cpp
@@ -48,6 +46,20 @@ set(MGHTTP_TEST_SOURCES
     test_reconnect.cpp
 )
 
+# Coroutine tests need C++20 and a toolchain with <coroutine>.
+if(MGHTTP_ENABLE_COROUTINES)
+    list(APPEND MGHTTP_TEST_SOURCES test_task.cpp)
+endif()
+
+# gzip/deflate need zlib; these tests build their own fixtures with zlib's
+# encoder, so they cannot exist in a build without it (task book 3.21).
+if(MGHTTP_ZLIB_AVAILABLE)
+    list(APPEND MGHTTP_TEST_SOURCES
+        test_content_decoder.cpp
+        test_content_encoding.cpp
+    )
+endif()
+
 # Feature gates here use the CMake options, not the C++ MEGOHTTP_HAS_* macros:
 # those are defined by config.hpp for the compiler and are not visible to CMake.
 if(MGHTTP_ENABLE_SSE)
@@ -57,18 +69,29 @@ if(MGHTTP_ENABLE_SSE)
         test_sse_session.cpp
     )
 endif()
+if(MGHTTP_ENABLE_WEBSOCKET AND MGHTTP_ENABLE_WEBSOCKET_DEFLATE)
+    list(APPEND MGHTTP_TEST_SOURCES
+        test_websocket_deflate.cpp
+    )
+endif()
 if(MGHTTP_ENABLE_WEBSOCKET)
     list(APPEND MGHTTP_TEST_SOURCES
         test_websocket.cpp
-        test_websocket_deflate.cpp
     )
 endif()
 
 # These tests drive a real TcpStream through UvExecutor (directly, or through
 # Client::open_websocket's stream provider), so they are libuv-only. The Asio
 # backend has its own connect_race/resolver coverage in test_asio.
-if(MGHTTP_BACKEND_LIBUV AND MGHTTP_ENABLE_WEBSOCKET)
+# test_websocket_session runs on BOTH backends: its fixture only needs an
+# Executor and a TcpStream, which is the abstraction the library is built on.
+# test_websocket_reconnect (below) drives Client::open_websocket and therefore
+# the backend's resolver/connect_race path, so it stays libuv-only; the Asio
+# side gets equivalent coverage from test_websocket_reconnect_backend.
+if(MGHTTP_ENABLE_WEBSOCKET)
     list(APPEND MGHTTP_TEST_SOURCES test_websocket_session.cpp)
+endif()
+if(MGHTTP_BACKEND_LIBUV AND MGHTTP_ENABLE_WEBSOCKET)
     list(APPEND MGHTTP_TEST_SOURCES test_websocket_reconnect.cpp)
 endif()
 

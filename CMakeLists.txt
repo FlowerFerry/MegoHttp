@@ -2,8 +2,12 @@ cmake_minimum_required(VERSION 3.14)
 
 project(MegoHttp VERSION 0.1.0 LANGUAGES CXX)
 
-# C++ Standard
-set(CMAKE_CXX_STANDARD 17)
+# C++ Standard. C++17 is the baseline; a caller may ask for C++20 to get the
+# coroutine surface (MGHTTP_ENABLE_COROUTINES then defaults ON). Do not
+# overwrite an explicit -DCMAKE_CXX_STANDARD.
+if(NOT DEFINED CMAKE_CXX_STANDARD)
+    set(CMAKE_CXX_STANDARD 17)
+endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -95,6 +99,15 @@ option(MGHTTP_ENABLE_COROUTINES "Enable C++20 coroutine support" ${MGHTTP_ENABLE
 
 if(MGHTTP_ENABLE_COROUTINES AND NOT MGHTTP_HAS_COROUTINE_HEADER)
     message(FATAL_ERROR "C++20 coroutines requested but <coroutine> header not available")
+endif()
+
+# The header existing is not enough: the compiler must also be in C++20 mode.
+# Asking for coroutines under C++17 is a configuration error, not a silent
+# downgrade (task book 3.12).
+if(MGHTTP_ENABLE_COROUTINES AND CMAKE_CXX_STANDARD LESS 20)
+    message(FATAL_ERROR
+        "MGHTTP_ENABLE_COROUTINES=ON requires CMAKE_CXX_STANDARD >= 20 "
+        "(current: ${CMAKE_CXX_STANDARD}). Reconfigure with -DCMAKE_CXX_STANDARD=20.")
 endif()
 
 # Print configuration

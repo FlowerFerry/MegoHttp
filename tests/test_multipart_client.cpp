@@ -11,7 +11,9 @@
 #include <megohttp/client.hpp>
 #include <megohttp/multipart_sink.hpp>
 
+#if MEGOHTTP_HAS_ZLIB
 #include <zlib.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -54,6 +56,7 @@ inline void closesock(sock_t s) { ::close(s); }
 inline void ensure_wsa() {}
 #endif
 
+#if MEGOHTTP_HAS_ZLIB
 std::vector<uint8_t> gzip_compress(const std::string& in) {
     z_stream s{};
     if (deflateInit2(&s, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 + 16, 8,
@@ -70,6 +73,7 @@ std::vector<uint8_t> gzip_compress(const std::string& in) {
     out.resize(produced);
     return out;
 }
+#endif // MEGOHTTP_HAS_ZLIB
 
 // Serves an HTTP response with the given raw bytes (possibly gzipped).
 // Keep-alive: it answers every request on a connection until the client closes,
@@ -103,12 +107,16 @@ public:
 
         std::string body_data = body;
         std::string enc;
+#if MEGOHTTP_HAS_ZLIB
         if (gzip_body) {
             auto gz = gzip_compress(body);
             if (gz.empty()) return false;
             body_data.assign(reinterpret_cast<const char*>(gz.data()), gz.size());
             enc = "Content-Encoding: gzip\r\n";
         }
+#else
+        (void)gzip_body;   // no zlib: the gzip fixture cannot be produced
+#endif
         if (send_cl) {
             resp_ =
                 "HTTP/1.1 200 OK\r\n"
@@ -267,6 +275,7 @@ TEST_CASE("Client delivers multipart parts via MultipartSink", "[s57][multipart]
     CHECK(std::string(sink->part_data[1].begin(), sink->part_data[1].end()) == "part two");
 }
 
+#if MEGOHTTP_HAS_ZLIB
 TEST_CASE("Client parses gzipped multipart response", "[s57][multipart][gzip]") {
     MultipartServer srv;
     REQUIRE(srv.start("multipart/mixed; boundary=b1", mp_mixed(), true));
@@ -293,6 +302,7 @@ TEST_CASE("Client parses gzipped multipart response", "[s57][multipart][gzip]") 
     CHECK(sink->complete_count == 1);
     CHECK(!sink->error_fired);
 }
+#endif // MEGOHTTP_HAS_ZLIB
 
 TEST_CASE("Client fires on_error when multipart body is truncated", "[s57][multipart][truncation]") {
     // A multipart body missing its closing boundary. Framing is close-delimited

@@ -5,6 +5,7 @@
 #include <megohttp/error.hpp>
 #include <megohttp/headers.hpp>
 
+
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -12,8 +13,12 @@
 #include <string>
 #include <vector>
 
-#if MEGOHTTP_HAS_ZLIB
-#include <zlib.h>
+// zlib is needed for permessage-deflate. The MEGOHTTP_HAS_WEBSOCKET_DEFLATE
+// macro is true only when the feature is enabled AND zlib is available. The
+// session-level check at websocket_session_impl.hpp refuses enable_deflate at
+// runtime when this macro is false, turning a link error into a hard error.
+#if MEGOHTTP_HAS_WEBSOCKET_DEFLATE
+#   include <zlib.h>
 #endif
 
 namespace megohttp {
@@ -35,6 +40,15 @@ struct DeflateNegotiated {
     bool server_no_context_takeover = false;
     bool client_no_context_takeover = false;
 };
+
+// Everything below needs zlib, so it exists only when the feature is compiled
+// in. The two POD structs above stay unconditional: WebSocketOptions holds a
+// DeflateOptions by value and must remain a complete type even in a build that
+// disabled the feature (a preprocessor-gated member would break every user that
+// names the struct). MEGOHTTP_HAS_WEBSOCKET_DEFLATE == 0 means "not compiled",
+// and websocket_session_impl.hpp rejects enable_deflate at start() with
+// WsCompressionNotCompiled, so nothing can reach these symbols.
+#if MEGOHTTP_HAS_WEBSOCKET_DEFLATE
 
 // Parse Sec-WebSocket-Extensions header for permessage-deflate offers
 // Returns nullopt if not offered or malformed
@@ -101,9 +115,16 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+#endif // MEGOHTTP_HAS_WEBSOCKET_DEFLATE
+
 } // namespace megohttp
 
-#if MEGOHTTP_HAS_ZLIB
+// The implementation is compiled only when MEGOHTTP_HAS_WEBSOCKET_DEFLATE holds
+// (feature enabled AND zlib available). A build with ENABLE_WEBSOCKET_DEFLATE=OFF
+// must not compile the DEFLATE code at all (task book 3.21: an explicitly
+// disabled feature must not keep its dependency), even when zlib is present for
+// HTTP gzip.
+#if MEGOHTTP_HAS_WEBSOCKET_DEFLATE
 #include <megohttp/websocket_deflate_impl.hpp>
 #endif
 

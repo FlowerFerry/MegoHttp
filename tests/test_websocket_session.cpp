@@ -5,9 +5,13 @@
 // the only way to test the handshake without pinning the client's random key.
 
 #include <megohttp/websocket_session.hpp>
-#include <megohttp/backend/executor_libuv.hpp>
 #include <megohttp/transport.hpp>
 #include <megohttp/resolver.hpp>
+#if MGHTTP_BACKEND_LIBUV
+#include <megohttp/backend/executor_libuv.hpp>
+#else
+#include <megohttp/backend/executor_asio.hpp>
+#endif
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -247,15 +251,19 @@ namespace {
     };
 
     // RAII wiring for one session over a real TCP connection.
-    using megohttp::libuv_backend::UvExecutor;
-
+    // Both backends are supported: the fixture only needs "an Executor" and
+    // "a TcpStream", which is exactly the abstraction the library is built on.
     struct SessionFixture {
-        std::shared_ptr<UvExecutor> exec;
+        std::shared_ptr<Executor> exec;
         std::shared_ptr<TcpStream> stream;
         std::shared_ptr<WebSocketSession> session;
 
         bool connect(uint16_t port) {
-            exec = UvExecutor::create_internal();
+#if MGHTTP_BACKEND_LIBUV
+            exec = libuv_backend::UvExecutor::create_internal();
+#else
+            exec = asio_backend::AsioExecutor::create_internal();
+#endif
             if (!exec) return false;
 
             ResolvedAddress target;
@@ -287,7 +295,11 @@ namespace {
 
         ~SessionFixture() {
             if (session) session->terminate();
-            if (exec) exec->shutdown();
+#if MGHTTP_BACKEND_LIBUV
+            if (auto e = std::dynamic_pointer_cast<libuv_backend::UvExecutor>(exec)) e->shutdown();
+#else
+            if (auto e = std::dynamic_pointer_cast<asio_backend::AsioExecutor>(exec)) e->shutdown();
+#endif
         }
     };
 

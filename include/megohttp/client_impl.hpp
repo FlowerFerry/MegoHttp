@@ -3257,6 +3257,30 @@ namespace megohttp {
     }
 #endif
 
+#if MEGOHTTP_HAS_COROUTINES
+    inline Task<Result<Response>> Client::request_co(const Request& req) {
+        // Publish the request's cancel handle on the promise so
+        // Task::cancel() can reach it from any thread, then suspend on the
+        // completion callback. Nothing blocks: the executor thread drives the
+        // request and resumes this coroutine from the callback.
+        auto* p = co_await Task<Result<Response>>::GetPromise{};
+
+        SuspendedOperation<Result<Response>> op;
+        // Capture the shared handle slot, not the raw promise pointer: cancel()
+        // may copy it from another thread while this body runs.
+        auto cancel_slot = p->cancel_;
+        op.start = [this, req, cancel_slot](std::function<void(Result<Response>)> done) {
+            *cancel_slot = this->request(req, std::move(done));
+        };
+        co_return co_await op;
+    }
+
+    inline Task<Result<Response>> Client::get_co(string_view url) {
+        Request req(Method::Get, url);
+        co_return co_await request_co(req);
+    }
+#endif
+
 } // namespace megohttp
 
 #endif // MEGOHTTP_CLIENT_IMPL_HPP_INCLUDED

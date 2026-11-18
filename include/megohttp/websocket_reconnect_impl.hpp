@@ -7,11 +7,13 @@ namespace megohttp {
         std::shared_ptr<Executor> executor,
         WsStreamProvider provider,
         WebSocketOptions ws_options,
-        WebSocketReconnectPolicy policy)
+        WebSocketReconnectPolicy policy,
+        TestHooks test_hooks)
         : executor_(std::move(executor))
         , provider_(std::move(provider))
         , ws_options_(std::move(ws_options))
-        , policy_(std::move(policy)) {}
+        , policy_(std::move(policy))
+        , hooks_(std::move(test_hooks)) {}
 
     inline ReconnectingWebSocket::~ReconnectingWebSocket() {
         terminate();
@@ -51,7 +53,7 @@ namespace megohttp {
         // The total-duration budget runs from the start of the LOGICAL session.
         // It is deliberately not refreshed on reconnect: a server that accepts
         // and immediately drops would otherwise reset the budget every time.
-        session_start_ = Clock::now();
+        session_start_ = now();
         attempt_connect();
     }
 
@@ -103,7 +105,7 @@ namespace megohttp {
                                           // would make the is_current() check
                                           // in this connection's own callbacks
                                           // fail immediately.
-                                          self->connected_at_ = Clock::now();
+                                          self->connected_at_ = self->now();
                                           const bool first = !self->ever_connected_;
                                           self->ever_connected_ = true;
 
@@ -222,7 +224,7 @@ namespace megohttp {
         // failure count; a short-lived one does not, which is what stops a
         // flapping server from retrying forever.
         if (ever_connected_) {
-            const Duration lifetime = Clock::now() - connected_at_;
+            const Duration lifetime = now() - connected_at_;
             if (ws_reconnect_detail::was_stable(policy_, lifetime)) {
                 attempts_.store(ws_reconnect_detail::decay_failures(
                     policy_, attempts_.load()));
@@ -255,7 +257,7 @@ namespace megohttp {
         // refreshed on every successful handshake, so using it here made
         // max_total_duration restart with each reconnect and a flapping server
         // could retry forever. session_start_ is set once in start().
-        const Duration elapsed = Clock::now() - session_start_;
+        const Duration elapsed = now() - session_start_;
         if (reconnect_detail::budget_exhausted(policy_.backoff, done, elapsed)) {
             ReconnectEvents ev;
             {
@@ -287,12 +289,8 @@ namespace megohttp {
             try { ev.on_scheduled(next_attempt, delay); } catch (...) {}
         }
 
-        if (!executor_) {
-            finish_session(err);
-            return;
-        }
         auto self = shared_from_this();
-        executor_->schedule_after(delay, [self]() {
+        schedule_after(delay, [self]() {
             if (!self->stopped_.load()) self->attempt_connect();
         });
     }

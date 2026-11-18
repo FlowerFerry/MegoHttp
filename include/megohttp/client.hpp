@@ -15,6 +15,10 @@
 #include <megohttp/proxy_tunnel.hpp>
 #include <megohttp/error.hpp>
 #include <megohttp/executor.hpp>
+
+#if MEGOHTTP_HAS_COROUTINES
+#include <megohttp/task.hpp>
+#endif
 #include <megohttp/redirect.hpp>
 #include <megohttp/cookie.hpp>
 #include <megohttp/request.hpp>
@@ -245,6 +249,13 @@ namespace megohttp {
 
         // Convenience: synchronous GET.
         Result<Response> get_sync(string_view url);
+
+#if MEGOHTTP_HAS_COROUTINES
+        // Eager coroutine: the request starts immediately on construction.
+        // Cancel before await cancels the in-flight request.
+        Task<Result<Response>> request_co(const Request& request);
+        Task<Result<Response>> get_co(string_view url);
+#endif
 
 #if MEGOHTTP_HAS_SSE
         // SSE session (S6.1). Creates a long-lived event stream with automatic

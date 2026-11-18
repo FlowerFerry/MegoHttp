@@ -36,9 +36,9 @@ namespace megohttp {
         std::function<void(string host, string path,
                            std::function<void(Result<std::shared_ptr<AsyncByteStream>>)> on_stream)>;
 
-    // -------------------------------------------------------------------------
+    // -----------------------------------------------------------------------
     // ReconnectingWebSocket: a logical session over physical connections.
-    // -------------------------------------------------------------------------
+    // -----------------------------------------------------------------------
     class ReconnectingWebSocket
         : public std::enable_shared_from_this<ReconnectingWebSocket> {
     public:
@@ -59,10 +59,25 @@ namespace megohttp {
             std::function<void(const Error& reason, size_t attempts, bool final)> on_gave_up;
         };
 
+        // For test injection: the clock the reconnect logic reads, and the
+        // scheduler it arms a retry on. Task book 13.7 forbids proving backoff
+        // and race behaviour "only with fixed sleeps", so a test needs to drive
+        // time itself instead of waiting for it.
+        //
+        // Both members default to the real thing; an empty function means
+        // "use the real one".
+        struct TestHooks {
+            std::function<TimePoint()> now;
+            // Receives the delay and the retry body; a test can run the body
+            // immediately (fully deterministic) or record the delay.
+            std::function<void(Duration delay, std::function<void()> fn)> schedule_after;
+        };
+
         ReconnectingWebSocket(std::shared_ptr<Executor> executor,
                               WsStreamProvider provider,
                               WebSocketOptions ws_options,
-                              WebSocketReconnectPolicy policy);
+                              WebSocketReconnectPolicy policy,
+                              TestHooks test_hooks = {});
         ~ReconnectingWebSocket();
 
         void on_open(OpenCallback cb);
@@ -105,6 +120,19 @@ namespace megohttp {
         WsStreamProvider provider_;
         WebSocketOptions ws_options_;
         WebSocketReconnectPolicy policy_;
+        TestHooks hooks_;
+
+        // Real time unless a test replaced it.
+        TimePoint now() const {
+            return hooks_.now ? hooks_.now() : Clock::now();
+        }
+        void schedule_after(Duration d, std::function<void()> fn) {
+            if (hooks_.schedule_after) {
+                hooks_.schedule_after(d, std::move(fn));
+                return;
+            }
+            if (executor_) executor_->schedule_after(d, std::move(fn));
+        }
 
         string host_;
         string path_;

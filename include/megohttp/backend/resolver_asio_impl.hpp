@@ -49,8 +49,12 @@ namespace detail {
                 const ErrorCode code =
                     (ec == asio::error::host_not_found) ? ErrorCode::DnsNameNotFound
                                                        : ErrorCode::DnsResolveFailed;
+                // Qualified: an unqualified `format` with a std::string argument
+                // reaches std::format via ADL under C++20, which returns
+                // std::string and cannot become a memepp::string.
                 cb_copy(Error{code, ErrorPhase::Resolve,
-                              format("async_resolve failed: {}", ec.message())});
+                              megohttp::format("async_resolve failed: {}",
+                                               ec.message())});
                 return;
             }
 

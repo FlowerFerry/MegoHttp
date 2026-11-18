@@ -214,10 +214,167 @@ TEST_CASE("reconnecting ws: a retired connection's late error is ignored",
     // Late error from the retired connection: the generation check must drop it,
     // so the provider is NOT called again for it. Without that check this starts
     // a second reconnect schedule racing the live one.
-    exec->post([first]() { first->fail_read(ErrorCode::ConnectionReset); });
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    //
+    // The assertion is made after the late error has been processed on the loop
+    // (post + wait), not after an arbitrary sleep: the loop drains in order, so
+    // once this posted task has run, the earlier fail_read has already been
+    // handled and any reconnect it caused would already be pending.
+    std::atomic<bool> drained{false};
+    exec->post([first, &drained]() {
+        first->fail_read(ErrorCode::ConnectionReset);
+    });
+    exec->post([&drained]() { drained.store(true); });
+    REQUIRE(wait_until([&] { return drained.load(); }, 2000));
 
     CHECK(provider_calls.load() <= after_two + 1);   // at most the one live retry
+
+    ws->terminate();
+#if MGHTTP_BACKEND_LIBUV
+    std::dynamic_pointer_cast<libuv_backend::UvExecutor>(exec)->shutdown();
+#else
+    std::dynamic_pointer_cast<asio_backend::AsioExecutor>(exec)->shutdown();
+#endif
+}
+
+TEST_CASE("reconnecting ws: backoff is driven by an injected clock, not by sleeping",
+          "[websocket][reconnect][clock]") {
+    // Task book 13.7: backoff and race behaviour must not be proven "only with
+    // fixed sleeps". The policy arithmetic is already covered by pure-function
+    // tests (test_reconnect.cpp); what this covers is that the SESSION actually
+    // asks for those delays, with a virtual clock and a scheduler that runs the
+    // retry body immediately.
+    auto exec = make_executor();
+    REQUIRE(exec);
+
+    // Virtual time: starts at 0 and only moves when the test says so.
+    auto vclock = std::make_shared<TimePoint>(TimePoint{});
+    std::vector<Duration> delays;
+    std::atomic<int> provider_calls{0};
+
+    WebSocketReconnectPolicy policy;
+    policy.enabled = true;
+    policy.backoff.initial_delay = std::chrono::milliseconds(100);
+    policy.backoff.max_delay = std::chrono::milliseconds(400);
+    policy.backoff.multiplier = 2.0;
+    policy.backoff.jitter_ratio = 0.0;      // deterministic
+    policy.backoff.max_attempts = 4;
+    policy.minimum_stable_connection_duration = std::chrono::hours(1);
+
+    WsStreamProvider provider = [&](string, string,
+                                    std::function<void(Result<std::shared_ptr<AsyncByteStream>>)> done) {
+        ++provider_calls;
+        // Always fail: the session should keep backing off until the budget ends.
+        exec->post([done]() {
+            done(Error{ErrorCode::ConnectionReset, ErrorPhase::TcpConnect,
+                       string("injected failure")});
+        });
+    };
+
+    ReconnectingWebSocket::TestHooks hooks;
+    hooks.now = [vclock]() { return *vclock; };
+    // Record the requested delay and run the retry body on the loop right away,
+    // advancing virtual time by that delay so the duration budget sees it.
+    hooks.schedule_after = [vclock, &delays, exec](Duration d, std::function<void()> fn) {
+        delays.push_back(d);
+        *vclock += d;
+        exec->post([fn]() { fn(); });
+    };
+
+    std::atomic<bool> ended{false};
+    auto ws = std::make_shared<ReconnectingWebSocket>(
+        exec, provider, WebSocketOptions{}, policy, hooks);
+    ws->on_session_end([&](const Error*) { ended.store(true); });
+    ws->start(string("host"), string("/ws"), Headers{});
+
+    // No sleeping: the injected scheduler runs every retry immediately, so the
+    // whole budget completes in a handful of loop turns.
+    REQUIRE(wait_until([&] { return ended.load(); }, 5000));
+
+    // 100, 200, 400, 400 (capped) -- proven from the recorded durations rather
+    // than from wall-clock timing.
+    REQUIRE(delays.size() == 4);
+    CHECK(delays[0] == std::chrono::milliseconds(100));
+    CHECK(delays[1] == std::chrono::milliseconds(200));
+    CHECK(delays[2] == std::chrono::milliseconds(400));
+    CHECK(delays[3] == std::chrono::milliseconds(400));
+    CHECK(provider_calls.load() == 5);   // initial attempt + 4 retries
+
+    ws->terminate();
+#if MGHTTP_BACKEND_LIBUV
+    std::dynamic_pointer_cast<libuv_backend::UvExecutor>(exec)->shutdown();
+#else
+    std::dynamic_pointer_cast<asio_backend::AsioExecutor>(exec)->shutdown();
+#endif
+}
+
+TEST_CASE("reconnecting ws: a stable connection decays the budget on virtual time",
+          "[websocket][reconnect][clock]") {
+    // The decay rule is the one that stops a flapping server from retrying
+    // forever. Driving it on a virtual clock is what makes "stayed up long
+    // enough" testable without waiting 30 seconds.
+    auto exec = make_executor();
+    REQUIRE(exec);
+
+    auto vclock = std::make_shared<TimePoint>(TimePoint{});
+    std::atomic<int> provider_calls{0};
+    std::atomic<int> failures_seen{0};
+
+    WebSocketReconnectPolicy policy;
+    policy.enabled = true;
+    policy.backoff.initial_delay = std::chrono::milliseconds(10);
+    policy.backoff.max_delay = std::chrono::milliseconds(10);
+    policy.backoff.jitter_ratio = 0.0;
+    policy.minimum_stable_connection_duration = std::chrono::milliseconds(500);
+    policy.stable_connection_success_decay = 0;   // 0 = clear all
+
+    std::vector<std::shared_ptr<FakeStream>> streams;
+    std::mutex mu;
+    WsStreamProvider provider = [&](string, string,
+                                    std::function<void(Result<std::shared_ptr<AsyncByteStream>>)> done) {
+        ++provider_calls;
+        auto s = std::make_shared<FakeStream>();
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            streams.push_back(s);
+        }
+        exec->post([s, done]() { done(Result<std::shared_ptr<AsyncByteStream>>(
+                                      std::static_pointer_cast<AsyncByteStream>(s))); });
+    };
+
+    ReconnectingWebSocket::TestHooks hooks;
+    hooks.now = [vclock]() { return *vclock; };
+    hooks.schedule_after = [vclock, exec](Duration d, std::function<void()> fn) {
+        *vclock += d;
+        exec->post([fn]() { fn(); });
+    };
+
+    auto ws = std::make_shared<ReconnectingWebSocket>(
+        exec, provider, WebSocketOptions{}, policy, hooks);
+    ws->set_reconnect_events({nullptr,
+        [&](size_t, const Error&) { failures_seen.fetch_add(1); }, nullptr, nullptr});
+    ws->start(string("host"), string("/ws"), Headers{});
+
+    // First connection comes up.
+    REQUIRE(wait_until([&] { return provider_calls.load() >= 1; }));
+    for (int i = 0; i < 200 && ws->reconnect_attempts() != 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    // Let virtual time pass beyond the stability threshold, then drop it: the
+    // failure counter must decay rather than carry over.
+    *vclock += std::chrono::milliseconds(1000);
+    std::shared_ptr<FakeStream> first;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        REQUIRE(!streams.empty());
+        first = streams[0];
+    }
+    exec->post([first]() { first->fail_read(); });
+
+    // It reconnects, and because the failure counter was cleared the attempt
+    // count restarts from 1 rather than continuing to climb.
+    REQUIRE(wait_until([&] { return provider_calls.load() >= 2; }));
+    CHECK(ws->reconnect_attempts() <= 1);
 
     ws->terminate();
 #if MGHTTP_BACKEND_LIBUV

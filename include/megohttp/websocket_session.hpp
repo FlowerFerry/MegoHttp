@@ -167,9 +167,16 @@ namespace megohttp {
         // permessage-deflate state for THIS connection. Recreated per handshake
         // because the zlib contexts are bound to the negotiated parameters and
         // RFC 7692 7.1.3 forbids carrying them across connections.
+        //
+        // deflate_negotiated_ stays unconditional: negotiated_deflate() returns
+        // it to callers and the "extension not accepted" result is meaningful in
+        // every build. The two context objects exist only when the feature is
+        // compiled in, which is exactly when their types exist.
         DeflateNegotiated deflate_negotiated_{};
+#if MEGOHTTP_HAS_WEBSOCKET_DEFLATE
         std::unique_ptr<DeflateCompressor> deflate_out_;
         std::unique_ptr<DeflateDecompressor> deflate_in_;
+#endif
 
         std::unique_ptr<WsFrameDecoder::Callbacks> decoder_cbs_;
         std::unique_ptr<WsFrameDecoder> decoder_;

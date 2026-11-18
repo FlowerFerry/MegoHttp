@@ -65,13 +65,17 @@ namespace megohttp {
         // A deflate offer the build cannot honour must fail before the handshake
         // goes out: proposing an extension and then being unable to decode the
         // reply corrupts the connection after it looked healthy.
-        if (opts_.enable_deflate && !MEGOHTTP_HAS_ZLIB) {
+        //
+        // The gate is MEGOHTTP_HAS_WEBSOCKET_DEFLATE, not MEGOHTTP_HAS_ZLIB: the
+        // latter only says zlib exists (HTTP gzip needs it too), while the former
+        // says WS deflate is actually compiled into this build.
+        if (opts_.enable_deflate && !MEGOHTTP_HAS_WEBSOCKET_DEFLATE) {
             auto cb = std::move(open_cb_);
             open_cb_ = nullptr;
             state_.store(WebSocketState::Closed);
             if (cb) {
                 cb(Error{ErrorCode::WsCompressionNotCompiled, ErrorPhase::TargetProtocol,
-                         string("permessage-deflate requested but zlib is not available")});
+                         string("permessage-deflate requested but the build does not include it")});
             }
             return;
         }
@@ -360,6 +364,7 @@ namespace megohttp {
         //   not returned at all -> continue UNCOMPRESSED (legal)
         //   accepted but unusable -> handshake failure
         deflate_negotiated_ = DeflateNegotiated{};
+#if MEGOHTTP_HAS_WEBSOCKET_DEFLATE
         deflate_out_.reset();
         deflate_in_.reset();
         if (opts_.enable_deflate) {
@@ -389,6 +394,11 @@ namespace megohttp {
                 deflate_in_ = std::make_unique<DeflateDecompressor>(deflate_negotiated_);
             }
         }
+#else
+        // enable_deflate was rejected in start(); this branch is unreachable but
+        // keeps the surrounding logic single-sourced.
+        if (opts_.enable_deflate) { finish_handshake_failure(); return true; }
+#endif
 
         // --- success ---
         handshake_done_ = true;
@@ -451,16 +461,24 @@ namespace megohttp {
         std::vector<uint8_t> payload(text.begin(), text.end());
         // Empty text is not compressible and RFC 7692 gives no benefit: send it
         // uncompressed so the peer sees a plain empty frame.
+#if MEGOHTTP_HAS_WEBSOCKET_DEFLATE
         const bool compress = deflate_out_ && deflate_negotiated_.enabled && !payload.empty();
         if (compress) payload = deflate_out_->compress(payload);
+#else
+        const bool compress = false;
+#endif
         send_frame(WsOpcode::Text, payload, true, compress, std::move(on_complete));
     }
 
     inline void WebSocketSession::send_binary(const std::vector<uint8_t>& data,
                                               std::function<void(const Error&)> on_complete) {
         std::vector<uint8_t> payload = data;
+#if MEGOHTTP_HAS_WEBSOCKET_DEFLATE
         const bool compress = deflate_out_ && deflate_negotiated_.enabled && !payload.empty();
         if (compress) payload = deflate_out_->compress(payload);
+#else
+        const bool compress = false;
+#endif
         send_frame(WsOpcode::Binary, payload, true, compress, std::move(on_complete));
     }
 
@@ -604,6 +622,15 @@ namespace megohttp {
         // a bad or oversized message is rejected while it is still being
         // produced rather than after the whole thing has been materialised
         // (task book 12.1A).
+#if !MEGOHTTP_HAS_WEBSOCKET_DEFLATE
+        // A peer can only send RSV1 if we offered the extension, and start()
+        // refuses enable_deflate when the build lacks it. Reaching here means
+        // the peer violated the protocol (or a build/config mismatch).
+        const Error e{ErrorCode::WsCompressionNotCompiled, ErrorPhase::TargetProtocol,
+                      string("compressed frame received but permessage-deflate is not compiled in")};
+        report_error(e);
+        return e;
+#else
         if (!deflate_in_ || !deflate_negotiated_.enabled) {
             const Error e{ErrorCode::WsProtocolError, ErrorPhase::TargetProtocol,
                           string("RSV1 set but permessage-deflate was not negotiated")};
@@ -660,6 +687,7 @@ namespace megohttp {
 
         if (message_cb_) message_cb_(type, plain);
         return VoidResult{};
+#endif // MEGOHTTP_HAS_WEBSOCKET_DEFLATE
     }
 
     inline VoidResult WebSocketSession::handle_control_frame(const WsFrame& frame) {

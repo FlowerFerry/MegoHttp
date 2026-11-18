@@ -134,7 +134,7 @@ namespace megohttp {
         if (ec) {
             self->open_ = false;
             cb(VoidResult{Error{ErrorCode::ConnectFailed, ErrorPhase::TcpConnect,
-                                format("connect failed: {}", ec.message())}});
+                                megohttp::format("connect failed: {}", ec.message())}});
             return;
         }
         self->open_ = true;
@@ -191,7 +191,7 @@ namespace megohttp {
                 self->open_ = false;
                 if (cb) {
                     cb(Error{ErrorCode::ConnectionReset, ErrorPhase::Receive,
-                             format("read error: {}", ec.message())});
+                             megohttp::format("read error: {}", ec.message())});
                 }
             }
             return;
@@ -241,7 +241,7 @@ namespace megohttp {
             self->open_ = false;
             if (pw->cb) {
                 pw->cb(Error{ErrorCode::ConnectionReset, ErrorPhase::Send,
-                             format("write error: {}", ec.message())});
+                             megohttp::format("write error: {}", ec.message())});
             }
             return;
         }

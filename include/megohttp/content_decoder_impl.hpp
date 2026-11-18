@@ -7,7 +7,13 @@
 
 #include <megohttp/string_adapter.hpp>
 
+// gzip / deflate need zlib; "br" needs Brotli. When NEITHER is available the
+// chain cannot decode anything, so this implementation is not compiled at all
+// and content_decoder.hpp skips including it. That keeps a build with both
+// features off free of the zlib/brotli headers (task book 3.21).
+#if MEGOHTTP_HAS_ZLIB
 #include <zlib.h>
+#endif
 
 #if MGHTTP_HAS_FEATURE_BROTLI
 #include <brotli/decode.h>
@@ -28,6 +34,7 @@ namespace megohttp {
 
     // --- Gzip decoder (zlib, wbits=31) -----------------------------------
 
+#if MEGOHTTP_HAS_ZLIB
     class GzipDecoder final : public ContentDecoder {
     public:
         explicit GzipDecoder(ContentDecoderChain::OutputCallback on_output)
@@ -105,6 +112,7 @@ namespace megohttp {
         z_stream stream_{};
         bool finished_{false};
     };
+#endif // MEGOHTTP_HAS_ZLIB
 
     // --- Brotli decoder --------------------------------------------------
 
@@ -181,6 +189,7 @@ namespace megohttp {
 
     // --- Deflate decoder (zlib wrapper, wbits=15) ------------------------
 
+#if MEGOHTTP_HAS_ZLIB
     class DeflateDecoderImpl final : public ContentDecoder {
     public:
         explicit DeflateDecoderImpl(ContentDecoderChain::OutputCallback on_output)
@@ -242,6 +251,7 @@ namespace megohttp {
         z_stream stream_{};
         bool finished_{false};
     };
+#endif // MEGOHTTP_HAS_ZLIB
 
     // --- Stub factories (the real wiring is in the chain factory below) ---
 
@@ -392,7 +402,7 @@ namespace megohttp {
             std::shared_ptr<ContentDecoder> decoder;
 
             if (enc == "gzip") {
-#if MEGOHTTP_HAS_GZIP
+#if MEGOHTTP_HAS_ZLIB
                 decoder = std::make_shared<GzipDecoder>(current_cb);
 #else
                 *err_slot = Error{ErrorCode::ContentEncodingUnsupported, ErrorPhase::Receive,
@@ -408,7 +418,7 @@ namespace megohttp {
                 return nullptr;
 #endif
             } else if (enc == "deflate") {
-#if MEGOHTTP_HAS_GZIP
+#if MEGOHTTP_HAS_ZLIB
                 decoder = std::make_shared<DeflateDecoderImpl>(current_cb);
 #else
                 *err_slot = Error{ErrorCode::ContentEncodingUnsupported, ErrorPhase::Receive,
