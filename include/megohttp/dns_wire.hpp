@@ -48,12 +48,12 @@ namespace megohttp {
             CNAME = 5,
             SOA   = 6,
             AAAA  = 28,
-            OPT   = 41,
+            Opt   = 41,
             Raw   = 0xFFFF,   // not a wire value: internal marker
         };
 
         enum class RecordClass : uint16_t {
-            IN  = 1,
+            In  = 1,
             Any = 255,
         };
 
@@ -75,7 +75,7 @@ namespace megohttp {
             string name;                    // owner name, lowercased, no trailing dot
             RecordType type{RecordType::Raw};
             uint16_t raw_type{0};           // wire value, always set
-            RecordClass klass{RecordClass::IN};
+            RecordClass klass{RecordClass::In};
             uint32_t ttl{0};
             byte_buffer data;               // A: 4 bytes, AAAA: 16, CNAME: decoded name
             string cname_target;            // filled only for type == CNAME
@@ -117,7 +117,7 @@ namespace megohttp {
         // client can match responses to the query that produced them.
         Result<byte_buffer> build_query(uint16_t id, string_view name,
                                         RecordType type,
-                                        RecordClass klass = RecordClass::IN);
+                                        RecordClass klass = RecordClass::In);
 
         // -------------------------------------------------------------------
         // Parsing a response

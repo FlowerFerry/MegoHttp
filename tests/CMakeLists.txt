@@ -47,6 +47,12 @@ set(MGHTTP_TEST_SOURCES
     test_dns_wire.cpp
 )
 
+# DoT tests: the resolver builds its own TLS/TCP connection and frames DNS
+# queries over it, so it needs the full DoT implementation available.
+if(MGHTTP_ENABLE_DOT AND NOT MGHTTP_TLS_NONE)
+    list(APPEND MGHTTP_TEST_SOURCES test_resolver_dot.cpp)
+endif()
+
 # Coroutine tests need C++20 and a toolchain with <coroutine>.
 if(MGHTTP_ENABLE_COROUTINES)
     list(APPEND MGHTTP_TEST_SOURCES test_task.cpp)

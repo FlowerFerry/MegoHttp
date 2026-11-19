@@ -331,9 +331,9 @@ namespace dns {
                     return Error{ErrorCode::DnsInvalidMessage, ErrorPhase::Resolve,
                                  string("DNS record header is truncated")};
                 }
-                rec.klass = (raw_class == 1) ? RecordClass::IN
+                rec.klass = (raw_class == 1) ? RecordClass::In
                                              : (raw_class == 255 ? RecordClass::Any
-                                                                 : RecordClass::IN);
+                                                                 : RecordClass::In);
                 uint16_t rdlen = 0;
                 if (!r.u16(rdlen)) {
                     if (m.truncated) return VoidResult{};
@@ -352,7 +352,7 @@ namespace dns {
                     case 5:  rec.type = RecordType::CNAME; break;
                     case 6:  rec.type = RecordType::SOA; break;
                     case 28: rec.type = RecordType::AAAA; break;
-                    case 41: rec.type = RecordType::OPT; break;
+                    case 41: rec.type = RecordType::Opt; break;
                     default: rec.type = RecordType::Raw; break;
                 }
 
