@@ -71,12 +71,19 @@ namespace megohttp {
         string tls_client_cert_token;
         bool tls_verify_peer{true};
 
+        // The PROXY layer's TLS trust material, separate from the target's
+        // (task book 9.3 forbids one object driving both identities). Only
+        // meaningful for an HTTPS proxy; empty for every other proxy type and
+        // for a direct connection.
+        string proxy_tls_token;
+
         bool operator==(const PoolKey& o) const noexcept {
             return port == o.port && proxy_port == o.proxy_port &&
                    tls_verify_peer == o.tls_verify_peer &&
                    scheme == o.scheme && host == o.host &&
                    proxy_type == o.proxy_type && proxy_host == o.proxy_host &&
                    proxy_auth_token == o.proxy_auth_token &&
+                   proxy_tls_token == o.proxy_tls_token &&
                    tls_ca_token == o.tls_ca_token &&
                    tls_client_cert_token == o.tls_client_cert_token;
         }

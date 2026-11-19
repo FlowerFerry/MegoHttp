@@ -46,6 +46,7 @@ namespace megohttp {
         mix(std::hash<std::string>{}(std::string(k.proxy_host.data(), k.proxy_host.size())));
         mix(k.proxy_port);
         mix(std::hash<std::string>{}(std::string(k.proxy_auth_token.data(), k.proxy_auth_token.size())));
+        mix(std::hash<std::string>{}(std::string(k.proxy_tls_token.data(), k.proxy_tls_token.size())));
         mix(std::hash<std::string>{}(std::string(k.tls_ca_token.data(), k.tls_ca_token.size())));
         mix(std::hash<std::string>{}(std::string(k.tls_client_cert_token.data(), k.tls_client_cert_token.size())));
         mix(k.tls_verify_peer ? 1u : 0u);

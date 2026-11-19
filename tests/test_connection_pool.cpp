@@ -406,6 +406,36 @@ TEST_CASE("pool key distinguishes http vs https", "[connection_pool]") {
     CHECK(k1.describe() != k2.describe());
 }
 
+TEST_CASE("pool key distinguishes different proxy TLS tokens", "[connection_pool][s51-05]") {
+    PoolKey k1 = key_for("example.com", 443);
+    k1.scheme = string("https");
+    k1.proxy_type = string("https");
+    k1.proxy_host = string("proxy.example.com");
+    k1.proxy_port = 3128;
+    k1.proxy_tls_token = string("ca=good");
+    k1.tls_ca_token = string("ca=target");
+
+    PoolKey k2 = k1;
+    k2.proxy_tls_token = string("ca=bad");
+
+    CHECK(k1 != k2);
+    CHECK(k1.proxy_tls_token != k2.proxy_tls_token);
+}
+
+TEST_CASE("proxy identity fields are distinct in the key", "[connection_pool][s51-05]") {
+    PoolKey k1 = key_for("example.com", 443);
+    k1.scheme = string("https");
+    k1.proxy_type = string("https");
+    k1.proxy_host = string("proxy.example.com");
+    k1.proxy_port = 3128;
+    k1.proxy_auth_token = string("u:alice|p:secret1");
+
+    PoolKey k2 = k1;
+    k2.proxy_auth_token = string("u:alice|p:secret2");
+
+    CHECK(k1 != k2);
+}
+
 // ---- fail_waiters -----------------------------------------------------------
 
 TEST_CASE("fail_waiters retires every queued request", "[connection_pool]") {

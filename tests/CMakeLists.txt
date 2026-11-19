@@ -44,6 +44,7 @@ set(MGHTTP_TEST_SOURCES
     test_client_retry.cpp
     test_cookie.cpp
     test_reconnect.cpp
+    test_dns_wire.cpp
 )
 
 # Coroutine tests need C++20 and a toolchain with <coroutine>.

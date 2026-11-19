@@ -20,6 +20,19 @@ import time
 BODY = b"hello over https"
 
 
+def multipart_body(boundary: bytes, parts):
+    """Assemble a multipart body from (headers_bytes, payload) pairs."""
+    out = b""
+    for i, (hdrs, payload) in enumerate(parts):
+        out += b"--" + boundary + b"\r\n"
+        out += hdrs
+        out += b"\r\n\r\n"          # blank line: end of the part's header block
+        out += payload
+        out += b"\r\n"
+    out += b"--" + boundary + b"--\r\n"
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cert")
@@ -30,7 +43,30 @@ def main():
         default=0.0,
         help="seconds to sleep before starting the TLS handshake",
     )
+    ap.add_argument(
+        "--multipart",
+        action="store_true",
+        help="answer with a multipart/mixed body instead of plain text",
+    )
+    ap.add_argument(
+        "--multipart-truncated",
+        action="store_true",
+        help="send a multipart body that stops after one part (no closing boundary)",
+    )
     args = ap.parse_args()
+
+    boundary = b"megohttp-boundary-42"
+    mp_text = multipart_body(boundary, [
+        (b'Content-Type: text/plain\r\nContent-Disposition: form-data; name="a"',
+         b"part-one"),
+        (b'Content-Type: application/octet-stream\r\nContent-Disposition: form-data; name="b"',
+         b"part-two"),
+    ])
+    if args.multipart_truncated:
+        # One part, then stop: the closing delimiter never arrives.
+        mp_text = (b"--" + boundary + b"\r\n"
+                   b'Content-Type: text/plain\r\nContent-Disposition: form-data; name="a"'
+                   b"\r\n\r\npart-one\r\n")
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -53,12 +89,20 @@ def main():
                 if not chunk:
                     return
                 buf += chunk
+
+            if args.multipart or args.multipart_truncated:
+                ctype = b'multipart/mixed; boundary="' + boundary + b'"'
+                body = mp_text
+            else:
+                ctype = b"text/plain"
+                body = BODY
+
             resp = (
                 b"HTTP/1.1 200 OK\r\n"
-                b"Content-Type: text/plain\r\n"
-                b"Content-Length: " + str(len(BODY)).encode() + b"\r\n"
-                b"Connection: close\r\n"
-                b"\r\n" + BODY
+                b"Content-Type: " + ctype + b"\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                b"Connection: keep-alive\r\n"
+                b"\r\n" + body
             )
             conn.sendall(resp)
         except Exception:

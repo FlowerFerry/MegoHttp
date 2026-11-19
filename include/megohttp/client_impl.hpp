@@ -2097,7 +2097,6 @@ namespace megohttp {
                     st->pool_key.tls_ca_token = tok.release();
                 }
             }
-
             // Proxy routing (S5.4). Resolved once per hop, before the head is
             // built, because the target form (absolute vs origin) and the set of
             // headers depend on the decision.
@@ -2108,6 +2107,54 @@ namespace megohttp {
                     to_view(url.host), url.port, url.is_secure());
                 if (!decision) { st->finish(decision.error()); return; }
                 st->proxy = decision.value().config;
+
+                // Pool key: the PROXY is part of the security boundary. Two
+                // connections to the same origin through different proxies are
+                // not interchangeable -- neither is one through a proxy with
+                // different credentials, nor an HTTPS proxy with different trust
+                // material. Leaving these empty keyed every proxied request as if
+                // it were direct, so the pool could hand a tunnel built for one
+                // proxy (or one target) to a request heading somewhere else.
+                //
+                // Filled here rather than at the top of begin() because the
+                // proxy decision is what makes them knowable.
+                if (st->pool) {
+                    switch (st->proxy.type) {
+                    case ProxyType::Http:   st->pool_key.proxy_type = string("http"); break;
+                    case ProxyType::Https:  st->pool_key.proxy_type = string("https"); break;
+                    case ProxyType::Socks5: st->pool_key.proxy_type = string("socks5"); break;
+                    case ProxyType::None:   st->pool_key.proxy_type = string{}; break;
+                    }
+                    if (st->proxy.is_set()) {
+                        st->pool_key.proxy_host = st->proxy.host;
+                        st->pool_key.proxy_port = st->proxy.port;
+                        // Credentials as a DIGEST, never the password itself: the
+                        // key is compared, hashed and (in tests) printed. Two
+                        // different passwords must still produce two different
+                        // tokens, and two identical ones must match -- a plain
+                        // hash gives both properties without keeping the secret
+                        // around in a long-lived object.
+                        if (st->proxy.has_credentials()) {
+                            std::size_t h = 1469598103934665603ull;
+                            auto mix = [&h](string_view v) {
+                                for (size_t i = 0; i < v.size(); ++i) {
+                                    h ^= static_cast<unsigned char>(v.data()[i]);
+                                    h *= 1099511628211ull;
+                                }
+                            };
+                            mix(to_view(st->proxy.username));
+                            mix(string_view("\x1f", 1));   // separator, not in a credential
+                            mix(to_view(st->proxy.password));
+                            st->pool_key.proxy_auth_token = format("{}", h);
+                        } else {
+                            st->pool_key.proxy_auth_token = string{};
+                        }
+                    } else {
+                        st->pool_key.proxy_host = string{};
+                        st->pool_key.proxy_port = 0;
+                        st->pool_key.proxy_auth_token = string{};
+                    }
+                }
 
 #if MGHTTP_TLS_NONE
                 if (proxy_detail::uses_proxy_tls(st->proxy.type)) {
@@ -2130,6 +2177,28 @@ namespace megohttp {
                     // host, exactly like an origin behind a load balancer.
                     if (st->proxy_tls_config.hostname.empty()) {
                         st->proxy_tls_config.hostname = st->proxy.host;
+                    }
+
+                    // The PROXY layer's trust material is a separate isolation
+                    // dimension from the target's (S5.1-05 / task book 9.3). Two
+                    // tunnels through the same proxy endpoint but validated
+                    // against different CAs, or with different client certs, must
+                    // never share a connection: the second would inherit an
+                    // identity check it never agreed to.
+                    if (st->pool) {
+                        string_builder ptok;
+                        detail::sb_append(ptok, st->proxy_tls_config.ca_file);
+                        detail::sb_append(ptok, "|");
+                        detail::sb_append(ptok, st->proxy_tls_config.ca_path);
+                        detail::sb_append(ptok, "|");
+                        detail::sb_append(ptok, st->proxy_tls_config.cert_file);
+                        detail::sb_append(ptok, "|");
+                        detail::sb_append(ptok, st->proxy_tls_config.key_file);
+                        detail::sb_append(ptok, "|");
+                        detail::sb_append(ptok, st->proxy_tls_config.verify_peer ? "1" : "0");
+                        detail::sb_append(ptok, "|");
+                        detail::sb_append(ptok, st->proxy_tls_config.verify_host ? "1" : "0");
+                        st->pool_key.proxy_tls_token = ptok.release();
                     }
                 }
             }

@@ -560,3 +560,49 @@ TEST_CASE("multipart flow receives pause() when sink returns false",
     CHECK(psink->complete_count == 1);
     CHECK(!psink->error_fired);
 }
+
+// Diagnostic: the exact body the HTTPS-proxy test serves, over a plain socket.
+// If this passes, the multipart parser handles the payload and any failure in
+// the proxy test is about the transport, not the parser.
+TEST_CASE("the same multipart payload parses over a plain connection",
+          "[s57][multipart][diagnostic]") {
+    const std::string body =
+        "--megohttp-boundary-42\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Disposition: form-data; name=\"a\"\r\n"
+        "\r\n"
+        "part-one\r\n"
+        "--megohttp-boundary-42\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "Content-Disposition: form-data; name=\"b\"\r\n"
+        "\r\n"
+        "part-two\r\n"
+        "--megohttp-boundary-42--\r\n";
+
+    MultipartServer srv;
+    REQUIRE(srv.start("multipart/mixed; boundary=\"megohttp-boundary-42\"", body));
+
+    struct Rec : MultipartSink {
+        int begun{0}, ended{0}, done{0};
+        std::vector<std::string> payloads;
+        void on_part_begin(const MultipartPartHead&) override { ++begun; payloads.push_back({}); }
+        bool on_part_data(const uint8_t* d, size_t n) override {
+            payloads.back().append(reinterpret_cast<const char*>(d), n);
+            return true;
+        }
+        void on_part_end() override { ++ended; }
+        void on_complete() override { ++done; }
+        void on_error(const Error&) override {}
+    };
+    auto sink = std::make_shared<Rec>();
+
+    Client c;
+    std::string url = "http://127.0.0.1:" + std::to_string(srv.port()) + "/";
+    Request req(Method::Get, string(url.c_str()));
+    req.set_multipart_sink(sink);
+
+    auto r = c.request_sync(req);
+    UNSCOPED_INFO("begun=" << sink->begun << " ended=" << sink->ended << " done=" << sink->done);
+    REQUIRE(r);
+    CHECK(sink->begun == 2);
+}

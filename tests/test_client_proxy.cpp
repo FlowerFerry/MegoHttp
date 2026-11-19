@@ -579,10 +579,11 @@ std::string fixture(const char* name) {
 // OriginServer above speaks cleartext, so a CONNECT-tunnel test needs this one.
 class HttpsOriginServer {
 public:
-    bool start(const char* cert, const char* key) {
+    bool start(const char* cert, const char* key, const char* extra_args = nullptr) {
         std::string cmd = "python \"";
         cmd += MEGOHTTP_TESTS_DIR;
         cmd += "/https_test_server.py\" \"" + fixture(cert) + "\" \"" + fixture(key) + "\"";
+        if (extra_args) { cmd += " "; cmd += extra_args; }
         return spawn_and_read_banner(cmd);
     }
 
@@ -855,6 +856,165 @@ TEST_CASE("layered TLS: HTTPS proxy and HTTPS target use independent trust",
     const std::string rec = proxy.recording();
     CHECK(rec.find("\"kind\": \"connect\"") != std::string::npos);
     CHECK(rec.find("\"tls\": true") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// S3.4-19 / S5.6-05: multipart over an HTTPS proxy CONNECT tunnel.
+//
+// Layer order under test: TLS to the proxy -> CONNECT -> TLS to the target ->
+// HTTP framing -> multipart parsing. Neither individual half is new (the tiered
+// TLS path is covered above, multipart over plain HTTP in test_multipart_client),
+// but the COMBINATION is what S3.4-19 asks for and it exercises a real risk: the
+// multipart parser sits at the very top of the stack, reading bytes that travelled
+// through two TLS layers.
+// ---------------------------------------------------------------------------
+TEST_CASE("multipart response arrives intact through an HTTPS proxy CONNECT tunnel",
+          "[proxy][client][https_proxy][multipart][s34-19][s56-05]") {
+    HttpsOriginServer origin;
+    REQUIRE(origin.start("server-cert.pem", "server-key.pem", "--multipart"));
+
+    ProxyServer proxy;
+    REQUIRE(proxy.start("connect", std::string("--tls-cert \"") + fixture("server-cert.pem") +
+                                       "\" --tls-key \"" + fixture("server-key.pem") + "\""));
+
+    ClientOptions o;
+    o.proxy.proxy.type = ProxyType::Https;
+    o.proxy.proxy.host = string("127.0.0.1");
+    o.proxy.proxy.port = proxy.port();
+    o.proxy.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.proxy.tls.hostname = string("localhost");
+    o.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.tls.hostname = string("localhost");
+
+    struct Recorder : MultipartSink {
+        int parts_begun{0};
+        int parts_ended{0};
+        int completions{0};
+        bool error_fired{false};
+        Error last_error{};
+        std::vector<std::string> payloads;
+        void on_part_begin(const MultipartPartHead&) override { ++parts_begun; payloads.push_back({}); }
+        bool on_part_data(const uint8_t* d, size_t n) override {
+            payloads.back().append(reinterpret_cast<const char*>(d), n);
+            return true;
+        }
+        void on_part_end() override { ++parts_ended; }
+        void on_complete() override { ++completions; }
+        void on_error(const Error& e) override { error_fired = true; last_error = e; }
+    };
+
+    auto sink = std::make_shared<Recorder>();
+
+    Client c(o);
+    Request req(Method::Get, to_owning(tunnel_url(origin.port(), "/via-layered-tls")));
+    MultipartResponseOptions mopts;
+    mopts.boundary = string("megohttp-boundary-42");   // explicit, bypass Content-Type parsing
+    req.set_multipart_sink(sink, mopts);
+
+    auto r = c.request_sync(req);
+    UNSCOPED_INFO("parts_begun=" << sink->parts_begun
+                 << " parts_ended=" << sink->parts_ended
+                 << " completions=" << sink->completions
+                 << " error=" << sink->error_fired);
+    if (sink->error_fired) {
+        UNSCOPED_INFO("sink error code=" << megohttp::to_string(sink->last_error.code())
+                     << " msg-len=" << sink->last_error.message().size());
+    }
+    if (!r) {
+        UNSCOPED_INFO("request failed: " << megohttp::to_string(r.error().code())
+                     << " (" << static_cast<int>(r.error().code()) << ")");
+        UNSCOPED_INFO("phase: " << megohttp::to_string(r.error().phase()));
+    }
+    REQUIRE(r);
+    CHECK(r.value().head().status_code == 200);
+    CHECK(r.value().body_is_buffered() == false);
+
+    // Both parts arrived with their exact payloads, over two TLS layers.
+    REQUIRE(sink->parts_begun == 2);
+    REQUIRE(sink->parts_ended == 2);
+    CHECK(sink->completions == 1);
+    CHECK(!sink->error_fired);
+    REQUIRE(sink->payloads.size() == 2);
+    CHECK(sink->payloads[0] == "part-one");
+    CHECK(sink->payloads[1] == "part-two");
+
+    // The proxy really did see a CONNECT on its own TLS listener.
+    const std::string rec = proxy.recording();
+    CHECK(rec.find("\"kind\": \"connect\"") != std::string::npos);
+    CHECK(rec.find("\"tls\": true") != std::string::npos);
+}
+
+// Diagnostic: same multipart payload, but through a PLAIN HTTP proxy CONNECT
+// tunnel (one TLS layer instead of two). Isolates "CONNECT" from "second TLS
+// layer" as the cause of a failure.
+TEST_CASE("multipart through a plain HTTP proxy CONNECT tunnel",
+          "[proxy][client][multipart][diagnostic]") {
+    HttpsOriginServer origin;
+    REQUIRE(origin.start("server-cert.pem", "server-key.pem", "--multipart"));
+
+    ProxyServer proxy;
+    REQUIRE(proxy.start("connect"));
+
+    ClientOptions o;
+    o.proxy.proxy.type = ProxyType::Http;      // cleartext to the proxy
+    o.proxy.proxy.host = string("127.0.0.1");
+    o.proxy.proxy.port = proxy.port();
+    o.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.tls.hostname = string("localhost");
+
+    struct Rec : MultipartSink {
+        int begun{0}, ended{0}, done{0};
+        std::vector<std::string> payloads;
+        void on_part_begin(const MultipartPartHead&) override { ++begun; payloads.push_back({}); }
+        bool on_part_data(const uint8_t* d, size_t n) override {
+            payloads.back().append(reinterpret_cast<const char*>(d), n);
+            return true;
+        }
+        void on_part_end() override { ++ended; }
+        void on_complete() override { ++done; }
+        void on_error(const Error&) override {}
+    };
+    auto sink = std::make_shared<Rec>();
+
+    Client c(o);
+    Request req(Method::Get, to_owning(tunnel_url(origin.port(), "/p")));
+    req.set_multipart_sink(sink);
+
+    auto r = c.request_sync(req);
+    UNSCOPED_INFO("begun=" << sink->begun << " ended=" << sink->ended << " done=" << sink->done);
+    if (!r) UNSCOPED_INFO("failed: " << megohttp::to_string(r.error().code()));
+    REQUIRE(r);
+    CHECK(sink->begun == 2);
+}
+
+TEST_CASE("a plain body arrives intact through an HTTPS proxy CONNECT tunnel",
+          "[proxy][client][https_proxy][diagnostic]") {
+    HttpsOriginServer origin;
+    REQUIRE(origin.start("server-cert.pem", "server-key.pem", "--multipart"));
+
+    ProxyServer proxy;
+    REQUIRE(proxy.start("connect", std::string("--tls-cert \"") + fixture("server-cert.pem") +
+                                       "\" --tls-key \"" + fixture("server-key.pem") + "\""));
+
+    ClientOptions o;
+    o.proxy.proxy.type = ProxyType::Https;
+    o.proxy.proxy.host = string("127.0.0.1");
+    o.proxy.proxy.port = proxy.port();
+    o.proxy.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.proxy.tls.hostname = string("localhost");
+    o.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.tls.hostname = string("localhost");
+
+    Client c(o);
+    auto r = c.request_sync(Request(Method::Get,
+        to_owning(tunnel_url(origin.port(), "/via-layered-tls"))));
+    REQUIRE(r);
+    // Buffered mode: the raw body must arrive byte-exact through both TLS layers.
+    const auto& b = r.value().body_bytes();
+    const std::string got(b.begin(), b.end());
+    UNSCOPED_INFO("body len=" << got.size());
+    UNSCOPED_INFO("body=" << got);
+    CHECK(got.size() == 248);   // multipart body: 2 parts + header blank lines
 }
 
 // ---------------------------------------------------------------------------
