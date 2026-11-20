@@ -111,7 +111,7 @@ def encode_ipv6(text):
     return socket.inet_pton(socket.AF_INET6, text)
 
 
-def build_response(query, force_rcode=None, truncate=False):
+def build_response(query, force_rcode=None, truncate=False, ttl=60):
     """Build a DNS response for a single-question query."""
     if len(query) < 12:
         raise ValueError("query too short")
@@ -133,14 +133,14 @@ def build_response(query, force_rcode=None, truncate=False):
     elif lower in CNAMES:
         cname_target = CNAMES[lower]
         # The CNAME record's OWNER is the queried name; its RDATA is the target.
-        answers.append((lower, 5, 60, encode_name(cname_target)))
+        answers.append((lower, 5, ttl, encode_name(cname_target)))
         records = ANSWERS.get(cname_target, {})
         for text in records.get(qtype, []):
-            answers.append((cname_target, qtype, 60, encode_address(qtype, text)))
+            answers.append((cname_target, qtype, ttl, encode_address(qtype, text)))
     elif lower in ANSWERS:
         records = ANSWERS[lower]
         for text in records.get(qtype, []):
-            answers.append((lower, qtype, 60, encode_address(qtype, text)))
+            answers.append((lower, qtype, ttl, encode_address(qtype, text)))
     else:
         rcode = RCODE_NXDOMAIN
 
@@ -287,7 +287,12 @@ class DohHandler:
             response = build_response(dns_query, force_rcode=force_rcode,
                                      truncate=(self.behaviour == "truncated-bit"),
                                      ttl=self.ttl)
-        except Exception:
+        except Exception as exc:
+            # Report the real reason on stderr. Swallowing it made a TypeError in
+            # build_response() masquerade as "malformed dns query" and hid a
+            # broken fixture behind a plausible-looking 400.
+            sys.stderr.write("doh_test_server: build_response failed: %r\n" % (exc,))
+            sys.stderr.flush()
             self.send(conn, 400, "text/plain", b"malformed dns query")
             return
 

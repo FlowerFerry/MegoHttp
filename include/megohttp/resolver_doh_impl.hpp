@@ -118,10 +118,14 @@ namespace megohttp {
             // Bound the response so a hostile endpoint cannot stream forever.
             copts.max_response_body = options_.max_response_bytes;
 
-            // S5A.4-03: resource isolation. Cap the DoH internal client's total
-            // connections so DNS requests cannot starve or be starved by the
-            // business pool. 4 is enough for a handful of concurrent lookups.
-            copts.pool.max_total_connections = 4;
+            // S5A.4-03: resource isolation is structural rather than a pool cap
+            // here: the DoH internal Client is a separate object with its own
+            // executor, its own TLS config and no cookie jar, so it neither
+            // shares nor waits on the business pool. Deliberately left
+            // unpooled (one connection per DoH request, closed afterwards),
+            // because a pooled keep-alive connection to a DoH endpoint is an
+            // extra failure mode (stale/reused connection -> non-200) that buys
+            // nothing for short DNS exchanges.
 
             client_ = std::make_unique<Client>(copts);
         }
