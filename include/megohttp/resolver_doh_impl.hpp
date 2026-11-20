@@ -128,7 +128,7 @@ namespace megohttp {
 
     inline DohResolver::DohResolver(std::shared_ptr<Executor> executor,
                                      DohOptions options)
-        : executor_(executor), options_(options) {
+        : executor_(executor), options_(options), cache_(options.cache) {
         http_client_ = std::make_unique<HttpClient>(executor, options);
     }
 
@@ -141,6 +141,25 @@ namespace megohttp {
     inline CancelHandle DohResolver::resolve(string host, uint16_t port,
                                               Callback cb) {
         auto cancel = std::make_shared<CancelState>();
+
+        // An IP literal needs no DNS at all.
+        if (auto lits = parse_ip_literal(to_view(host), port); !lits.empty()) {
+            executor_->post([cb, lits, cancel]() {
+                if (cancel && cancel->is_cancelled()) return;
+                if (cb) cb(AddressList(lits));
+            });
+            return CancelHandle{cancel};
+        }
+
+        // Check the TTL-driven cache first (task book 9-A.6).
+        if (auto cached = cache_.get(
+                host, port, static_cast<uint16_t>(dnswire::RecordType::A))) {
+            executor_->post([cb, answers = std::move(*cached), cancel]() {
+                if (cancel && cancel->is_cancelled()) return;
+                if (cb) cb(answers);
+            });
+            return CancelHandle{cancel};
+        }
 
         // Allocate query ID
         uint16_t qid = 0;
@@ -313,6 +332,52 @@ namespace megohttp {
         byte_buffer body_buf(body.begin(), body.end());
 
         auto result = parse_response(body_buf, *q);
+
+        // Cache the answer before delivering it (task book 9-A.6). Only a
+        // definitive DNS answer is cached -- parse_response already filters out
+        // SERVFAIL/REFUSED and reports them as errors, so `result` being a value
+        // means the answer is cacheable.
+        if (result) {
+            const uint16_t qtype = static_cast<uint16_t>(q->qtype);
+            auto parsed = dnswire::parse_message(body_buf);
+            if (parsed && !result.value().empty()) {
+                if (auto ttl = dnswire::min_ttl(parsed.value().answers)) {
+                    uint32_t effective = *ttl;
+                    // RFC 8484: an HTTP intermediary may have already aged the
+                    // response. Age is a lower bound on how much of the DNS TTL
+                    // has been consumed; honour it so the cache never outlives
+                    // the record.
+                    auto age_header = resp.head().headers.get("age");
+                    if (age_header) {
+                        uint64_t age = 0;
+                        const auto& av = age_header.value();
+                        bool digits = !av.empty();
+                        for (size_t i = 0; i < av.size(); ++i) {
+                            const char c = av[i];
+                            if (c < '0' || c > '9') { digits = false; break; }
+                            if (age > (UINT64_MAX - 9) / 10) { digits = false; break; }
+                            age = age * 10 + static_cast<uint64_t>(c - '0');
+                        }
+                        if (digits) {
+                            if (age >= effective) {
+                                effective = 0;   // fully aged: do not cache
+                            } else {
+                                effective -= static_cast<uint32_t>(age);
+                            }
+                        }
+                    }
+                    if (effective > 0) {
+                        cache_.put_positive(q->host, q->qport, qtype,
+                                            result.value(), effective);
+                    }
+                }
+            } else if (parsed && result.value().empty()) {
+                // NODATA: a definitive "no records of this type" answer.
+                if (auto neg = dnswire::negative_cache_ttl(parsed.value())) {
+                    cache_.put_negative(q->host, q->qport, qtype, *neg);
+                }
+            }
+        }
 
         std::lock_guard<std::mutex> lk(pending_mutex_);
         pending_.erase(q->id);

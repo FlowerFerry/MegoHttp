@@ -45,6 +45,7 @@ set(MGHTTP_TEST_SOURCES
     test_cookie.cpp
     test_reconnect.cpp
     test_dns_wire.cpp
+    test_dns_cache.cpp
 )
 
 # DoT tests: the resolver builds its own TLS/TCP connection and frames DNS

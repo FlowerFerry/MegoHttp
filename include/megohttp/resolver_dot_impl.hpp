@@ -265,6 +265,17 @@ namespace megohttp {
             return handle;
         }
 
+        // Check the TTL-driven cache first (task book 9-A.6). A negative entry
+        // (NXDOMAIN / NODATA) returns an empty list -- not an error.
+        if (auto cached = cache_.get(host, port,
+                                      static_cast<uint16_t>(::megohttp::dns::RecordType::A))) {
+            executor_->post([cb, answers = std::move(*cached), cancel]() {
+                if (cancel && cancel->is_cancelled()) return;
+                if (cb) cb(answers);
+            });
+            return handle;
+        }
+
         auto q = std::make_shared<Query>();
         q->host = std::move(host);
         q->qport = port;
@@ -484,15 +495,26 @@ namespace megohttp {
         if (!q || !q->cb) return;
         if (q->cancel && q->cancel->is_cancelled()) return;
 
+        const uint16_t qtype = static_cast<uint16_t>(q->qtype);
+
         switch (msg.rcode) {
             case ResponseCode::NoError:
                 break;
-            case ResponseCode::NxDomain:
+            case ResponseCode::NxDomain: {
+                // NXDOMAIN is a definitive answer, so it is negatively cached
+                // per RFC 2308 using the SOA MINIMUM (task book 9-A.6).
+                if (auto neg = negative_cache_ttl(msg)) {
+                    cache_.put_negative(q->host, q->qport, qtype, *neg);
+                }
                 q->cb(Error{ErrorCode::DnsNameNotFound, ErrorPhase::Resolve,
                             string("DoT: NXDOMAIN")});
                 return;
+            }
             case ResponseCode::ServFail:
             case ResponseCode::Refused:
+                // SERVFAIL and REFUSED are transport-level failures of the
+                // upstream, NOT statements about the name. Caching them would
+                // turn a transient outage into a lasting NXDOMAIN.
                 q->cb(Error{ErrorCode::DnsServerFailure, ErrorPhase::Resolve,
                             string("DoT: server failure")});
                 return;
@@ -529,11 +551,24 @@ namespace megohttp {
 
         if (out.empty()) {
             // NOERROR with no address records is NODATA, which is a valid answer
-            // meaning "this name has no records of that type" (9-A.5).
+            // meaning "this name has no records of that type" (9-A.5). It is
+            // negatively cached like NXDOMAIN -- the name exists but this type
+            // is absent.
+            if (auto neg = negative_cache_ttl(msg)) {
+                cache_.put_negative(q->host, q->qport, qtype, *neg);
+            }
             q->cb(Error{ErrorCode::DnsNoData, ErrorPhase::Resolve,
                         string("DoT: NOERROR with no address records")});
             return;
         }
+
+        // Positive cache with the real record TTL (task book 9-A.6). A CNAME
+        // chain's entries carry their own TTLs, so the minimum across the answer
+        // set is the only value that keeps the whole chain coherent.
+        if (auto ttl = min_ttl(msg.answers)) {
+            cache_.put_positive(q->host, q->qport, qtype, out, *ttl);
+        }
+
         q->cb(AddressList(std::move(out)));
     }
 

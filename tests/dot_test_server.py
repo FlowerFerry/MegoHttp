@@ -60,7 +60,28 @@ def main():
     ap.add_argument("--key", required=True)
     ap.add_argument("--rcode", type=int, default=None,
                     help="Force a specific RCODE (3 = NXDOMAIN)")
+    ap.add_argument("--ttl", type=int, default=60,
+                    help="TTL in the answer record (0 = do not cache)")
+    ap.add_argument("--count-file", default=None,
+                    help="Write the number of queries received to this file")
     args = ap.parse_args()
+
+    # Shared across connections so the counter reflects the whole server, which
+    # is what a cache test needs: a second lookup that hits the cache must not
+    # increase this number.
+    query_count = [0]
+    count_lock = threading.Lock()
+
+    def bump_and_write():
+        with count_lock:
+            query_count[0] += 1
+            value = query_count[0]
+        if args.count_file:
+            try:
+                with open(args.count_file, "w") as f:
+                    f.write(str(value))
+            except OSError:
+                pass
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -91,9 +112,10 @@ def main():
                         return
                     wire += chunk
 
-                reply = build_reply(wire, rcode=args.rcode)
+                reply = build_reply(wire, rcode=args.rcode, ttl=args.ttl)
                 framed = struct.pack("!H", len(reply)) + reply
                 conn.sendall(framed)
+                bump_and_write()
         except Exception:
             pass
         finally:

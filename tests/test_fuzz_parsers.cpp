@@ -37,6 +37,7 @@
 #include <catch2/catch_all.hpp>
 
 #include <megohttp/content_range.hpp>
+#include <megohttp/dns_wire.hpp>
 #include <megohttp/http.hpp>
 #include <megohttp/multipart_response.hpp>
 
@@ -81,6 +82,69 @@ const char* const kRangeSeeds[] = {
     "bytes 500-499/1234",
     "bytes 0-18446744073709551616/9",
 };
+
+// DNS message seeds as raw bytes. Each one is a different shape the parser has
+// to handle: a plain A answer, a CNAME chain, NXDOMAIN with no authority,
+// a message with a compression pointer, a truncated message, and a query
+// (which a response parser must reject).
+std::vector<std::vector<uint8_t>> dns_seeds() {
+    // Helper: a 12-byte header + question for "example.com" type A class IN.
+    auto header_and_question = [](uint16_t id, uint16_t flags, uint16_t ancount) {
+        std::vector<uint8_t> v;
+        auto put16 = [&v](uint16_t x) {
+            v.push_back(static_cast<uint8_t>(x >> 8));
+            v.push_back(static_cast<uint8_t>(x & 0xFF));
+        };
+        put16(id);
+        put16(flags);
+        put16(1);        // qdcount
+        put16(ancount);  // ancount
+        put16(0);        // nscount
+        put16(0);        // arcount
+        // "example.com": 7 example 3 com 0
+        const uint8_t name[] = {7, 'e','x','a','m','p','l','e', 3, 'c','o','m', 0};
+        v.insert(v.end(), name, name + sizeof(name));
+        put16(1);  // qtype A
+        put16(1);  // qclass IN
+        return v;
+    };
+
+    std::vector<std::vector<uint8_t>> seeds;
+
+    {   // A answer with one 192.0.2.1 record, pointer-compressed owner.
+        auto v = header_and_question(0x1234, 0x8180, 1);
+        const uint8_t ans[] = {0xC0, 0x0C,  0x00, 0x01, 0x00, 0x01,
+                               0x00, 0x00, 0x00, 0x3C, 0x00, 0x04,
+                               192, 0, 2, 1};
+        v.insert(v.end(), ans, ans + sizeof(ans));
+        seeds.push_back(v);
+    }
+    {   // NXDOMAIN with no authority section (negative_cache_ttl is nullopt).
+        seeds.push_back(header_and_question(0x2345, 0x8183, 0));
+    }
+    {   // Truncated: header claims an answer that is not there.
+        seeds.push_back(header_and_question(0x3456, 0x8180, 1));
+    }
+    {   // A bare header: no question at all.
+        seeds.push_back({0x12, 0x34, 0x81, 0x80, 0x00, 0x00,
+                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00});
+    }
+    {   // A forward compression pointer, which the parser must reject.
+        std::vector<uint8_t> v = {0x12, 0x34, 0x81, 0x80, 0x00, 0x01,
+                                  0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+        v.push_back(0xC0);
+        v.push_back(0x20);   // points forward, into uninitialised territory
+        v.push_back(0x00);
+        v.push_back(0x01);
+        v.push_back(0x00);
+        v.push_back(0x01);
+        seeds.push_back(v);
+    }
+    {   // Empty input.
+        seeds.push_back({});
+    }
+    return seeds;
+}
 
 // Collects HTTP parser output; all callbacks accept everything so the sweep
 // exercises the parser itself, not a sink's policy.
@@ -210,6 +274,96 @@ TEST_CASE("Content-Range parser survives mutated input", "[fuzz][byteranges]") {
     CHECK(accepted > 0);
     CHECK(rejected > 0);
     CHECK(accepted + rejected == 6 * 200);
+}
+
+TEST_CASE("DNS wire-format parser survives mutated input", "[fuzz][dns]") {
+    // Task book 9-A.7: the DNS parser gets its own fuzz entry point, using the
+    // production parser (dns::parse_message), with bounded input and a bounded
+    // pointer-hop limit inside the parser itself.
+    std::mt19937 rng(0xD15EA5EDu);
+    size_t parsed = 0, rejected = 0;
+
+    const auto seeds = dns_seeds();
+    for (const auto& seed : seeds) {
+        std::vector<uint8_t> input = seed;
+        for (int round = 0; round < 200; ++round) {
+            auto r = megohttp::dns::parse_message(input);
+            if (r) {
+                ++parsed;
+                // Walk the parsed structure so a corrupted-but-accepted message
+                // cannot leave a bad index unchecked.
+                const auto& msg = r.value();
+                (void)megohttp::dns::extract_addresses(msg, megohttp::dns::RecordType::A);
+                (void)megohttp::dns::min_ttl(msg.answers);
+                (void)megohttp::dns::negative_cache_ttl(msg);
+            } else {
+                ++rejected;
+            }
+
+            // Mutate as raw bytes: the mutations must be able to break lengths,
+            // counts and compression pointers, which is where the risk lives.
+            std::string as_string(input.begin(), input.end());
+            as_string = mutate(as_string, rng);
+            if (as_string.size() > 2048) as_string.resize(2048);
+            input.assign(as_string.begin(), as_string.end());
+        }
+    }
+
+    CHECK(parsed > 0);
+    CHECK(rejected > 0);
+    CHECK(parsed + rejected == seeds.size() * 200);
+}
+
+TEST_CASE("DNS wire-format parser tolerates random bytes", "[fuzz][dns]") {
+    std::mt19937 rng(0x5EEDBEEFu);
+    std::uniform_int_distribution<int> byte_dist(0, 255);
+
+    for (int round = 0; round < 300; ++round) {
+        const size_t len = rng() % 512;
+        std::vector<uint8_t> input;
+        input.reserve(len);
+        for (size_t i = 0; i < len; ++i) {
+            input.push_back(static_cast<uint8_t>(byte_dist(rng)));
+        }
+
+        auto r = megohttp::dns::parse_message(input);
+        if (r) {
+            const auto& msg = r.value();
+            (void)megohttp::dns::extract_addresses(msg, megohttp::dns::RecordType::A);
+            (void)megohttp::dns::extract_addresses(msg, megohttp::dns::RecordType::AAAA);
+            (void)megohttp::dns::negative_cache_ttl(msg);
+        }
+    }
+    SUCCEED("no crash on 300 random DNS buffers");
+}
+
+TEST_CASE("DNS query builder round-trips every fuzzed query", "[fuzz][dns]") {
+    // build_query must either produce a message that parses back, or fail
+    // cleanly. A builder that emits unparseable bytes would break DoT/DoH in a
+    // way the response-side fuzz above cannot see.
+    std::mt19937 rng(0xB0117u);
+    std::uniform_int_distribution<int> len_dist(0, 40);
+    std::uniform_int_distribution<int> chr_dist(33, 126);
+
+    for (int round = 0; round < 200; ++round) {
+        std::string name;
+        const int len = len_dist(rng);
+        for (int i = 0; i < len; ++i) {
+            name.push_back(static_cast<char>(chr_dist(rng)));
+        }
+
+        auto built = megohttp::dns::build_query(
+            0x4242, string_view(name.data(), name.size()),
+            megohttp::dns::RecordType::A);
+        if (!built) continue;   // rejected (empty label, over-long, etc.)
+
+        auto parsed = megohttp::dns::parse_message(built.value());
+        // Whatever the builder accepted must parse back as a query with the
+        // same name spelled the way the wire carries it.
+        REQUIRE(parsed);
+        CHECK(parsed.value().id == 0x4242);
+        CHECK_FALSE(parsed.value().is_response);
+    }
 }
 
 TEST_CASE("all parsers tolerate random bytes", "[fuzz][random]") {

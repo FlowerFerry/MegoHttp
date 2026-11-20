@@ -23,6 +23,7 @@
 
 #if MEGOHTTP_HAS_DOH
 
+#include <megohttp/dns_cache.hpp>
 #include <megohttp/dns_wire.hpp>
 #include <megohttp/error.hpp>
 #include <megohttp/executor.hpp>
@@ -78,6 +79,15 @@ namespace megohttp {
 
         // Maximum redirects to follow (only if follow_redirects is true)
         size_t max_redirects{3};
+
+        // TTL-driven answer cache (task book 9-A.6). Positive entries expire on
+        // the record TTL, negative entries on the SOA MINIMUM (RFC 2308).
+        //
+        // DoH additionally must respect the HTTP cache age on top of the DNS
+        // TTL: a response served from an intermediary cache has already spent
+        // part of its lifetime, so the effective TTL is `min(dns_ttl,
+        // remaining_age)`.
+        DnsCacheOptions cache{};
     };
 
     // DNS over HTTPS resolver.
@@ -144,6 +154,9 @@ namespace megohttp {
 
         // Next DNS message ID
         uint16_t next_id_{1};
+
+        // TTL-driven answer cache (task book 9-A.6).
+        mutable DnsCache cache_;
 
         // HTTP client (owned, isolated)
         std::unique_ptr<HttpClient> http_client_;

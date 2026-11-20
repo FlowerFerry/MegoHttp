@@ -15,6 +15,7 @@
 
 #if MEGOHTTP_HAS_DOT
 
+#include <megohttp/dns_cache.hpp>
 #include <megohttp/dns_wire.hpp>
 #include <megohttp/error.hpp>
 #include <megohttp/executor.hpp>
@@ -53,6 +54,10 @@ namespace megohttp {
         // (RFC 7858 §4.1). A strict-mode endpoint that refuses to cache NXDOMAIN
         // would set this false, but the default follows the RFC.
         bool accept_no_data{true};
+
+        // TTL-driven answer cache (task book 9-A.6). Positive entries expire on
+        // the record TTL, negative entries on the SOA MINIMUM (RFC 2308).
+        DnsCacheOptions cache{};
     };
 
     // DNS over TLS resolver. One resolver owns one long-lived TLS connection to
@@ -116,6 +121,10 @@ namespace megohttp {
         // burst of lookups is serialised through this queue.
         bool write_in_flight_{false};
         std::vector<std::shared_ptr<Query>> write_queue_;
+
+        // TTL-driven answer cache (task book 9-A.6). Positive entries expire on
+        // the record TTL, negative entries on the SOA MINIMUM (RFC 2308).
+        mutable DnsCache cache_;
 
         // Queries waiting for an answer.
         std::unordered_map<uint16_t, std::shared_ptr<Query>> pending_;

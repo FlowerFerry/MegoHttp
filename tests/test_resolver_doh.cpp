@@ -175,7 +175,7 @@ TEST_CASE("DoH POST resolves a name over HTTPS", "[doh][s5a]") {
                                                 got.error().message().size()));
     }
     REQUIRE(got);
-    CHECK(got.value().size() == 2);
+    REQUIRE(got.value().size() == 2);
     CHECK(got.value()[0].port == 443);
     CHECK(got.value()[0].text == string("192.0.2.1"));
 }
@@ -366,7 +366,7 @@ TEST_CASE("DoH delivers a CNAME chain answer", "[doh][s5a]") {
     REQUIRE(wait_until([&] { return done.load(); }));
     REQUIRE(got);
     // alias.example -> CNAME dual.example -> 2 A records for dual.example
-    CHECK(got.value().size() == 2);
+    REQUIRE(got.value().size() == 2);
     CHECK(got.value()[0].port == 8443);
 }
 

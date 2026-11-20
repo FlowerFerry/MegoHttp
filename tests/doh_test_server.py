@@ -22,6 +22,7 @@ import ssl
 import struct
 import sys
 import threading
+import time
 
 RECORD_A = 1
 RECORD_AAAA = 28
@@ -177,11 +178,13 @@ def b64url_decode(text):
 
 
 class DohHandler:
-    def __init__(self, sock, certfile, keyfile, behaviour):
+    def __init__(self, sock, certfile, keyfile, behaviour, ttl=60, on_answered=None):
         self.sock = sock
         self.certfile = certfile
         self.keyfile = keyfile
         self.behaviour = behaviour
+        self.ttl = ttl
+        self.on_answered = on_answered
 
     def serve(self):
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -282,12 +285,15 @@ class DohHandler:
             elif self.behaviour == "nxdomain":
                 force_rcode = RCODE_NXDOMAIN
             response = build_response(dns_query, force_rcode=force_rcode,
-                                     truncate=(self.behaviour == "truncated-bit"))
+                                     truncate=(self.behaviour == "truncated-bit"),
+                                     ttl=self.ttl)
         except Exception:
             self.send(conn, 400, "text/plain", b"malformed dns query")
             return
 
         self.send(conn, 200, "application/dns-message", response)
+        if self.on_answered:
+            self.on_answered()
 
     def send(self, conn, status, content_type, body):
         reason = {200: "OK", 400: "Bad Request", 405: "Method Not Allowed",
@@ -307,6 +313,10 @@ def main():
                         choices=["normal", "wrong-status", "wrong-media-type",
                                  "truncated", "servfail", "nxdomain",
                                  "truncated-bit"])
+    parser.add_argument("--ttl", type=int, default=60,
+                        help="TTL in the answer record (0 = do not cache)")
+    parser.add_argument("--count-file", default=None,
+                        help="Write the number of DNS answers served to this file")
     args = parser.parse_args()
 
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -318,12 +328,29 @@ def main():
     sys.stdout.write("READY %d %d\n" % (os.getpid(), port))
     sys.stdout.flush()
 
+    # Counts every DNS answer served. A cache test needs this: a second lookup
+    # that hits the client-side cache must not increase it.
+    answer_count = [0]
+    count_lock = threading.Lock()
+
+    def bump_and_write():
+        with count_lock:
+            answer_count[0] += 1
+            value = answer_count[0]
+        if args.count_file:
+            try:
+                with open(args.count_file, "w") as f:
+                    f.write(str(value))
+            except OSError:
+                pass
+
     while True:
         try:
             conn, _ = listener.accept()
         except OSError:
             break
-        handler = DohHandler(conn, args.cert, args.key, args.behaviour)
+        handler = DohHandler(conn, args.cert, args.key, args.behaviour,
+                             args.ttl, bump_and_write)
         threading.Thread(target=handler.serve, daemon=True).start()
 
 
