@@ -118,6 +118,11 @@ namespace megohttp {
             // Bound the response so a hostile endpoint cannot stream forever.
             copts.max_response_body = options_.max_response_bytes;
 
+            // S5A.4-03: resource isolation. Cap the DoH internal client's total
+            // connections so DNS requests cannot starve or be starved by the
+            // business pool. 4 is enough for a handful of concurrent lookups.
+            copts.pool.max_total_connections = 4;
+
             client_ = std::make_unique<Client>(copts);
         }
 

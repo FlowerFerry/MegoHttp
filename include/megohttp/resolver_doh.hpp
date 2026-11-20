@@ -80,6 +80,11 @@ namespace megohttp {
         // Maximum redirects to follow (only if follow_redirects is true)
         size_t max_redirects{3};
 
+        // Bootstrap mode (task book 9-A.4). When false (default, strict mode),
+        // a named endpoint with no bootstrap_ip is a ConfigurationError.
+        // When true, the endpoint hostname is resolved via system DNS.
+        bool use_system_bootstrap{false};
+
         // TTL-driven answer cache (task book 9-A.6). Positive entries expire on
         // the record TTL, negative entries on the SOA MINIMUM (RFC 2308).
         //

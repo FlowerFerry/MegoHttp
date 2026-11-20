@@ -465,4 +465,41 @@ TEST_CASE("DoT reports NXDOMAIN and caches nothing without an SOA", "[dot][s5a][
     CHECK(nx.load() == 2);
 }
 
+// S5A.4-01: system bootstrap mode resolves server_name via system DNS.
+TEST_CASE("DoT system bootstrap resolves a named endpoint", "[dot][s5a][bootstrap]") {
+    DotTestServer srv;
+    REQUIRE(srv.start());
+
+    auto ex = detail::make_default_executor();
+    REQUIRE(ex);
+
+    DotOptions o;
+    o.server_name = string("localhost");
+    // NO bootstrap_ip: system bootstrap mode must resolve it.
+    o.port = srv.port();
+    o.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.connect_timeout = std::chrono::seconds(5);
+    o.use_system_bootstrap = true;
+
+    auto resolver = std::make_shared<DotResolver>(ex, o);
+
+    std::atomic<bool> done{false};
+    Result<AddressList> got = Error{ErrorCode::Unknown};
+    resolver->resolve(string("example.com"), 443, [&](Result<AddressList> r) {
+        got = std::move(r);
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    if (!got) {
+        UNSCOPED_INFO("resolve failed: " << megohttp::to_string(got.error().code())
+                     << " phase=" << megohttp::to_string(got.error().phase())
+                     << " msg=" << std::string(got.error().message().data(),
+                                                got.error().message().size()));
+    }
+    REQUIRE(got);
+    REQUIRE(got.value().size() == 1);
+    CHECK(got.value()[0].text == string("192.0.2.1"));
+}
+
 #endif // MEGOHTTP_HAS_DOT && !MGHTTP_TLS_NONE

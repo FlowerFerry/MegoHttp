@@ -22,6 +22,7 @@
 
 #include <megohttp/resolver_dot.hpp>
 #include <megohttp/dns_wire.hpp>   // explicit: the impl needs the codec's types
+#include <megohttp/resolver.hpp>   // SystemResolver for bootstrap resolution
 
 #if MEGOHTTP_HAS_DOT
 
@@ -29,6 +30,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <memory>
 
 namespace megohttp {
     namespace dot_detail {
@@ -53,7 +55,7 @@ namespace megohttp {
     // Connection: TCP -> TLS -> framed read loop
     // -----------------------------------------------------------------------
 
-    inline void DotResolver::Connection::connect(std::function<void(const Error*)> on_ready) {
+    inline void DotResolver::Connection::connect(AddressList addrs, std::function<void(const Error*)> on_ready) {
         connect_cb_ = std::move(on_ready);
 
         if (!executor_) {
@@ -68,27 +70,14 @@ namespace megohttp {
             return;
         }
 
-        // A DoT endpoint is named by a DNS name, but connecting needs an address.
-        // The bootstrap IP (when given) is dialled directly; otherwise the name
-        // must already BE a literal. Resolving the endpoint's own name here would
-        // be the recursion the task book forbids (9-A.4): the resolver would have
-        // to resolve itself to resolve anything.
-        AddressList addrs = parse_ip_literal(to_view(options_.bootstrap_ip), options_.port);
-        if (addrs.empty() && !options_.server_name.empty()) {
-            addrs = parse_ip_literal(to_view(options_.server_name), options_.port);
-        }
+        // The caller must provide addresses (strict bootstrap IP or system-resolved).
         if (addrs.empty()) {
             state_ = State::Failed;
             auto cb = std::move(connect_cb_);
             connect_cb_ = nullptr;
             if (cb) {
-                // A named endpoint with no bootstrap address is a configuration
-                // error, not a network failure: say so, and do NOT quietly fall
-                // back to the system resolver.
                 cb(new Error{ErrorCode::ConfigurationError, ErrorPhase::Resolve,
-                             string("DoT endpoint is a name but no bootstrap IP was configured; "
-                                    "set DotOptions::bootstrap_ip (strict bootstrap mode does "
-                                    "not fall back to system DNS)")});
+                             string("DoT connection has no address to dial")});
             }
             return;
         }
@@ -345,15 +334,106 @@ namespace megohttp {
     }
 
     inline void DotResolver::ensure_connection() {
-        // A connection that exists is either Open (reuse) or still Connecting
-        // (let it finish). Creating a second one would abandon the first mid
-        // handshake and every query waiting on it.
         if (conn_) return;
+
+        // S5A.4-01: resolve the bootstrap address.
+        // Strict mode (default): bootstrap_ip or server_name must be an IP literal.
+        // System bootstrap mode: resolve server_name via system resolver first.
+        AddressList addrs;
+        if (!options_.bootstrap_ip.empty()) {
+            addrs = parse_ip_literal(to_view(options_.bootstrap_ip), options_.port);
+        }
+        if (addrs.empty() && !options_.server_name.empty()) {
+            addrs = parse_ip_literal(to_view(options_.server_name), options_.port);
+        }
+
+        if (!addrs.empty()) {
+            // Got a literal address — create the connection directly.
+            create_connection(std::move(addrs));
+            return;
+        }
+
+        // No literal address. In strict mode this is a hard error.
+        if (!options_.use_system_bootstrap) {
+            auto err = Error{ErrorCode::ConfigurationError, ErrorPhase::Resolve,
+                             string("DoT endpoint is a name but no bootstrap IP was configured; "
+                                    "set DotOptions::bootstrap_ip (strict bootstrap mode does "
+                                    "not fall back to system DNS)")};
+            // Fail all pending lookups with this configuration error.
+            auto pending = std::move(pending_);
+            pending_.clear();
+            for (auto& kv : pending) {
+                if (kv.second && kv.second->cb && kv.second->cancel &&
+                    !kv.second->cancel->is_cancelled()) {
+                    kv.second->cb(err);
+                }
+            }
+            return;
+        }
+
+        // System bootstrap mode: resolve server_name via system resolver.
+        if (bootstrap_pending_) return;  // already resolving
+        if (!bootstrap_failed_ && !bootstrap_addrs_.empty()) {
+            // Previously resolved — reuse.
+            create_connection(bootstrap_addrs_);
+            return;
+        }
+        if (bootstrap_failed_) {
+            // Previous bootstrap failed — report.
+            auto err = Error{ErrorCode::DnsResolveFailed, ErrorPhase::Resolve,
+                             string("DoT bootstrap resolution failed")};
+            auto pending = std::move(pending_);
+            pending_.clear();
+            for (auto& kv : pending) {
+                if (kv.second && kv.second->cb && kv.second->cancel &&
+                    !kv.second->cancel->is_cancelled()) {
+                    kv.second->cb(err);
+                }
+            }
+            return;
+        }
+
+        bootstrap_pending_ = true;
+        auto self = shared_from_this();
+        auto sys_resolver = std::make_shared<SystemResolver>(executor_);
+        auto handle = sys_resolver->resolve(options_.server_name, options_.port,
+            [self, sys_resolver](Result<AddressList> r) {
+                self->executor_->post([self, r = std::move(r)]() mutable {
+                    self->bootstrap_pending_ = false;
+                    if (r) {
+                        self->bootstrap_addrs_ = std::move(r.value());
+                        // If there are pending queries, create the connection now.
+                        if (!self->bootstrap_addrs_.empty() && self->pending_.empty()) {
+                            // Connection will be created on next resolve().
+                        }
+                        if (!self->bootstrap_addrs_.empty()) {
+                            // We may have queued queries waiting; submit them.
+                            self->create_connection(self->bootstrap_addrs_);
+                        }
+                    } else {
+                        self->bootstrap_failed_ = true;
+                        // Fail all pending.
+                        auto pending = std::move(self->pending_);
+                        self->pending_.clear();
+                        for (auto& kv : pending) {
+                            if (kv.second && kv.second->cb && kv.second->cancel &&
+                                !kv.second->cancel->is_cancelled()) {
+                                kv.second->cb(r.error());
+                            }
+                        }
+                    }
+                });
+            });
+        (void)handle;  // Don't cancel the bootstrap resolution.
+    }
+
+    inline void DotResolver::create_connection(AddressList addrs) {
+        if (conn_) return;  // already created (race guard)
 
         conn_ = std::make_shared<Connection>(executor_, options_);
 
         auto self = shared_from_this();
-        conn_->connect([self](const Error* err) {
+        conn_->connect(std::move(addrs), [self](const Error* err) {
             if (err) {
                 self->on_connection_failed(*err);
                 return;

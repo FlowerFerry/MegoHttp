@@ -55,6 +55,13 @@ namespace megohttp {
         // would set this false, but the default follows the RFC.
         bool accept_no_data{true};
 
+        // Bootstrap mode (task book 9-A.4). When false (default, strict mode),
+        // a named endpoint with no bootstrap_ip is a ConfigurationError — the
+        // resolver will NOT fall back to the system DNS. When true, the resolver
+        // resolves server_name through the system resolver before connecting;
+        // this exposes the endpoint name to system DNS but avoids manual IP config.
+        bool use_system_bootstrap{false};
+
         // TTL-driven answer cache (task book 9-A.6). Positive entries expire on
         // the record TTL, negative entries on the SOA MINIMUM (RFC 2308).
         DnsCacheOptions cache{};
@@ -129,6 +136,17 @@ namespace megohttp {
         // Queries waiting for an answer.
         std::unordered_map<uint16_t, std::shared_ptr<Query>> pending_;
 
+        // Bootstrap state (S5A.4-01): when use_system_bootstrap is true and
+        // bootstrap_ip is empty, resolve server_name via system resolver first.
+        // bootstrap_addrs_ holds the resolved addresses (empty = pending, filled
+        // = ready). bootstrap_failed_ records a permanent failure.
+        AddressList bootstrap_addrs_;
+        bool bootstrap_pending_{false};
+        bool bootstrap_failed_{false};
+
+        // Create the TCP+TLS connection with already-resolved addresses.
+        void create_connection(AddressList addrs);
+
         // Maximum concurrent queries on one connection. RFC 7858 doesn't specify
         // a limit, but a server can cap it. 64 is generous enough for normal use.
         static constexpr size_t kMaxInFlight = 64;
@@ -155,8 +173,9 @@ namespace megohttp {
             : executor_(std::move(executor)), options_(std::move(options)) {}
 
         // Begin connecting: TCP -> TLS -> read loop.
+        // `addrs` must be pre-resolved addresses to dial.
         // on_ready fires exactly once with success or failure.
-        void connect(std::function<void(const Error*)> on_ready);
+        void connect(AddressList addrs, std::function<void(const Error*)> on_ready);
 
         // Write a DNS message (already length-prefixed by the caller).
         // The buffer must stay valid until the callback fires.
