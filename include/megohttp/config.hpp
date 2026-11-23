@@ -192,6 +192,16 @@
 #   define MEGOHTTP_HAS_BROTLI 0
 #endif
 
+// Brotli ENCODER availability. Separate from MEGOHTTP_HAS_BROTLI: a build can
+// decode brotli with only brotlidec.lib. Request body compression needs the
+// encoder library (brotlienc), so requesting "br" without it must fail with
+// ContentEncodingUnsupported rather than link-fail or send plain bytes.
+#if defined(MGHTTP_HAVE_BROTLI_ENCODER) && MGHTTP_HAVE_BROTLI_ENCODER != 0
+#   define MEGOHTTP_HAS_BROTLI_ENCODER 1
+#else
+#   define MEGOHTTP_HAS_BROTLI_ENCODER 0
+#endif
+
 #if defined(MGHTTP_ENABLE_SSE) && MGHTTP_ENABLE_SSE != 0
 #   define MEGOHTTP_HAS_SSE 1
 #else

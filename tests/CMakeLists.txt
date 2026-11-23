@@ -30,6 +30,8 @@ set(MGHTTP_TEST_SOURCES
     test_multipart_client.cpp
     test_content_range.cpp
     test_content_type.cpp
+    test_content_encoder.cpp
+    test_request_compression.cpp
     test_fuzz_parsers.cpp
     test_tls_stream.cpp
     test_client_tls.cpp

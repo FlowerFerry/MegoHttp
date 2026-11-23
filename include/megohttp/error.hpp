@@ -80,6 +80,10 @@ namespace megohttp {
         ContentDecodingFailed   = MGEC__HTTP_BEGIN - 100,
         ContentEncodingUnsupported = MGEC__HTTP_BEGIN - 101,
         ContentDecodingResourceExceeded = MGEC__HTTP_BEGIN - 102,
+        // Request-side encoding failure: the encoder itself failed (zlib/brotli
+        // returned an error, or the output could not be produced). Kept separate
+        // from ContentDecodingFailed so a caller can tell which direction broke.
+        ContentEncodingFailed   = MGEC__HTTP_BEGIN - 103,
 
         // --- Timeouts ---
         TimeoutResolve          = MGEC__HTTP_BEGIN - 120,

@@ -16,6 +16,8 @@
 #include <megohttp/backend/executor_asio.hpp>
 #endif
 
+#include <megohttp/content_encoder.hpp>
+
 #include <atomic>
 #include <cstdlib>
 #include <mutex>
@@ -161,6 +163,21 @@ namespace megohttp {
             // True when the request body is sent chunk-framed (a BodySource with
             // no caller-supplied framing header). The sender wraps every piece.
             bool body_chunked{false};
+
+            // Request body compression (task book 7.3). The body is encoded
+            // ONCE in submit(), before the state is registered, so every retry
+            // and redirect hop reuses the exact bytes that were already sent.
+            // `encoded_body` is only consulted when wire_coding != None.
+            Request::Compression wire_coding{Request::Compression::None};
+            std::vector<uint8_t> encoded_body;
+
+            // The bytes that actually go on the wire. One accessor for the head
+            // builder and both send paths, so a compressed request cannot end up
+            // advertising a length that differs from what is written.
+            const std::vector<uint8_t>& wire_body() const noexcept {
+                return wire_coding == Request::Compression::None
+                    ? request.body_bytes() : encoded_body;
+            }
 
             // Held while the exchange is live so the stream outlives its callbacks.
             std::shared_ptr<AsyncByteStream> stream;
@@ -488,7 +505,7 @@ namespace megohttp {
                 }
 
                 // Buffered mode: single write of the whole buffer.
-                const auto& body = state_->request.body_bytes();
+                const auto& body = state_->wire_body();
                 if (body.empty()) {
                     // No buffered body: proceed to reading response.
                     disarm_send_timer();
@@ -528,7 +545,7 @@ namespace megohttp {
                 }
 
                 // Buffered mode: single write of the whole buffer.
-                const auto& body = state_->request.body_bytes();
+                const auto& body = state_->wire_body();
                 if (body.empty()) {
                     disarm_send_timer();
                     arm_recv_timer();
@@ -1561,8 +1578,10 @@ namespace megohttp {
         // decision so the exchange holds the body accordingly.
         inline Result<string> build_request_head(const Request& req, const Url& url,
                                                  bool expect_continue, bool pooling,
-                                                                                                  bool forward_proxy,
-                                                                                                  const ProxyConfig& proxy) {
+                                                 bool forward_proxy,
+                                                 const ProxyConfig& proxy,
+                                                 Request::Compression wire_coding,
+                                                 size_t wire_body_size) {
             Headers headers = req.headers();
 
             // Proxy credentials belong to the proxy hop and to nothing else.
@@ -1615,12 +1634,27 @@ namespace megohttp {
             // an explicit assertion about the body and is not second-guessed.
             const bool has_te = headers.contains("transfer-encoding");
             const bool has_cl = headers.contains("content-length");
+            // The body coding describes the bytes that follow, so it is added
+            // only when an encoded body actually exists. `prepare_request_body`
+            // leaves wire_coding at None for a missing/empty body.
+            if (wire_coding != Request::Compression::None) {
+                const char* coding_name =
+                    content_encoding_detail::name_of(wire_coding);
+                if (coding_name) {
+                    headers.set("content-encoding",
+                                string_view(coding_name,
+                                    std::char_traits<char>::length(coding_name)));
+                }
+            }
             if (req.has_body() && !has_cl && !has_te) {
                 if (req.body_source().has_value()) {
                     headers.set("transfer-encoding", "chunked");
                 } else {
+                    // Content-Length describes the ENCODED body. Using
+                    // body_bytes().size() here would tell the server to read N
+                    // bytes and then write M != N, which truncates or hangs.
                     headers.set("content-length",
-                                to_view(format("{}", req.body_bytes().size())));
+                                to_view(format("{}", wire_body_size)));
                 }
             }
             if (expect_continue && !headers.contains("expect")) {
@@ -1816,11 +1850,30 @@ namespace megohttp {
             st->options = opt_override ? *opt_override : options;
             st->pool = pool;
 
+            // Request body compression (task book 7.3). Preparation happens
+            // before the state is registered: a conflict or a missing encoder is
+            // a synchronously rejected submission, and a state that was never
+            // accepted must not sit in in_flight_ until shutdown. Encoding runs
+            // on the SUBMITTING thread on purpose -- doing it on the I/O thread
+            // would block every other connection for the duration.
+            auto prepared_body = content_encoding_detail::prepare_request_body(req);
+            if (!prepared_body) {
+                // Break the self-hold installed above: this state was never
+                // registered in in_flight_, so nothing else will ever call
+                // finish() to release it. Without this reset the cycle
+                // (self_hold -> state -> self_hold) leaks the whole state.
+                st->self_hold.reset();
+                if (on_complete) on_complete(prepared_body.error());
+                return;
+            }
+
             // Redirect budget (S5.2). Only counts when the caller opted in;
             // with the policy off the counter stays 0 and nothing follows.
             st->hops_left = st->options.redirects.follow
                                 ? st->options.redirects.max_redirects : 0;
             st->request = req;
+            st->wire_coding = prepared_body.value().coding;
+            st->encoded_body = std::move(prepared_body.value().bytes);
             st->on_complete = std::move(on_complete);
 
             // Track in-flight so shutdown() can retire this request (S2.6-02/04).
@@ -1954,6 +2007,12 @@ namespace megohttp {
                 if (redirect_detail::becomes_get(status, s->request.method())) {
                     next_req.set_method(Method::Get);
                     next_req.clear_body();
+                    // The redirect dropped the body, so the encoded copy and
+                    // its coding go with it. Leaving either behind would put a
+                    // Content-Encoding on a request that carries no body.
+                    next_req.set_compress_body(Request::Compression::None);
+                    s->wire_coding = Request::Compression::None;
+                    s->encoded_body.clear();
                 } else if (redirect_detail::preserves_body(status)) {
                     // 307/308 keep the body, which requires it to be replayable:
                     // a BodySource that has already been consumed cannot be re-sent,
@@ -2246,7 +2305,7 @@ namespace megohttp {
             // testing that alone made Expect never fire for a streamed upload.
             const bool body_carries_bytes =
                 st->request.body_source().has_value() ||
-                !st->request.body_bytes().empty();
+                !st->wire_body().empty();
             st->expect_continue_sent = st->options.expect_continue
                                     && st->request.has_body()
                                     && body_carries_bytes;
@@ -2258,7 +2317,9 @@ namespace megohttp {
             auto head = detail::build_request_head(st->request, url,
                                                    st->expect_continue_sent,
                                                    st->pool != nullptr, forward_proxy,
-                                                   st->proxy);
+                                                   st->proxy,
+                                                   st->wire_coding,
+                                                   st->wire_body().size());
             if (!head) { st->finish(head.error()); return; }
             // Whether the body must be chunk-framed. Same three-case decision the
             // head builder made; recorded on the state so the sender wraps each

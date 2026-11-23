@@ -342,24 +342,40 @@ endif()
 #
 # To populate deps/brotli-1.1.0/build_msvc:
 #   cmake -S deps/brotli-1.1.0 -B deps/brotli-1.1.0/build_msvc \
-#         -G "Visual Studio 17 2022" -A x64 \
-#         -DBROTLI_DISABLE_TESTS=ON -DBROTLI_BUILD_ENCODER=OFF
+#         -G "Visual Studio 17 2022" -A x64
 #   cmake --build deps/brotli-1.1.0/build_msvc --config Release
+#
+# The prebuilt tree contains brotlidec.lib, brotlienc.lib and brotlicommon.lib.
+# The encoder is optional: request body compression reports
+# ContentEncodingUnsupported when only the decoder was built.
+set(MGHTTP_BROTLI_ENCODER_AVAILABLE OFF)
+set(MGHTTP_BROTLI_ENCODER_TARGET "")
+set(MGHTTP_BROTLI_AVAILABLE OFF)
 if(MGHTTP_ENABLE_BROTLI)
     find_package(Brotli QUIET)
     if(BROTLI_FOUND AND TARGET Brotli::Decoder)
         set(MGHTTP_BROTLI_AVAILABLE ON)
         message(STATUS "brotli: system package")
+        if(TARGET Brotli::Encoder)
+            set(MGHTTP_BROTLI_ENCODER_TARGET Brotli::Encoder)
+        elseif(TARGET Brotli::brotlienc)
+            set(MGHTTP_BROTLI_ENCODER_TARGET Brotli::brotlienc)
+        endif()
+        if(MGHTTP_BROTLI_ENCODER_TARGET)
+            set(MGHTTP_BROTLI_ENCODER_AVAILABLE ON)
+        endif()
     else()
         set(BROTLI_ROOT "${MGHTTP_DEPS_DIR}/brotli-1.1.0")
         if(MSVC)
             set(BROTLI_DIR "${BROTLI_ROOT}/${MGHTTP_DEP_BUILD}/Release")
             set(BROTLI_LIB "${BROTLI_DIR}/brotlidec.lib")
             set(BROTLI_COMMON "${BROTLI_DIR}/brotlicommon.lib")
+            set(BROTLI_ENC "${BROTLI_DIR}/brotlienc.lib")
         else()
             set(BROTLI_DIR "${BROTLI_ROOT}/${MGHTTP_DEP_BUILD}")
             set(BROTLI_LIB "${BROTLI_DIR}/libbrotlidec.a")
             set(BROTLI_COMMON "${BROTLI_DIR}/libbrotlicommon.a")
+            set(BROTLI_ENC "${BROTLI_DIR}/libbrotlienc.a")
         endif()
         if(EXISTS "${BROTLI_LIB}")
             add_library(mghttp_brotli STATIC IMPORTED GLOBAL)
@@ -371,6 +387,20 @@ if(MGHTTP_ENABLE_BROTLI)
             add_library(Brotli::Decoder ALIAS mghttp_brotli)
             set(MGHTTP_BROTLI_AVAILABLE ON)
             message(STATUS "brotli: in-tree ${BROTLI_LIB}")
+            if(EXISTS "${BROTLI_ENC}")
+                add_library(mghttp_brotli_enc STATIC IMPORTED GLOBAL)
+                set_target_properties(mghttp_brotli_enc PROPERTIES
+                    IMPORTED_LOCATION "${BROTLI_ENC}"
+                    INTERFACE_LINK_LIBRARIES "${BROTLI_COMMON}"
+                    INTERFACE_INCLUDE_DIRECTORIES
+                        "$<BUILD_INTERFACE:${BROTLI_ROOT}/c/include>")
+                set(MGHTTP_BROTLI_ENCODER_TARGET mghttp_brotli_enc)
+                set(MGHTTP_BROTLI_ENCODER_AVAILABLE ON)
+                message(STATUS "brotli encoder: in-tree ${BROTLI_ENC}")
+            else()
+                message(STATUS "brotli encoder not found; request body compression "
+                               "will report ContentEncodingUnsupported for br")
+            endif()
         else()
             set(MGHTTP_BROTLI_AVAILABLE OFF)
             message(STATUS "brotli not available; MGHTTP_ENABLE_BROTLI is ON but "
@@ -378,8 +408,6 @@ if(MGHTTP_ENABLE_BROTLI)
                            "report ContentEncodingUnsupported.")
         endif()
     endif()
-else()
-    set(MGHTTP_BROTLI_AVAILABLE OFF)
 endif()
 
 # Create interface target
@@ -456,6 +484,13 @@ endif()
 
 if(MGHTTP_ENABLE_BROTLI AND MGHTTP_BROTLI_AVAILABLE)
     target_compile_definitions(megohttp INTERFACE MGHTTP_ENABLE_BROTLI=1)
+endif()
+
+# Separate from MGHTTP_ENABLE_BROTLI: decoding only needs brotlidec, while
+# request body compression needs brotlienc. Defining this without the library
+# would make config.hpp advertise a coding that cannot be produced.
+if(MGHTTP_ENABLE_BROTLI AND MGHTTP_BROTLI_AVAILABLE AND MGHTTP_BROTLI_ENCODER_AVAILABLE)
+    target_compile_definitions(megohttp INTERFACE MGHTTP_HAVE_BROTLI_ENCODER=1)
 endif()
 
 if(MGHTTP_ENABLE_SSE)
@@ -680,7 +715,18 @@ if((MGHTTP_ENABLE_GZIP OR MGHTTP_ENABLE_WEBSOCKET_DEFLATE) AND MGHTTP_ZLIB_AVAIL
 endif()
 
 if(MGHTTP_ENABLE_BROTLI AND MGHTTP_BROTLI_AVAILABLE AND TARGET Brotli::Decoder)
-    target_link_libraries(megohttp INTERFACE Brotli::Decoder)
+    # BUILD_INTERFACE only: the imported target exists in this build tree, but
+    # install(EXPORT) would otherwise write "Brotli::Decoder" / mghttp_brotli*
+    # into the installed interface, where the consumer has no such target and
+    # find_package fails at generate time. The installed package therefore does
+    # not link brotli; a consumer that uses coding must link it itself (same
+    # non-hermetic policy as zlib, libuv and fmt).
+    target_link_libraries(megohttp INTERFACE $<BUILD_INTERFACE:Brotli::Decoder>)
+endif()
+
+if(MGHTTP_ENABLE_BROTLI AND MGHTTP_BROTLI_ENCODER_AVAILABLE AND MGHTTP_BROTLI_ENCODER_TARGET)
+    target_link_libraries(megohttp INTERFACE
+        $<BUILD_INTERFACE:${MGHTTP_BROTLI_ENCODER_TARGET}>)
 endif()
 
 # Tests

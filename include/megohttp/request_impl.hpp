@@ -34,8 +34,9 @@ namespace megohttp {
         std::optional<Request::SseCallback> sse_callback;
         SseParser::Limits sse_limits;
 #endif
-        // Content coding. Upload compression is opt-in; response decoding is on
-        // by default because Accept-Encoding is sent by this library.
+        // Content coding. Upload compression is opt-in and implemented for
+        // buffered bodies in content_encoder.hpp; response decoding is on by
+        // default because Accept-Encoding is sent by this library.
         Request::Compression compress{Request::Compression::None};
         bool decode_response{true};
     };

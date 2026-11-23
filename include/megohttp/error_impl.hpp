@@ -66,6 +66,7 @@ namespace megohttp {
             { ErrorCode::ContentDecodingFailed,   "ContentDecodingFailed" },
             { ErrorCode::ContentEncodingUnsupported, "ContentEncodingUnsupported" },
             { ErrorCode::ContentDecodingResourceExceeded, "ContentDecodingResourceExceeded" },
+            { ErrorCode::ContentEncodingFailed,   "ContentEncodingFailed" },
 
             { ErrorCode::TimeoutResolve,          "TimeoutResolve" },
             { ErrorCode::TimeoutConnect,          "TimeoutConnect" },

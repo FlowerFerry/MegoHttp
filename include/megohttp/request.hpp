@@ -167,11 +167,30 @@ namespace megohttp {
         // Request body compression. OFF by default: compressing an upload
         // spends CPU the caller never asked for, and a server that does not
         // understand the coding answers 415.
+        //
+        // Current implementation (task book 7.3):
+        //   - a buffered body (set_body) is encoded once at submission; the
+        //     request carries Content-Encoding and Content-Length describes the
+        //     ENCODED bytes. Redirects/retries reuse the same encoded buffer.
+        //   - a BodySource is rejected with NotImplemented: streaming
+        //     compression is not implemented, and sending plaintext under a
+        //     Content-Encoding header would be worse than failing.
+        //   - no body, or an explicitly empty buffered body, is left untouched
+        //     (there is nothing to encode; a zero-length body keeps its normal
+        //     framing).
+        //   - a caller-supplied Content-Encoding / Content-Length /
+        //     Transfer-Encoding combined with compression is rejected with
+        //     InvalidArgument, because the head would contradict the body.
+        //   - a coding this build cannot produce (gzip disabled, brotli encoder
+        //     missing) is rejected with ContentEncodingUnsupported.
+        // Encoding runs on the submitting thread, before the request is
+        // accepted; a failure is therefore a synchronous rejection (the same
+        // documented exception as invalid options).
         enum class Compression {
             None,       // no Content-Encoding (default)
-            Gzip,       // Content-Encoding: gzip
-            Deflate,    // Content-Encoding: deflate (zlib wrapper)
-            Brotli,     // Content-Encoding: br
+            Gzip,       // Content-Encoding: gzip (RFC 1952)
+            Deflate,    // Content-Encoding: deflate (RFC 1950 zlib wrapper)
+            Brotli,     // Content-Encoding: br (RFC 7932)
         };
         void set_compress_body(Compression coding);
         Compression compress_body() const noexcept;
