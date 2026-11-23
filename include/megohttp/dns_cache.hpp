@@ -85,14 +85,16 @@ namespace megohttp {
 
         static std::string key(const string& host, uint16_t port, uint16_t qtype);
 
-        // Record `k` as most recently used and evict the oldest entries when the
-        // cache is over its limit. Caller holds the exclusive lock.
+        // Append `k` to the eviction order and drop the oldest entries when the
+        // cache is over its limit. This is insertion order, NOT LRU: get() takes
+        // a read lock and does not reorder, so a hot entry can still be evicted.
+        // Caller holds the exclusive lock.
         void touch_locked(const std::string& k);
 
         DnsCacheOptions options_;
         mutable std::shared_mutex mutex_;
         std::unordered_map<std::string, Entry> entries_;
-        // Insertion order for LRU eviction when max_entries is hit.
+        // Eviction order (FIFO) for when max_entries is hit. Hits do not reorder.
         std::deque<std::string> order_;
     };
 

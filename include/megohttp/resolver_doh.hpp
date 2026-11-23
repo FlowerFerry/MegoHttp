@@ -97,8 +97,10 @@ namespace megohttp {
 
     // DNS over HTTPS resolver.
     //
-    // Each DoH request is an independent HTTP/1.1 request. HTTP keep-alive
-    // is used when possible via the underlying connection pool.
+    // Each DoH request is an independent HTTP/1.1 request, deliberately NOT
+    // pooled: one connection per query, closed afterwards. A pooled keep-alive
+    // connection to a DoH endpoint only adds a stale-socket failure mode and
+    // buys nothing for short DNS exchanges.
     //
     // DoH queries do not share message IDs like DoT; each HTTP request/response
     // pair is self-contained. The resolver serializes the query into the HTTP

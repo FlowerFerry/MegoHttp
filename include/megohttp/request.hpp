@@ -75,9 +75,9 @@ namespace megohttp {
         bool has_body() const noexcept;
         void clear_body();
 
-        // Only a byte body is replayable. A BodySource is replayable iff it
-        // reports is_resettable(); a streamed body is never assumed replayable,
-        // which is what keeps redirect/retry from silently re-sending it.
+        // Only a byte body is replayable. There is no resettable-stream
+        // interface, so a streamed body is never replayable -- that is what
+        // keeps redirect/retry from silently re-sending it.
         bool is_body_replayable() const noexcept;
 
         // Body bytes when the body is a byte buffer; empty otherwise.

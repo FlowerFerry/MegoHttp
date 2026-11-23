@@ -126,9 +126,10 @@ namespace megohttp {
                               bool compressed);
 
         // Negotiated permessage-deflate parameters for the CURRENT physical
-        // connection. valid == false when the extension was not accepted, and
-        // false again once the connection ends (the parameters belong to that
-        // connection, not to the session).
+        // connection. `enabled == false` means the extension was not accepted
+        // (keep working uncompressed). There is no separate "valid" flag: the
+        // value belongs to this connection and is replaced on the next
+        // handshake, because a reconnect renegotiates from scratch.
         DeflateNegotiated negotiated_deflate() const { return deflate_negotiated_; }
 
     private:

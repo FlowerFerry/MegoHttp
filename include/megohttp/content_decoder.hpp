@@ -71,8 +71,9 @@ namespace megohttp {
     // exposes a single feed/flush interface.
     //
     // Construction order = decode order = reverse of the Content-Encoding header.
-    // E.g. "Content-Encoding: gzip, br" means the server compressed with br
-    // first, then gzip. So the chain is [gzip decoder, br decoder].
+    // "Content-Encoding: gzip, br" means the data was original -> gzip -> br,
+    // so decoding runs br first and then gzip: the wire-facing decoder
+    // (decoders_.front()) is br, and its output feeds gzip.
     class ContentDecoderChain final : public ContentDecoder {
     public:
         using OutputCallback = std::function<bool(const uint8_t* data, size_t size)>;

@@ -132,12 +132,15 @@
 // Feature Dependencies
 // ============================================================================
 
-// DoT/DoH requires TLS
-#if defined(MGHTTP_ENABLE_DOT) && MGHTTP_ENABLE_DOT && defined(MGHTTP_TLS_NONE)
+// DoT/DoH requires TLS. Checked numerically: MGHTTP_TLS_NONE=0 must mean "off",
+// exactly like the rest of the feature macros (see the 0/1 section below).
+#if defined(MGHTTP_ENABLE_DOT) && MGHTTP_ENABLE_DOT && \
+    defined(MGHTTP_TLS_NONE) && MGHTTP_TLS_NONE
 #   error "DoT requires TLS (MGHTTP_TLS_NONE cannot be used with MGHTTP_ENABLE_DOT)"
 #endif
 
-#if defined(MGHTTP_ENABLE_DOH) && MGHTTP_ENABLE_DOH && defined(MGHTTP_TLS_NONE)
+#if defined(MGHTTP_ENABLE_DOH) && MGHTTP_ENABLE_DOH && \
+    defined(MGHTTP_TLS_NONE) && MGHTTP_TLS_NONE
 #   error "DoH requires TLS (MGHTTP_TLS_NONE cannot be used with MGHTTP_ENABLE_DOH)"
 #endif
 
@@ -216,8 +219,11 @@
 #if defined(MGHTTP_ENABLE_WEBSOCKET_DEFLATE) && MGHTTP_ENABLE_WEBSOCKET_DEFLATE != 0 \
     && MEGOHTTP_HAS_ZLIB
 #   define MEGOHTTP_HAS_WEBSOCKET_DEFLATE 1
-#elif !defined(MGHTTP_ENABLE_WEBSOCKET_DEFLATE)
-#   define MEGOHTTP_HAS_WEBSOCKET_DEFLATE 0
+// Not configured explicitly: follow WebSocket (task book 3.16), but only when
+// zlib is actually available to implement it.
+#elif !defined(MGHTTP_ENABLE_WEBSOCKET_DEFLATE) && MEGOHTTP_HAS_WEBSOCKET \
+    && MEGOHTTP_HAS_ZLIB
+#   define MEGOHTTP_HAS_WEBSOCKET_DEFLATE 1
 #else
 #   define MEGOHTTP_HAS_WEBSOCKET_DEFLATE 0
 #endif

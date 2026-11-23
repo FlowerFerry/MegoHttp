@@ -468,6 +468,11 @@ endif()
 
 if(MGHTTP_ENABLE_WEBSOCKET_DEFLATE)
     target_compile_definitions(megohttp INTERFACE MGHTTP_ENABLE_WEBSOCKET_DEFLATE=1)
+else()
+    # Explicit 0, not omitted: config.hpp treats "not configured" as "follow
+    # MGHTTP_ENABLE_WEBSOCKET" (task book 3.16), so omitting it would silently
+    # re-enable the feature the caller turned off.
+    target_compile_definitions(megohttp INTERFACE MGHTTP_ENABLE_WEBSOCKET_DEFLATE=0)
 endif()
 
 # zlib is a LIBRARY fact, not a per-feature one: both gzip and permessage-deflate

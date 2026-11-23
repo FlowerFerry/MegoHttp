@@ -1,3 +1,35 @@
 build/
 build_*/
 deps/
+
+# Ad-hoc local scripts, probes and their output that accumulate in the repo root.
+/_tmp_*/
+/_*.bat
+/_*.py
+/_*.log
+/*.log
+/*.txt
+/*.exe
+/*.obj
+
+# Runtime DLLs copied next to binaries by local runs (OpenSSL / MemeString).
+/libssl-*.dll
+/libcrypto-*.dll
+/libmeme_string.dll
+
+# Extra root scratch that does not start with an underscore.
+/*.bat
+/_scratch/
+/scratch/
+/_*.cpp
+/_*.json
+/_*.tmp
+/include/**/.hermes-tmp.*
+
+# Test-run artefacts (regenerated on every run; tls_fixtures contains keys).
+/tests/tls_fixtures/
+/tests/mgproxy_*.json
+/tests/mgproxy_*.json.tmp
+/tests/*.exe
+/tests/dot_cache_count.txt
+/tests/consumer/bld.txt
