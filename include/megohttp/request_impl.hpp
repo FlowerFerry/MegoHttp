@@ -20,6 +20,8 @@ namespace megohttp {
         std::optional<Request::BodySink> body_sink;
         std::optional<Request::BodySinkComplete> body_sink_complete;
         std::shared_ptr<Request::BodySinkFlow> body_sink_flow;
+        // S1.7-05: final response head delivered before the body completes.
+        std::optional<Request::HeadCallback> head_callback;
         // S5.7-01: multipart response parser attached to this request. Null
         // means the body is delivered raw (buffer or BodySink).
         std::shared_ptr<MultipartSink> multipart_sink;
@@ -238,6 +240,14 @@ namespace megohttp {
 
     inline const std::shared_ptr<Request::BodySinkFlow>& Request::body_sink_flow() const noexcept {
         return impl_->body_sink_flow;
+    }
+
+    inline void Request::set_head_callback(HeadCallback cb) {
+        impl_->head_callback = std::move(cb);
+    }
+
+    inline const std::optional<Request::HeadCallback>& Request::head_callback() const noexcept {
+        return impl_->head_callback;
     }
 
 #if MEGOHTTP_HAS_SSE

@@ -6,6 +6,7 @@
 #include <megohttp/headers.hpp>
 #include <megohttp/http.hpp>
 #include <megohttp/multipart_sink.hpp>
+#include <megohttp/response.hpp>
 #if MEGOHTTP_HAS_SSE
 #include <megohttp/sse.hpp>
 #endif
@@ -124,6 +125,33 @@ namespace megohttp {
         const std::optional<BodySink>& body_sink() const noexcept;
         const std::optional<BodySinkComplete>& body_sink_complete() const noexcept;
         const std::shared_ptr<BodySinkFlow>& body_sink_flow() const noexcept;
+
+        // --- Response head callback (S1.7-05; task book 6.4 / 7.1) ---
+        // Invoked on the I/O execution context as soon as the FINAL response
+        // head is complete, before any body byte reaches a BodySink,
+        // MultipartSink or SSE parser, and before the terminal callback. This
+        // is what lets a streaming caller inspect status / Content-Type /
+        // Content-Length and decide whether the body is worth consuming.
+        //
+        // Contract:
+        //   - once per attempt that produces a final head; zero times when the
+        //     request fails before one (DNS, connect, TLS, proxy, cancel);
+        //   - not called for informational 1xx responses (their codes are in
+        //     ResponseHead::informational_status_codes). 101 is a final
+        //     protocol-switch head and DOES call it;
+        //   - not called for a 3xx that this Client follows; a 3xx that is NOT
+        //     followed is a final response and DOES call it;
+        //   - with retries enabled it can fire once per attempt (e.g. 503 then
+        //     200); the terminal callback still fires exactly once;
+        //   - ResponseHead::trailers is empty here: trailers arrive after the
+        //     body. Copy the head if you need to keep it; the reference is valid
+        //     only for the duration of the call;
+        //   - a callback that throws terminates the request with
+        //     ErrorCode::Unknown (ErrorPhase::Receive), the same policy as a
+        //     throwing BodySink.
+        using HeadCallback = std::function<void(const ResponseHead&)>;
+        void set_head_callback(HeadCallback cb);
+        const std::optional<HeadCallback>& head_callback() const noexcept;
 
         // Pause/resume handle for a streaming multipart download. Same state
         // machine as BodySinkFlow -- an alias rather than a second class, because

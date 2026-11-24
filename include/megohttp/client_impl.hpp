@@ -769,6 +769,24 @@ namespace megohttp {
                 }
                 rh.informational_status_codes = head.informational;
 
+                // Response head callback (S1.7-05; task book 6.4 / 7.1). This is
+                // the earliest point at which the FINAL head is complete, and it
+                // is before any consumer is chosen, so no body byte can have
+                // reached a sink/parser yet. Redirects the caller asked to
+                // follow returned above; 1xx went through on_informational().
+                //
+                // A throwing callback fails the request with Unknown/Receive and
+                // no body is delivered, matching the BodySink policy.
+                if (auto& head_cb = state_->request.head_callback();
+                    head_cb.has_value() && *head_cb) {
+                    try {
+                        (*head_cb)(rh);
+                    } catch (...) {
+                        return Error{ErrorCode::Unknown, ErrorPhase::Receive,
+                                     string("response head callback threw")};
+                    }
+                }
+
                 // S3.2-02: Choose buffered or streaming mode based on request.
                 //
                 // Three consumers exist and exactly one is chosen:
