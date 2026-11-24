@@ -85,6 +85,143 @@ namespace megohttp {
             uint64_t cap_{0};
         };
 
+        // ------------------------------------------------------------------
+        // Request trailers (S3.1-11).
+        //
+        // The declaration (the `Trailer` header) is built at submission from the
+        // static fields and the caller's own Trailer header. A dynamic source
+        // does not run until EOF, so its names must be announced up front; an
+        // undeclared dynamic field is rejected rather than silently sent.
+        // ------------------------------------------------------------------
+        struct PreparedTrailers {
+            Headers fields;
+            std::optional<Request::TrailerSource> source;
+            std::vector<string> declared;
+            string declaration;
+        };
+
+        inline void add_declared_name(std::vector<string>& names, string_view name) {
+            for (const auto& n : names) {
+                if (ascii_iequals(to_view(n), name)) return;
+            }
+            names.push_back(to_string(name));
+        }
+
+        inline string join_trailer_names(const std::vector<string>& names) {
+            string_builder b;
+            bool first = true;
+            for (const auto& n : names) {
+                if (!first) sb_append(b, ", ");
+                sb_append(b, to_view(n));
+                first = false;
+            }
+            return b.release();
+        }
+
+        // Validates field syntax, the RFC 7230 forbidden list, declared-name
+        // membership (when required) and the configured count/byte limits.
+        inline VoidResult validate_request_trailers(
+                const Headers& fields,
+                const std::vector<string>& declared,
+                const ClientOptions& options,
+                bool require_declared) {
+            size_t count = declared.size();
+            size_t bytes = 0;
+            for (const auto& n : declared) {
+                if (chunked::is_forbidden_trailer_name(to_view(n))) {
+                    return Error{ErrorCode::InvalidArgument, ErrorPhase::Send,
+                                 string("field is forbidden in a request trailer")};
+                }
+                bytes += n.size() + 2;
+            }
+
+            for (const auto& f : fields) {
+                const string_view name = to_view(f.first);
+                const string_view value = to_view(f.second);
+                if (!is_valid_header_name(name)) {
+                    return Error{ErrorCode::InvalidArgument, ErrorPhase::Send,
+                                 string("invalid request trailer field name")};
+                }
+                if (!is_valid_header_value(value)) {
+                    return Error{ErrorCode::InvalidArgument, ErrorPhase::Send,
+                                 string("request trailer value contains CR/LF/NUL")};
+                }
+                if (chunked::is_forbidden_trailer_name(name)) {
+                    return Error{ErrorCode::InvalidArgument, ErrorPhase::Send,
+                                 string("field is forbidden in a request trailer")};
+                }
+                if (require_declared) {
+                    bool announced = false;
+                    for (const auto& n : declared) {
+                        if (ascii_iequals(to_view(n), name)) {
+                            announced = true;
+                            break;
+                        }
+                    }
+                    if (!announced) {
+                        return Error{ErrorCode::InvalidArgument, ErrorPhase::Send,
+                                     string("trailer field was not declared in the Trailer header")};
+                    }
+                }
+                ++count;
+                bytes += name.size() + 2 + value.size() + 2;
+            }
+
+            if (options.max_request_trailer_count != 0 &&
+                count > options.max_request_trailer_count) {
+                return Error{ErrorCode::InvalidArgument, ErrorPhase::Send,
+                             string("too many request trailer fields")};
+            }
+            if (options.max_request_trailer_bytes != 0 &&
+                bytes > options.max_request_trailer_bytes) {
+                return Error{ErrorCode::InvalidArgument, ErrorPhase::Send,
+                             string("request trailer bytes exceed the configured limit")};
+            }
+            return VoidResult{};
+        }
+
+        inline Result<PreparedTrailers> prepare_request_trailers(
+                const Request& request, const ClientOptions& options) {
+            PreparedTrailers prepared;
+            prepared.fields = request.trailers();
+            prepared.source = request.trailer_source();
+
+            const bool has_source =
+                prepared.source.has_value() && *prepared.source;
+            const bool has_static = !prepared.fields.empty();
+            const bool has_declaration = request.headers().contains("trailer");
+            if (!has_source && !has_static && !has_declaration) return prepared;
+
+            // A trailer lives in the chunked terminating block. A Content-Length
+            // body has no such block, and a caller-supplied framing header opts
+            // out of the library's chunked sender.
+            if (!request.has_body() || !request.body_source().has_value()) {
+                return Error{ErrorCode::InvalidArgument, ErrorPhase::Send,
+                             string("request trailers require a BodySource (chunked body)")};
+            }
+            if (request.headers().contains("content-length") ||
+                request.headers().contains("transfer-encoding")) {
+                return Error{ErrorCode::InvalidArgument, ErrorPhase::Send,
+                             string("request trailers conflict with caller-supplied framing headers")};
+            }
+
+            // Declared = caller Trailer header ∪ static field names.
+            if (auto raw = request.headers().get("trailer")) {
+                auto parsed = chunked::parse_trailer_names(*raw);
+                if (!parsed) return parsed.error();
+                prepared.declared = std::move(parsed.value());
+            }
+            for (const auto& f : prepared.fields) {
+                add_declared_name(prepared.declared, to_view(f.first));
+            }
+            prepared.declaration = join_trailer_names(prepared.declared);
+
+            auto valid = validate_request_trailers(
+                prepared.fields, prepared.declared, options, false);
+            if (!valid) return valid.error();
+            return prepared;
+        }
+
         // Per-request state. Self-holding: the request owns it from submission
         // until the terminal callback runs, so a caller that drops the cancel
         // handle does not abort anything.
@@ -163,6 +300,15 @@ namespace megohttp {
             // True when the request body is sent chunk-framed (a BodySource with
             // no caller-supplied framing header). The sender wraps every piece.
             bool body_chunked{false};
+
+            // S3.1-11: request trailers. Static fields are validated at
+            // submission; the dynamic source runs once at EOF. `declared` is the
+            // union announced in the Trailer header and is what an emitted field
+            // must match.
+            Headers request_trailers;
+            std::optional<Request::TrailerSource> trailer_source;
+            std::vector<string> declared_trailer_names;
+            string trailer_declaration;
 
             // Request body compression (task book 7.3). The body is encoded
             // ONCE in submit(), before the state is registered, so every retry
@@ -635,6 +781,10 @@ namespace megohttp {
             // Emits the chunked terminator (when chunk-framed) and moves on to
             // reading the response.
             void finish_body_streaming() {
+                // A late write callback can arrive after cancellation or a
+                // terminal error. Never run the trailer source (a user callback)
+                // or start a read after the terminal notification has fired.
+                if (state_->finished.load()) return;
                 if (!state_->body_chunked) {
                     disarm_send_timer();
                     arm_recv_timer();
@@ -643,7 +793,41 @@ namespace megohttp {
                 }
                 auto self = shared_from_this();
                 auto stream = state_->stream;
-                auto tail = chunked::encode_last_chunk(nullptr);
+
+                // Request trailers (S3.1-11): static fields were validated at
+                // submission; the dynamic source runs here, exactly once, after
+                // the last body byte. Its fields must have been declared up
+                // front, and a failure means no terminating chunk is sent --
+                // better a broken request than a trailer that does not describe
+                // the body.
+                Headers trailer_fields = state_->request_trailers;
+                if (state_->trailer_source && *state_->trailer_source) {
+                    Result<Headers> extra = Error{
+                        ErrorCode::Unknown, ErrorPhase::Send,
+                        string("request trailer source produced no result")};
+                    try {
+                        extra = (*state_->trailer_source)();
+                    } catch (...) {
+                        fail(Error{ErrorCode::Unknown, ErrorPhase::Send,
+                                   string("request trailer source threw an exception")});
+                        return;
+                    }
+                    if (!extra) {
+                        fail(Error{extra.error().code(), ErrorPhase::Send,
+                                   extra.error().message()});
+                        return;
+                    }
+                    for (const auto& f : extra.value()) {
+                        trailer_fields.add(to_view(f.first), to_view(f.second));
+                    }
+                }
+                auto trailers_ok = detail::validate_request_trailers(
+                    trailer_fields, state_->declared_trailer_names,
+                    state_->options, true);
+                if (!trailers_ok) { fail(trailers_ok.error()); return; }
+
+                auto tail = chunked::encode_last_chunk(
+                    trailer_fields.empty() ? nullptr : &trailer_fields);
                 if (!tail) { fail(tail.error()); return; }
                 auto last = std::make_shared<string>(std::move(tail.value()));
                 stream->async_write(
@@ -1352,6 +1536,13 @@ namespace megohttp {
                 // would deliver them before the caller asked for them.
                 if (sink_paused_) return;
                 if (multipart_paused_) return;
+                // The transport allows exactly one outstanding read. The
+                // Expect: 100-continue path can reach here after on_informational
+                // has already started the body send, and finish_body_streaming
+                // asks for a read again when the terminating chunk is written;
+                // without this guard the second async_read_some is rejected with
+                // "another read is already outstanding".
+                if (reading_) return;
                 // Replay the tail the parser could not consume last time before
                 // reading anything new. Without this the CRLF and any following
                 // chunk that shared the same socket read were dropped.
@@ -1370,8 +1561,10 @@ namespace megohttp {
                 }
                 auto self = shared_from_this();
                 auto stream = state_->stream;
+                reading_ = true;
                 stream->async_read_some(
                     [self](Result<string_view> r) {
+                        self->reading_ = false;
                         if (!r) { self->fail(r.error()); return; }
 
                         const string_view sv = r.value();
@@ -1495,6 +1688,10 @@ namespace megohttp {
             // ever resume it), so delivery continues as before.
             std::shared_ptr<Request::BodySinkFlow> sink_flow_;
             bool sink_paused_{false};
+            // True while an async_read_some is outstanding. The transport
+            // contract allows exactly one; read_more() is reachable from both the
+            // 100-continue body path and the chunked terminator write.
+            bool reading_{false};
             // Bytes a paused feed() could not consume. The stream's read view is
             // only valid for that callback, so the tail is copied here and
             // replayed on resume.
@@ -1599,7 +1796,8 @@ namespace megohttp {
                                                  bool forward_proxy,
                                                  const ProxyConfig& proxy,
                                                  Request::Compression wire_coding,
-                                                 size_t wire_body_size) {
+                                                 size_t wire_body_size,
+                                                 string_view trailer_declaration) {
             Headers headers = req.headers();
 
             // Proxy credentials belong to the proxy hop and to nothing else.
@@ -1635,6 +1833,14 @@ namespace megohttp {
                 // (a server that sees "close" hands out no second exchange,
                 // which is exactly what makes the no-pool path safe).
                 headers.set("connection", pooling ? "keep-alive" : "close");
+            }
+            // Request trailer declaration (S3.1-11). The names were validated at
+            // submission and merged with any caller-supplied Trailer header; it
+            // is only meaningful for a chunked body, so a redirect that dropped
+            // the body cannot leave a stale declaration behind.
+            if (!trailer_declaration.empty() && req.has_body() &&
+                req.body_source().has_value()) {
+                headers.set("trailer", trailer_declaration);
             }
             // Body framing. Three distinct cases, and conflating them is how a
             // request ends up lying about its own shape:
@@ -1885,6 +2091,16 @@ namespace megohttp {
                 return;
             }
 
+            // Request trailers (S3.1-11). Same rule: validate before the state
+            // is registered, and reject synchronously on a bad configuration.
+            auto prepared_trailers =
+                detail::prepare_request_trailers(req, st->options);
+            if (!prepared_trailers) {
+                st->self_hold.reset();
+                if (on_complete) on_complete(prepared_trailers.error());
+                return;
+            }
+
             // Redirect budget (S5.2). Only counts when the caller opted in;
             // with the policy off the counter stays 0 and nothing follows.
             st->hops_left = st->options.redirects.follow
@@ -1892,6 +2108,10 @@ namespace megohttp {
             st->request = req;
             st->wire_coding = prepared_body.value().coding;
             st->encoded_body = std::move(prepared_body.value().bytes);
+            st->request_trailers = std::move(prepared_trailers.value().fields);
+            st->trailer_source = std::move(prepared_trailers.value().source);
+            st->declared_trailer_names = std::move(prepared_trailers.value().declared);
+            st->trailer_declaration = std::move(prepared_trailers.value().declaration);
             st->on_complete = std::move(on_complete);
 
             // Track in-flight so shutdown() can retire this request (S2.6-02/04).
@@ -2337,7 +2557,8 @@ namespace megohttp {
                                                    st->pool != nullptr, forward_proxy,
                                                    st->proxy,
                                                    st->wire_coding,
-                                                   st->wire_body().size());
+                                                   st->wire_body().size(),
+                                                   to_view(st->trailer_declaration));
             if (!head) { st->finish(head.error()); return; }
             // Whether the body must be chunk-framed. Same three-case decision the
             // head builder made; recorded on the state so the sender wraps each

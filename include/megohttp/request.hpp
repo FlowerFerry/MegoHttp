@@ -87,6 +87,30 @@ namespace megohttp {
         // Body source for streaming upload; nullopt if using buffer mode.
         const std::optional<BodySource>& body_source() const noexcept;
 
+        // --- Request trailers (S3.1-11; task book 7 "trailer 的读取及受控发送") ---
+        // Sent in the terminating chunk of a CHUNKED request body. A buffered
+        // body is Content-Length framed, where trailers cannot be sent, so
+        // setting a trailer without a BodySource is rejected at submission.
+        // OFF by default.
+        //
+        // Static trailers are known at submission. A TrailerSource runs at EOF
+        // on the I/O thread for values computed over the body (checksums,
+        // signatures); both may be set and the source's fields are appended
+        // after the static ones.
+        //
+        // Every emitted name must be declared, either by a static trailer or by
+        // the caller's `Trailer` header. The library merges those into the
+        // declaration it sends and rejects an undeclared dynamic name at EOF.
+        // Fields RFC 7230 forbids in a trailer (Content-Length,
+        // Transfer-Encoding, Host, Trailer, ...) are rejected. Declared names
+        // and emitted fields are bounded by
+        // ClientOptions::max_request_trailer_count / _bytes.
+        using TrailerSource = std::function<Result<Headers>()>;
+        void set_trailers(Headers trailers);
+        const Headers& trailers() const noexcept;
+        void set_trailer_source(TrailerSource src);
+        const std::optional<TrailerSource>& trailer_source() const noexcept;
+
         // Body sink for streaming download; nullopt if using buffer mode (default).
         // When set, body_bytes() will be empty and body_is_buffered() false.
         //

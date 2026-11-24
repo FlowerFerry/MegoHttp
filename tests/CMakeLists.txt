@@ -33,6 +33,7 @@ set(MGHTTP_TEST_SOURCES
     test_content_encoder.cpp
     test_request_compression.cpp
     test_head_callback.cpp
+    test_request_trailers.cpp
     test_fuzz_parsers.cpp
     test_tls_stream.cpp
     test_client_tls.cpp

@@ -185,6 +185,16 @@ namespace megohttp {
         // Parsed chunk size line: hex digits with optional ;ext
         Result<uint64_t> parse_chunk_size(string_view line);
 
+        // Parses a `Trailer` header value into distinct field names. Each name
+        // must be a valid HTTP field-name; empty list elements are ignored and
+        // duplicates are collapsed case-insensitively.
+        Result<std::vector<string>> parse_trailer_names(string_view value);
+
+        // True for fields RFC 7230 4.1.2 forbids in a trailer: message framing,
+        // routing, authentication, response control and payload processing.
+        // Sending one of these in a trailer can desynchronise the message.
+        bool is_forbidden_trailer_name(string_view name) noexcept;
+
     } // namespace chunked
 
     // ---------------------------------------------------------------------------

@@ -81,6 +81,12 @@ namespace megohttp {
         // things, and only the last one is bounded by max_response_body.
         DecoderLimits decoder_limits{};
 
+        // Request trailer limits (S3.1-11). Counted over the declared names in
+        // the `Trailer` header AND the emitted trailer fields together, so a
+        // source cannot grow the terminator without bound. 0 = unlimited.
+        size_t max_request_trailer_count{32};
+        size_t max_request_trailer_bytes{8 * 1024};
+
         // Connection pool (phase 5, task book 8.1). Defaults reproduce the
         // pre-phase-5 behaviour exactly: no limits and no queueing, so every
         // request opens its own connection. Turning the limits on is what makes

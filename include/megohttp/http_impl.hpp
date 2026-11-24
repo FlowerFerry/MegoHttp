@@ -266,6 +266,46 @@ namespace megohttp {
             return detail::sb_release(buf);
         }
 
+        inline Result<std::vector<string>> parse_trailer_names(string_view value) {
+            std::vector<string> names;
+            for (string_view raw : http_detail::split_list(value)) {
+                const string_view tok = http_detail::trim_ows(raw);
+                if (tok.empty()) continue;   // an empty list element is legal
+                if (!is_valid_header_name(tok)) {
+                    return Error{ErrorCode::InvalidArgument,
+                                 "invalid field name in Trailer header"};
+                }
+                bool duplicate = false;
+                for (const auto& existing : names) {
+                    if (detail::ascii_iequals(to_view(existing), tok)) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (!duplicate) names.push_back(to_string(tok));
+            }
+            return names;
+        }
+
+        inline bool is_forbidden_trailer_name(string_view name) noexcept {
+            // RFC 7230 4.1.2: a trailer must not carry anything needed for
+            // framing, routing, authentication, response control or deciding how
+            // to process the payload.
+            static const char* const kForbidden[] = {
+                "content-length", "transfer-encoding", "host", "trailer",
+                "connection", "te", "upgrade", "keep-alive", "proxy-connection",
+                "content-encoding", "content-type", "content-range",
+                "authorization", "proxy-authorization", "proxy-authenticate",
+                "www-authenticate", "cookie", "set-cookie", "cache-control",
+                "expect", "max-forwards", "range", "if-match", "if-none-match",
+                "if-modified-since", "if-unmodified-since", "if-range",
+            };
+            for (const char* forbidden : kForbidden) {
+                if (detail::ascii_iequals(name, forbidden)) return true;
+            }
+            return false;
+        }
+
         inline Result<uint64_t> parse_chunk_size(string_view line) {
             // chunk-size = 1*HEXDIG [ chunk-ext ]
             const char* p = (line).data();

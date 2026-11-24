@@ -16,6 +16,9 @@ namespace megohttp {
         bool has_body{false};
         // S3.2-01: BodySource for streaming upload
         std::optional<Request::BodySource> body_source;
+        // S3.1-11: request trailers sent in the chunked terminating block.
+        Headers trailers;
+        std::optional<Request::TrailerSource> trailer_source;
         // S3.2-02: BodySink for streaming download
         std::optional<Request::BodySink> body_sink;
         std::optional<Request::BodySinkComplete> body_sink_complete;
@@ -195,6 +198,22 @@ namespace megohttp {
 
     inline const std::optional<Request::BodySource>& Request::body_source() const noexcept {
         return impl_->body_source;
+    }
+
+    inline void Request::set_trailers(Headers trailers) {
+        impl_->trailers = std::move(trailers);
+    }
+
+    inline const Headers& Request::trailers() const noexcept {
+        return impl_->trailers;
+    }
+
+    inline void Request::set_trailer_source(TrailerSource src) {
+        impl_->trailer_source = std::move(src);
+    }
+
+    inline const std::optional<Request::TrailerSource>& Request::trailer_source() const noexcept {
+        return impl_->trailer_source;
     }
 
     inline void Request::set_body_sink(BodySink sink, BodySinkComplete complete) {
