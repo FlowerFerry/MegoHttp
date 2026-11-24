@@ -1,0 +1,34 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# MegoHttp's INTERFACE target links against imported targets from its dependencies.
+# An out-of-tree consumer fails at generate time unless those targets are
+# recreated here, so every dependency that appears in INTERFACE_LINK_LIBRARIES
+# is re-created below. The @MGHTTP_*@ substitutions match the options this
+# package was built with; only the dependencies that were actually enabled are
+# looked up.
+if(@MGHTTP_TLS_OPENSSL@)
+    find_dependency(OpenSSL)
+endif()
+
+if(@MGHTTP_TLS_MBEDTLS@)
+    find_dependency(MbedTLS CONFIG)
+endif()
+
+# libuv, standalone Asio, fmt and zlib are usually consumed from the source tree,
+# so no installed CMake package exists for them. Their absolute artifact paths are
+# exported verbatim in MegoHttpTargets.cmake, which is why they are NOT looked up
+# here. If a consumer also has an installed package for one of them, its own
+# find_package call takes precedence for anything it uses directly.
+#
+# S1.9-04: The installed package links against libmeme_string.dll at runtime.
+# The DLL must be available on the consumer's PATH or next to the executable.
+# The import library (.lib) is installed with the package; the runtime DLL
+# is not, because it is a non-hermetic external dependency built from a
+# separate source tree. Consumers should copy it or set up their own
+# deployment mechanism.
+
+include("${CMAKE_CURRENT_LIST_DIR}/MegoHttpTargets.cmake")
+
+check_required_components(MegoHttp)
