@@ -70,6 +70,27 @@ public:
     // If no_context_takeover is true, resets state after each message
     std::vector<uint8_t> compress(const std::vector<uint8_t>& input);
 
+    // Incremental form for ONE RFC 7692 message (task book 6.6 / 12.1A).
+    //
+    //   begin_message()
+    //   compress_chunk(data, size)  0..n times
+    //   end_message()
+    //
+    // compress_chunk() returns whatever zlib has produced so far, which may
+    // be empty; end_message() flushes with Z_SYNC_FLUSH and removes the
+    // trailing 0x00 0x00 0xFF 0xFF. The caller sends the returned bytes as
+    // one or more WebSocket frames; frame boundaries inside a compressed
+    // message are not significant to the receiver.
+    //
+    // These calls are not thread-safe on their own: WebSocketSession
+    // serializes them with its send mutex. begin_message() must be paired
+    // with end_message(); an aborted message leaves the zlib context in an
+    // undefined position and requires closing the connection.
+    VoidResult begin_message();
+    Result<std::vector<uint8_t>> compress_chunk(const uint8_t* data, size_t size);
+    Result<std::vector<uint8_t>> end_message();
+    bool message_open() const noexcept;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
@@ -109,6 +130,20 @@ public:
     VoidResult decompress_streaming(const std::vector<uint8_t>& input,
                                     size_t max_output_bytes,
                                     const ChunkSink& on_chunk);
+
+    // Incremental receive form (task book 6.6 / 12.1A). begin_message(),
+    // decompress_chunk() 0..n times, end_message(). The caller feeds the
+    // compressed bytes of each frame as they arrive; end_message() appends the
+    // RFC 7692 0x00 0x00 0xFF 0xFF tail and returns the final output.
+    //
+    // max_output_bytes is a cap for THIS call, not the whole message; the
+    // caller passes the remaining message budget. A cap breach is reported as
+    // WsCompressionResourceExceeded before the output is materialised.
+    VoidResult begin_message();
+    Result<std::vector<uint8_t>> decompress_chunk(const uint8_t* data, size_t size,
+                                                  size_t max_output_bytes);
+    Result<std::vector<uint8_t>> end_message(size_t max_output_bytes);
+    bool message_open() const noexcept;
 
 private:
     struct Impl;

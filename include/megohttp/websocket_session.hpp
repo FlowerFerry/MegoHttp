@@ -84,6 +84,9 @@ namespace megohttp {
     public:
         using MessageCallback =
             std::function<void(WsMessageType, const std::vector<uint8_t>&)>;
+        using MessageBeginCallback = std::function<void(WsMessageType, bool compressed)>;
+        using MessageDataCallback = std::function<bool(const uint8_t* data, size_t size)>;
+        using MessageEndCallback = std::function<void()>;
         using ErrorCallback = std::function<void(const Error&)>;
         using CloseCallback = std::function<void(uint16_t code, const string& reason)>;
         using OpenCallback = std::function<void(const Error&)>;
@@ -103,6 +106,42 @@ namespace megohttp {
                        std::function<void(const Error&)> on_complete = nullptr);
         void send_binary(const std::vector<uint8_t>& data,
                          std::function<void(const Error&)> on_complete = nullptr);
+
+        // Incremental message sending (task book 6.6 / 12.1A):
+        //
+        //   send_begin(type) -> send_data(...) 0..n times -> send_end(cb)
+        //
+        // One logical message is produced; frame boundaries are chosen by the
+        // library (max_frame_size) and are invisible to the receiver. Only one
+        // incremental message may be open at a time. While it is open,
+        // send_text/send_binary and a second send_begin return WsInvalidState;
+        // control frames (ping/pong/close) may interleave and are never
+        // compressed.
+        //
+        // The message is bound to THIS physical connection. A close, error or
+        // reconnect aborts it: the send_end callback fires once with that
+        // error, and the bytes are never replayed on a new connection.
+        //
+        // send_begin/send_data report synchronous rejection (not open, invalid
+        // state, message too large, queue full) through their VoidResult. A
+        // send_data rejection leaves the message usable -- no compressed input
+        // was consumed -- so the caller may retry that chunk. send_end's
+        // callback is the message terminal: success after the last frame is
+        // written, or the write/connection error. If send_end itself returns an
+        // error, it did not accept the message terminal and the callback is not
+        // invoked.
+        VoidResult send_begin(WsMessageType type);
+        VoidResult send_data(const uint8_t* data, size_t size);
+        VoidResult send_data(string_view data);
+        VoidResult send_data(const std::vector<uint8_t>& data);
+        VoidResult send_end(std::function<void(const Error&)> on_complete = nullptr);
+
+        // True while a send_begin/send_data/send_end message is open.
+        bool is_sending_message() const noexcept;
+        // Encoded bytes currently sitting in the send queue, including the
+        // frame being written. The active message's uncompressed bytes are not
+        // included; they are accounted at admission instead.
+        size_t pending_send_bytes() const noexcept;
         void send_ping(const std::vector<uint8_t>& payload = {},
                        std::function<void(const Error&)> on_complete = nullptr);
         void send_pong(const std::vector<uint8_t>& payload = {},
@@ -112,6 +151,30 @@ namespace megohttp {
         void terminate();
 
         void on_message(MessageCallback cb) { message_cb_ = std::move(cb); }
+
+        // Incremental receive (task book 6.6 / 12.1A). When any of these is
+        // non-null, the decoder delivers begin -> data* -> end instead of the
+        // whole-message on_message callback; on_message is NOT called in that
+        // mode. Set these before start() (or before the first message).
+        //
+        // - begin: once per message; `compressed` is the first frame's RSV1.
+        // - data: one frame payload (uncompressed) or one decompressed chunk
+        //   (permessage-deflate). Return false to request a receive pause.
+        // - end: once per complete message; not called on disconnect/error.
+        //
+        // Views are valid only during the call. Control frames may interleave
+        // and are never passed to data.
+        void set_incremental_message_callbacks(MessageBeginCallback begin,
+                                               MessageDataCallback data,
+                                               MessageEndCallback end);
+
+        // Receive backpressure. pause_receive() stops before the next data
+        // frame; control frames already buffered are still delivered.
+        // resume_receive() posts to the executor, replays buffered frames, and
+        // resumes socket reads. Both are thread-safe.
+        void pause_receive();
+        void resume_receive();
+        bool is_receive_paused() const noexcept;
         void on_close(CloseCallback cb) { close_cb_ = std::move(cb); }
         void on_error(ErrorCallback cb) { error_cb_ = std::move(cb); }
 
@@ -133,6 +196,8 @@ namespace megohttp {
         DeflateNegotiated negotiated_deflate() const { return deflate_negotiated_; }
 
     private:
+        friend class WsDecoderBridge;
+
         void do_send_upgrade(const string& host, const string& path,
                              Headers& extra_headers);
         void start_reading();
@@ -147,13 +212,43 @@ namespace megohttp {
                         bool fin = true, bool rsv1 = false,
                         std::function<void(const Error&)> on_complete = nullptr);
         void pump_send_queue();
+        void pump_send_queue_now();
         void complete_send(bool ok, Result<size_t> r,
                            std::function<void(const Error&)> on_complete);
+
+        // --- locked send helpers (send_mutex_ MUST be held) ---
+        VoidResult send_frame_locked(WsOpcode opcode, const uint8_t* payload,
+                                     size_t size, bool fin, bool rsv1,
+                                     std::function<void(const Error&)> on_complete);
+        VoidResult enqueue_payload_locked(WsOpcode first_opcode, const uint8_t* payload,
+                                          size_t size, bool fin, bool rsv1,
+                                          std::function<void(const Error&)> on_complete);
+        VoidResult send_text_locked(WsOpcode opcode, const uint8_t* data, size_t size,
+                                    std::function<void(const Error&)> on_complete);
+        VoidResult send_begin_locked(WsMessageType type);
+        VoidResult send_data_locked(const uint8_t* data, size_t size);
+        VoidResult send_end_locked(std::function<void(const Error&)> on_complete);
+        void complete_incremental_locked(const Error& err);
+        void complete_incremental(const Error& err);
+        void flush_incremental_completion();
+        void terminate_impl(const Error& reason, bool notify);
+        bool queue_has_capacity_locked(size_t raw_bytes, size_t wire_bytes) const;
+        size_t max_fragment_payload() const;
+        bool take_fatal_send_error();
 
         void transition_to_open();
         void transition_to_closing(uint16_t code, const string& reason);
         void transition_to_closed();
         void report_error(const Error& err);
+
+        // --- incremental receive (called by WsDecoderBridge) ---
+        bool has_incremental_receive() const noexcept;
+        bool receive_pause_requested() const noexcept;
+        VoidResult on_incremental_begin(WsMessageType type, bool compressed);
+        VoidResult on_incremental_data(const uint8_t* data, size_t size);
+        VoidResult on_incremental_end();
+        VoidResult deliver_incremental_plain(const uint8_t* data, size_t size);
+        void resume_receive_on_loop();
 
         std::shared_ptr<AsyncByteStream> stream_;
         WebSocketOptions opts_;
@@ -190,11 +285,44 @@ namespace megohttp {
         // Bytes currently queued (front item included while it is being written).
         size_t send_queue_bytes_{0};
         bool sending_{false};
+        // At most one scheduled pump: AsioExecutor::is_in_loop_thread() is
+        // always false (an external io_context may have many threads), so a
+        // naive "post if not on the loop thread" would post forever.
+        std::atomic<bool> pump_posted_{false};
         mutable std::mutex send_mutex_;
+
+        // --- incremental message state (guarded by send_mutex_) ---
+        bool incremental_active_{false};
+        WsMessageType incremental_type_{WsMessageType::Text};
+        size_t incremental_raw_bytes_{0};
+        bool incremental_first_frame_sent_{false};
+        bool incremental_compressed_{false};
+        std::function<void(const Error&)> incremental_complete_;
+        bool incremental_completed_{false};
+        // Completion extracted under the lock, invoked after it is released.
+        std::function<void(const Error&)> incremental_ready_cb_;
+        Error incremental_ready_err_;
+        bool incremental_ready_{false};
+        // A compression/enqueue failure after zlib consumed input leaves the
+        // stream unusable; the public wrapper closes the connection.
+        bool fatal_send_error_{false};
 
         MessageCallback message_cb_;
         ErrorCallback error_cb_;
         CloseCallback close_cb_;
+
+        // --- incremental receive state (I/O thread, except the atomics) ---
+        MessageBeginCallback message_begin_cb_;
+        MessageDataCallback message_data_cb_;
+        MessageEndCallback message_end_cb_;
+        std::atomic<bool> incremental_receive_enabled_{false};
+        std::atomic<bool> receive_paused_{false};
+        std::atomic<bool> receive_resume_posted_{false};
+        bool rx_incremental_active_{false};
+        WsMessageType rx_type_{WsMessageType::Text};
+        bool rx_compressed_{false};
+        size_t rx_total_{0};
+        WsUtf8Validator rx_validator_;
         OpenCallback open_cb_;
 
         std::shared_ptr<Timer> close_timeout_timer_;

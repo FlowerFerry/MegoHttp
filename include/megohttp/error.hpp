@@ -122,6 +122,10 @@ namespace megohttp {
         WsCompressionNegotiationFailed      = MGEC__HTTP_BEGIN - 222,
         WsCompressionMalformedData          = MGEC__HTTP_BEGIN - 223,
         WsCompressionResourceExceeded       = MGEC__HTTP_BEGIN - 224,
+        // The encoder itself failed (zlib error). Kept separate from the
+        // receive-side "malformed data" code so a caller can tell which
+        // direction broke.
+        WsCompressionFailed                 = MGEC__HTTP_BEGIN - 225,
 
         // --- multipart response: five distinct cases, never merged ---
         MultipartMediaTypeInvalid    = MGEC__HTTP_BEGIN - 240,

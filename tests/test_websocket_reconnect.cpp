@@ -336,6 +336,54 @@ TEST_CASE("ws reconnect stops after a local close", "[websocket][reconnect]") {
     srv.stop();
 }
 
+TEST_CASE("ws reconnect forwards incremental send on the current connection",
+          "[websocket][reconnect]") {
+    sock_init();
+    WsHandshakeServer srv;
+    REQUIRE(srv.start(/*drop_count=*/0));
+
+    Client client;
+    WebSocketOptions wopt;
+    WebSocketReconnectPolicy policy;
+    policy.enabled = false;
+
+    string_builder ub;
+    detail::sb_append(ub, "ws://127.0.0.1:");
+    detail::sb_append(ub, to_view(format("{}", srv.port())));
+    detail::sb_append(ub, "/ws");
+    const string url = ub.release();
+
+    auto ws = client.open_websocket(to_view(url), wopt, policy);
+    REQUIRE(wait_until([&] { return ws->is_open(); }, 6000));
+
+    std::atomic<bool> done{false};
+    Error completion;
+    CHECK(static_cast<bool>(ws->send_begin(WsMessageType::Text)));
+    CHECK(ws->is_sending_message());
+
+    std::atomic<bool> whole_rejected{false};
+    const bool accepted = ws->send_text(string("whole"), [&](const Error& e) {
+        whole_rejected.store(e.code() == ErrorCode::WsInvalidState);
+    });
+    CHECK(!accepted);
+    CHECK(whole_rejected.load());
+
+    CHECK(static_cast<bool>(ws->send_data(
+        reinterpret_cast<const uint8_t*>("incremental"), 11)));
+    auto r = ws->send_end([&](const Error& e) {
+        completion = e;
+        done.store(true);
+    });
+    CHECK(static_cast<bool>(r));
+    CHECK(wait_until([&] { return done.load(); }, 6000));
+    CHECK(!completion);
+    CHECK(!ws->is_sending_message());
+
+    ws->terminate();
+    client.shutdown();
+    srv.stop();
+}
+
 TEST_CASE("ws reconnect total-duration budget runs from the session start",
           "[websocket][reconnect]") {
     // D13: the total-duration budget used to be measured from the last

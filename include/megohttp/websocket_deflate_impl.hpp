@@ -138,6 +138,7 @@ namespace megohttp {
         z_stream strm{};
         DeflateNegotiated params;
         bool initialised{false};
+        bool in_message{false};
 
         explicit Impl(const DeflateNegotiated& p) : params(p) {
             // RAW deflate (negative window bits): RFC 7692 forbids the zlib or
@@ -161,33 +162,134 @@ namespace megohttp {
 
     inline DeflateCompressor::~DeflateCompressor() = default;
 
-    inline std::vector<uint8_t> DeflateCompressor::compress(const std::vector<uint8_t>& input) {
-        // Not initialised: pass the payload through unchanged. The return type
-        // cannot carry an Error, and the caller checks the negotiated state.
-        if (!impl_->initialised) return input;
-
+    inline VoidResult DeflateCompressor::begin_message() {
+        if (!impl_->initialised) {
+            return Error{ErrorCode::WsCompressionNotCompiled, ErrorPhase::TargetProtocol,
+                         string("permessage-deflate is not available in this build")};
+        }
+        if (impl_->in_message) {
+            return Error{ErrorCode::WsInvalidState, ErrorPhase::TargetProtocol,
+                         string("a permessage-deflate message is already open")};
+        }
+        // Context takeover keeps the stream between messages; no_context_takeover
+        // resets it before each message (RFC 7692 7.1.1). Resetting at begin
+        // rather than end means a failed message cannot contaminate the next one.
         if (impl_->params.client_no_context_takeover) impl_->reset();
+        impl_->in_message = true;
+        return VoidResult{};
+    }
 
-        // Generous buffer: deflateBound assumes a fresh stream, which is wrong
-        // for the second message when context takeover keeps the state alive.
-        std::vector<uint8_t> out(input.size() + input.size() / 2 + 256);
+    inline Result<std::vector<uint8_t>> DeflateCompressor::compress_chunk(
+        const uint8_t* data, size_t size) {
+        if (!impl_->initialised) {
+            return Error{ErrorCode::WsCompressionNotCompiled, ErrorPhase::TargetProtocol,
+                         string("permessage-deflate is not available in this build")};
+        }
+        if (!impl_->in_message) {
+            return Error{ErrorCode::WsInvalidState, ErrorPhase::TargetProtocol,
+                         string("no permessage-deflate message is open")};
+        }
 
-        impl_->strm.next_in = const_cast<Bytef*>(input.data());
-        impl_->strm.avail_in = static_cast<uInt>(input.size());
-        impl_->strm.next_out = out.data();
-        impl_->strm.avail_out = static_cast<uInt>(out.size());
+        std::vector<uint8_t> out;
+        if (size == 0) return out;
 
-        const int rc = deflate(&impl_->strm, Z_SYNC_FLUSH);
-        if (rc != Z_OK && rc != Z_BUF_ERROR) return input;
+        size_t offset = 0;
+        while (offset < size) {
+            // zlib's avail_in is uInt; feed a bounded slice for huge inputs.
+            const size_t take = (std::min)(size - offset,
+                                           static_cast<size_t>(0x40000000));
+            impl_->strm.next_in = const_cast<Bytef*>(data + offset);
+            impl_->strm.avail_in = static_cast<uInt>(take);
 
-        out.resize(out.size() - impl_->strm.avail_out);
-        // RFC 7692 7.2.1: Z_SYNC_FLUSH leaves a trailing 0x00 0x00 0xFF 0xFF on
-        // the wire, and the sender must REMOVE it (the receiver re-appends it).
-        // Keeping it would put two markers in the stream.
+            for (;;) {
+                uint8_t buf[32 * 1024];
+                impl_->strm.next_out = buf;
+                impl_->strm.avail_out = static_cast<uInt>(sizeof buf);
+                const uInt before_in = impl_->strm.avail_in;
+                const int rc = deflate(&impl_->strm, Z_NO_FLUSH);
+                const size_t produced = sizeof buf - impl_->strm.avail_out;
+                if (produced) out.insert(out.end(), buf, buf + produced);
+
+                if (rc != Z_OK && rc != Z_BUF_ERROR) {
+                    impl_->in_message = false;
+                    return Error{ErrorCode::WsCompressionFailed, ErrorPhase::Send,
+                                 string("permessage-deflate compression failed")};
+                }
+                // Stop once all input is consumed and the output buffer was not
+                // filled. A full buffer means zlib has more pending output.
+                if (impl_->strm.avail_in == 0 && impl_->strm.avail_out != 0) break;
+                // Defensive: no progress with input still pending is a broken
+                // stream state, not something to spin on.
+                if (produced == 0 && impl_->strm.avail_in == before_in &&
+                    impl_->strm.avail_in != 0) {
+                    impl_->in_message = false;
+                    return Error{ErrorCode::WsCompressionFailed, ErrorPhase::Send,
+                                 string("permessage-deflate compression made no progress")};
+                }
+            }
+            offset += take;
+        }
+        return out;
+    }
+
+    inline Result<std::vector<uint8_t>> DeflateCompressor::end_message() {
+        if (!impl_->initialised) {
+            return Error{ErrorCode::WsCompressionNotCompiled, ErrorPhase::TargetProtocol,
+                         string("permessage-deflate is not available in this build")};
+        }
+        if (!impl_->in_message) {
+            return Error{ErrorCode::WsInvalidState, ErrorPhase::TargetProtocol,
+                         string("no permessage-deflate message is open")};
+        }
+
+        std::vector<uint8_t> out;
+        impl_->strm.next_in = nullptr;
+        impl_->strm.avail_in = 0;
+        for (;;) {
+            uint8_t buf[16 * 1024];
+            impl_->strm.next_out = buf;
+            impl_->strm.avail_out = static_cast<uInt>(sizeof buf);
+            const int rc = deflate(&impl_->strm, Z_SYNC_FLUSH);
+            const size_t produced = sizeof buf - impl_->strm.avail_out;
+            if (produced) out.insert(out.end(), buf, buf + produced);
+
+            if (rc != Z_OK && rc != Z_BUF_ERROR) {
+                impl_->in_message = false;
+                return Error{ErrorCode::WsCompressionFailed, ErrorPhase::Send,
+                             string("permessage-deflate flush failed")};
+            }
+            // Z_SYNC_FLUSH is complete once the output buffer was not filled.
+            if (impl_->strm.avail_out != 0) break;
+        }
+        impl_->in_message = false;
+
+        // RFC 7692 7.2.1: the sender removes the trailing 0x00 0x00 0xFF 0xFF;
+        // the receiver appends it back before inflating.
         if (out.size() >= 4 && out[out.size() - 4] == 0x00 && out[out.size() - 3] == 0x00 &&
             out[out.size() - 2] == 0xFF && out[out.size() - 1] == 0xFF) {
             out.resize(out.size() - 4);
         }
+        return out;
+    }
+
+    inline bool DeflateCompressor::message_open() const noexcept {
+        return impl_->in_message;
+    }
+
+    inline std::vector<uint8_t> DeflateCompressor::compress(const std::vector<uint8_t>& input) {
+        // Legacy convenience entry point: it has no error channel, so a
+        // compression failure returns the input unchanged. New code must use
+        // begin_message/compress_chunk/end_message and check the Result.
+        if (!impl_->initialised) return input;
+        if (impl_->in_message) return input;
+        if (!begin_message()) return input;
+        auto chunk = compress_chunk(input.data(), input.size());
+        if (!chunk) return input;
+        auto tail = end_message();
+        if (!tail) return input;
+        std::vector<uint8_t> out = std::move(chunk.value());
+        const auto& t = tail.value();
+        out.insert(out.end(), t.begin(), t.end());
         return out;
     }
 
@@ -199,6 +301,7 @@ namespace megohttp {
         z_stream strm{};
         DeflateNegotiated params;
         bool initialised{false};
+        bool in_message{false};
 
         explicit Impl(const DeflateNegotiated& p) : params(p) {
             if (inflateInit2(&strm, -params.server_window_bits) == Z_OK) {
@@ -360,6 +463,149 @@ namespace megohttp {
         }
 
         return VoidResult{};
+    }
+
+    inline VoidResult DeflateDecompressor::begin_message() {
+        if (!impl_->initialised) {
+            return Error{ErrorCode::WsCompressionNotCompiled, ErrorPhase::TargetProtocol,
+                         string("permessage-deflate is not available in this build")};
+        }
+        if (impl_->in_message) {
+            return Error{ErrorCode::WsInvalidState, ErrorPhase::TargetProtocol,
+                         string("a permessage-deflate receive message is already open")};
+        }
+        if (impl_->params.server_no_context_takeover) impl_->reset();
+        impl_->in_message = true;
+        return VoidResult{};
+    }
+
+    inline Result<std::vector<uint8_t>> DeflateDecompressor::decompress_chunk(
+        const uint8_t* data, size_t size, size_t max_output_bytes) {
+        if (!impl_->initialised) {
+            return Error{ErrorCode::WsCompressionNotCompiled, ErrorPhase::TargetProtocol,
+                         string("permessage-deflate is not available in this build")};
+        }
+        if (!impl_->in_message) {
+            return Error{ErrorCode::WsInvalidState, ErrorPhase::TargetProtocol,
+                         string("no permessage-deflate receive message is open")};
+        }
+
+        std::vector<uint8_t> out;
+        if (size == 0) return out;
+
+        size_t offset = 0;
+        while (offset < size) {
+            const size_t take = (std::min)(size - offset,
+                                           static_cast<size_t>(0x40000000));
+            impl_->strm.next_in = const_cast<Bytef*>(data + offset);
+            impl_->strm.avail_in = static_cast<uInt>(take);
+
+            for (;;) {
+                uint8_t buf[32 * 1024];
+                impl_->strm.next_out = buf;
+                impl_->strm.avail_out = static_cast<uInt>(sizeof buf);
+                const uInt before_in = impl_->strm.avail_in;
+                const int rc = inflate(&impl_->strm, Z_SYNC_FLUSH);
+                const size_t produced = sizeof buf - impl_->strm.avail_out;
+                if (produced) {
+                    if (max_output_bytes != 0 &&
+                        out.size() + produced > max_output_bytes) {
+                        impl_->in_message = false;
+                        return Error{ErrorCode::WsCompressionResourceExceeded,
+                                     ErrorPhase::Compression,
+                                     string("decompressed message exceeded the output limit")};
+                    }
+                    out.insert(out.end(), buf, buf + produced);
+                }
+
+                if (rc == Z_STREAM_END) {
+                    // RFC 7692 messages use Z_SYNC_FLUSH and never terminate the
+                    // DEFLATE stream; a real end marker mid-message is malformed.
+                    impl_->in_message = false;
+                    return Error{ErrorCode::WsCompressionMalformedData,
+                                 ErrorPhase::Receive,
+                                 string("unexpected end of permessage-deflate stream")};
+                }
+                if (rc != Z_OK && rc != Z_BUF_ERROR) {
+                    impl_->in_message = false;
+                    return Error{ErrorCode::WsCompressionMalformedData,
+                                 ErrorPhase::Receive,
+                                 string("permessage-deflate payload could not be decoded")};
+                }
+                if (impl_->strm.avail_in == 0 &&
+                    (impl_->strm.avail_out != 0 || produced == 0)) {
+                    break;
+                }
+                if (produced == 0 && impl_->strm.avail_in == before_in &&
+                    impl_->strm.avail_in != 0) {
+                    impl_->in_message = false;
+                    return Error{ErrorCode::WsCompressionMalformedData,
+                                 ErrorPhase::Receive,
+                                 string("permessage-deflate inflate made no progress")};
+                }
+            }
+            offset += take;
+        }
+        return out;
+    }
+
+    inline Result<std::vector<uint8_t>> DeflateDecompressor::end_message(
+        size_t max_output_bytes) {
+        if (!impl_->initialised) {
+            return Error{ErrorCode::WsCompressionNotCompiled, ErrorPhase::TargetProtocol,
+                         string("permessage-deflate is not available in this build")};
+        }
+        if (!impl_->in_message) {
+            return Error{ErrorCode::WsInvalidState, ErrorPhase::TargetProtocol,
+                         string("no permessage-deflate receive message is open")};
+        }
+
+        const uint8_t tail[4] = {0x00, 0x00, 0xFF, 0xFF};
+        impl_->strm.next_in = const_cast<Bytef*>(tail);
+        impl_->strm.avail_in = 4;
+
+        std::vector<uint8_t> out;
+        for (;;) {
+            uint8_t buf[16 * 1024];
+            impl_->strm.next_out = buf;
+            impl_->strm.avail_out = static_cast<uInt>(sizeof buf);
+            const uInt before_in = impl_->strm.avail_in;
+            const int rc = inflate(&impl_->strm, Z_SYNC_FLUSH);
+            const size_t produced = sizeof buf - impl_->strm.avail_out;
+            if (produced) {
+                if (max_output_bytes != 0 &&
+                    out.size() + produced > max_output_bytes) {
+                    impl_->in_message = false;
+                    return Error{ErrorCode::WsCompressionResourceExceeded,
+                                 ErrorPhase::Compression,
+                                 string("decompressed message exceeded the output limit")};
+                }
+                out.insert(out.end(), buf, buf + produced);
+            }
+
+            if (rc == Z_STREAM_END) break;
+            if (rc != Z_OK && rc != Z_BUF_ERROR) {
+                impl_->in_message = false;
+                return Error{ErrorCode::WsCompressionMalformedData,
+                             ErrorPhase::Receive,
+                             string("permessage-deflate payload could not be decoded")};
+            }
+            if (impl_->strm.avail_in == 0 && impl_->strm.avail_out != 0) break;
+            if (produced == 0 && impl_->strm.avail_in == before_in &&
+                impl_->strm.avail_in != 0) {
+                impl_->in_message = false;
+                return Error{ErrorCode::WsCompressionMalformedData,
+                             ErrorPhase::Receive,
+                             string("permessage-deflate flush made no progress")};
+            }
+        }
+
+        impl_->in_message = false;
+        return out;
+    }
+
+    inline bool DeflateDecompressor::message_open() const noexcept {
+        return impl_->in_message;
     }
 
 } // namespace megohttp

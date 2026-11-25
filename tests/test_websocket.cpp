@@ -73,6 +73,116 @@ namespace {
 
 } // namespace
 
+TEST_CASE("websocket decoder incremental callbacks", "[websocket][decoder]") {
+    struct IncCollector : WsFrameDecoder::Callbacks {
+        std::vector<std::pair<WsMessageType, bool>> begins;
+        std::vector<std::vector<uint8_t>> data;
+        int ends{0};
+        int whole_messages{0};
+        bool pause_after_first{false};
+        bool paused{false};
+
+        bool wants_incremental_messages() const override { return true; }
+        bool pause_requested() const override { return paused; }
+        VoidResult on_control(const WsFrame&) override { return VoidResult{}; }
+        VoidResult on_message(WsMessageType, const byte_buffer&, bool) override {
+            ++whole_messages;
+            return VoidResult{};
+        }
+        VoidResult on_message_begin(WsMessageType t, bool compressed) override {
+            begins.push_back({t, compressed});
+            return VoidResult{};
+        }
+        VoidResult on_message_data(const uint8_t* p, size_t n) override {
+            data.emplace_back(p, p + n);
+            if (pause_after_first && data.size() == 1) paused = true;
+            return VoidResult{};
+        }
+        VoidResult on_message_end() override {
+            ++ends;
+            return VoidResult{};
+        }
+    };
+
+    SECTION("fragmented text delivers begin/data/end once") {
+        IncCollector col;
+        WsFrameDecoder d(col);
+        std::vector<uint8_t> bytes;
+        auto a = server_frame(WsOpcode::Text, "hel", false);
+        auto b = server_frame(WsOpcode::Continuation, "lo", true);
+        bytes.insert(bytes.end(), a.begin(), a.end());
+        bytes.insert(bytes.end(), b.begin(), b.end());
+        REQUIRE(feed(d, bytes));
+        CHECK(col.begins.size() == 1);
+        CHECK(col.begins[0].first == WsMessageType::Text);
+        CHECK(!col.begins[0].second);
+        REQUIRE(col.data.size() == 2);
+        CHECK(std::string(col.data[0].begin(), col.data[0].end()) == "hel");
+        CHECK(std::string(col.data[1].begin(), col.data[1].end()) == "lo");
+        CHECK(col.ends == 1);
+        CHECK(col.whole_messages == 0);
+    }
+
+    SECTION("a compressed first frame is reported as compressed") {
+        IncCollector col;
+        WsFrameDecoder d(col);
+        std::vector<uint8_t> bytes;
+        auto a = server_frame(WsOpcode::Binary, "xx", false, true);
+        auto b = server_frame(WsOpcode::Continuation, "yy", true);
+        bytes.insert(bytes.end(), a.begin(), a.end());
+        bytes.insert(bytes.end(), b.begin(), b.end());
+        REQUIRE(feed(d, bytes));
+        REQUIRE(col.begins.size() == 1);
+        CHECK(col.begins[0].first == WsMessageType::Binary);
+        CHECK(col.begins[0].second);
+        REQUIRE(col.data.size() == 2);
+        CHECK(std::string(col.data[0].begin(), col.data[0].end()) == "xx");
+        CHECK(std::string(col.data[1].begin(), col.data[1].end()) == "yy");
+        CHECK(col.ends == 1);
+    }
+
+    SECTION("pause stops before the next data frame and resumes from the buffer") {
+        IncCollector col;
+        col.pause_after_first = true;
+        WsFrameDecoder d(col);
+        std::vector<uint8_t> bytes;
+        auto a = server_frame(WsOpcode::Text, "one", false);
+        auto b = server_frame(WsOpcode::Continuation, "two", true);
+        bytes.insert(bytes.end(), a.begin(), a.end());
+        bytes.insert(bytes.end(), b.begin(), b.end());
+        REQUIRE(feed(d, bytes));
+        REQUIRE(col.data.size() == 1);
+        CHECK(col.ends == 0);
+
+        col.paused = false;
+        REQUIRE(feed(d, {}));               // resume buffered bytes
+        REQUIRE(col.data.size() == 2);
+        CHECK(std::string(col.data[1].begin(), col.data[1].end()) == "two");
+        CHECK(col.ends == 1);
+    }
+
+    SECTION("control frames pass while paused, data frames wait") {
+        IncCollector col;
+        col.pause_after_first = true;
+        WsFrameDecoder d(col);
+        std::vector<uint8_t> bytes;
+        auto a = server_frame(WsOpcode::Text, "one", false);
+        auto ping = server_frame(WsOpcode::Ping, "k", true);
+        auto b = server_frame(WsOpcode::Continuation, "two", true);
+        bytes.insert(bytes.end(), a.begin(), a.end());
+        bytes.insert(bytes.end(), ping.begin(), ping.end());
+        bytes.insert(bytes.end(), b.begin(), b.end());
+        REQUIRE(feed(d, bytes));
+        REQUIRE(col.data.size() == 1);
+        CHECK(col.ends == 0);
+
+        col.paused = false;
+        REQUIRE(feed(d, {}));
+        REQUIRE(col.data.size() == 2);
+        CHECK(col.ends == 1);
+    }
+}
+
 TEST_CASE("ws accept key matches the RFC 6455 example", "[websocket]") {
     // RFC 6455 1.3 worked example. Any SHA-1 or base64 bug shows up here.
     CHECK(str(ws_detail::accept_key_for("dGhlIHNhbXBsZSBub25jZQ==")) ==

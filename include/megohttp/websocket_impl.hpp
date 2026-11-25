@@ -418,6 +418,7 @@ namespace megohttp {
         bool message_compressed_{false};
         WsMessageType message_type_{WsMessageType::Text};
         byte_buffer message_;
+        size_t incremental_message_bytes_{0};
 
         VoidResult fail(ErrorCode code, const char* msg) {
             failed_ = true;
@@ -428,6 +429,15 @@ namespace megohttp {
             for (;;) {
                 const size_t avail = buf_.size() - consumed_;
                 if (avail < 2) return VoidResult{};
+
+                // Backpressure is checked before the next frame. Control
+                // frames are allowed through while paused so ping/pong/close
+                // cannot be starved; the first data frame stops the loop and
+                // stays buffered for feed(nullptr, 0).
+                if (cbs_.pause_requested()) {
+                    const uint8_t op_raw = buf_[consumed_] & 0x0F;
+                    if ((op_raw & 0x8) == 0) return VoidResult{};
+                }
 
                 const uint8_t b0 = buf_[consumed_];
                 const uint8_t b1 = buf_[consumed_ + 1];
@@ -530,6 +540,52 @@ namespace megohttp {
                 return cbs_.on_control(f);
             }
 
+            if (cbs_.wants_incremental_messages()) {
+                if (f.opcode == WsOpcode::Continuation) {
+                    if (!in_message_) {
+                        return fail(ErrorCode::WsProtocolError,
+                                    "continuation frame without a message to continue");
+                    }
+                } else {
+                    if (in_message_) {
+                        return fail(ErrorCode::WsProtocolError,
+                                    "a new data frame started while a fragmented message was open");
+                    }
+                    in_message_ = true;
+                    message_compressed_ = f.rsv1;
+                    message_type_ = (f.opcode == WsOpcode::Text)
+                                        ? WsMessageType::Text
+                                        : WsMessageType::Binary;
+                    incremental_message_bytes_ = 0;
+                    auto r = cbs_.on_message_begin(message_type_, f.rsv1);
+                    if (!r) return r;
+                }
+
+                if (f.opcode == WsOpcode::Continuation && f.rsv1) {
+                    return fail(ErrorCode::WsProtocolError,
+                                "RSV1 set on a continuation frame");
+                }
+
+                if (limits_.max_message_bytes > 0 &&
+                    incremental_message_bytes_ + f.payload.size() >
+                        limits_.max_message_bytes) {
+                    return fail(ErrorCode::WsMessageTooLarge,
+                                "message exceeded max_message_bytes");
+                }
+                incremental_message_bytes_ += f.payload.size();
+
+                if (!f.payload.empty()) {
+                    auto r = cbs_.on_message_data(f.payload.data(), f.payload.size());
+                    if (!r) return r;
+                }
+
+                if (!f.fin) return VoidResult{};
+                in_message_ = false;
+                message_compressed_ = false;
+                incremental_message_bytes_ = 0;
+                return cbs_.on_message_end();
+            }
+
             if (f.opcode == WsOpcode::Continuation) {
                 if (!in_message_) {
                     return fail(ErrorCode::WsProtocolError,
@@ -590,7 +646,9 @@ namespace megohttp {
             return Error{ErrorCode::WsProtocolError, ErrorPhase::TargetProtocol,
                          string("frame decoder already failed")};
         }
-        impl_->buf_.insert(impl_->buf_.end(), data, data + size);
+        if (size != 0) {
+            impl_->buf_.insert(impl_->buf_.end(), data, data + size);
+        }
         auto r = impl_->parse_available();
         // Drop the consumed prefix so the buffer does not grow for a long-lived
         // connection.

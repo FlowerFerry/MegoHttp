@@ -206,6 +206,21 @@ namespace megohttp {
             if (cb) { try { cb(e); } catch (...) {} }
             self->handle_disconnect(e);
         });
+
+        // Incremental receive callbacks belong to the logical session and are
+        // re-applied to every new physical connection.
+        MessageBeginCallback inc_begin;
+        MessageDataCallback inc_data;
+        MessageEndCallback inc_end;
+        {
+            std::lock_guard<std::mutex> lk(self->mutex_);
+            inc_begin = self->inc_message_begin_cb_;
+            inc_data = self->inc_message_data_cb_;
+            inc_end = self->inc_message_end_cb_;
+        }
+        session->set_incremental_message_callbacks(
+            inc_begin, inc_data, inc_end);
+        if (self->receive_paused_.load()) session->pause_receive();
     }
 
     inline void ReconnectingWebSocket::handle_disconnect(const Error& err) {
@@ -359,6 +374,13 @@ namespace megohttp {
             }
             return false;
         }
+        if (s->is_sending_message()) {
+            if (on_complete) {
+                on_complete(Error{ErrorCode::WsInvalidState, ErrorPhase::TargetProtocol,
+                                  string("an incremental message is already open")});
+            }
+            return false;
+        }
         s->send_text(text, std::move(on_complete));
         return true;
     }
@@ -377,8 +399,134 @@ namespace megohttp {
             }
             return false;
         }
+        if (s->is_sending_message()) {
+            if (on_complete) {
+                on_complete(Error{ErrorCode::WsInvalidState, ErrorPhase::TargetProtocol,
+                                  string("an incremental message is already open")});
+            }
+            return false;
+        }
         s->send_binary(data, std::move(on_complete));
         return true;
+    }
+
+    inline VoidResult ReconnectingWebSocket::send_begin(WsMessageType type) {
+        std::shared_ptr<WebSocketSession> s;
+        {
+            std::lock_guard<std::mutex> lk(session_mutex_);
+            s = session_;
+        }
+        if (!s || !s->is_open()) {
+            return Error{ErrorCode::WsNotOpen, ErrorPhase::TargetProtocol,
+                         string("no open connection")};
+        }
+        return s->send_begin(type);
+    }
+
+    inline VoidResult ReconnectingWebSocket::send_data(const uint8_t* data, size_t size) {
+        std::shared_ptr<WebSocketSession> s;
+        {
+            std::lock_guard<std::mutex> lk(session_mutex_);
+            s = session_;
+        }
+        if (!s || !s->is_open()) {
+            return Error{ErrorCode::WsNotOpen, ErrorPhase::TargetProtocol,
+                         string("no open connection")};
+        }
+        return s->send_data(data, size);
+    }
+
+    inline VoidResult ReconnectingWebSocket::send_data(string_view data) {
+        return send_data(reinterpret_cast<const uint8_t*>(data.data()), data.size());
+    }
+
+    inline VoidResult ReconnectingWebSocket::send_data(
+        const std::vector<uint8_t>& data) {
+        return send_data(data.data(), data.size());
+    }
+
+    inline VoidResult ReconnectingWebSocket::send_end(
+        std::function<void(const Error&)> on_complete) {
+        std::shared_ptr<WebSocketSession> s;
+        {
+            std::lock_guard<std::mutex> lk(session_mutex_);
+            s = session_;
+        }
+        if (!s || !s->is_open()) {
+            const Error e{ErrorCode::WsNotOpen, ErrorPhase::TargetProtocol,
+                          string("no open connection")};
+            if (on_complete) {
+                try { on_complete(e); } catch (...) {}
+            }
+            return e;
+        }
+        return s->send_end(std::move(on_complete));
+    }
+
+    inline bool ReconnectingWebSocket::is_sending_message() const noexcept {
+        std::shared_ptr<WebSocketSession> s;
+        {
+            std::lock_guard<std::mutex> lk(session_mutex_);
+            s = session_;
+        }
+        return s && s->is_sending_message();
+    }
+
+    inline void ReconnectingWebSocket::set_incremental_message_callbacks(
+        MessageBeginCallback begin, MessageDataCallback data, MessageEndCallback end) {
+        std::shared_ptr<WebSocketSession> s;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            inc_message_begin_cb_ = std::move(begin);
+            inc_message_data_cb_ = std::move(data);
+            inc_message_end_cb_ = std::move(end);
+        }
+        {
+            std::lock_guard<std::mutex> lk(session_mutex_);
+            s = session_;
+        }
+        if (s) {
+            MessageBeginCallback b;
+            MessageDataCallback d;
+            MessageEndCallback e;
+            {
+                std::lock_guard<std::mutex> lk(mutex_);
+                b = inc_message_begin_cb_;
+                d = inc_message_data_cb_;
+                e = inc_message_end_cb_;
+            }
+            s->set_incremental_message_callbacks(b, d, e);
+        }
+    }
+
+    inline void ReconnectingWebSocket::pause_receive() {
+        receive_paused_.store(true);
+        std::shared_ptr<WebSocketSession> s;
+        {
+            std::lock_guard<std::mutex> lk(session_mutex_);
+            s = session_;
+        }
+        if (s) s->pause_receive();
+    }
+
+    inline void ReconnectingWebSocket::resume_receive() {
+        receive_paused_.store(false);
+        std::shared_ptr<WebSocketSession> s;
+        {
+            std::lock_guard<std::mutex> lk(session_mutex_);
+            s = session_;
+        }
+        if (s) s->resume_receive();
+    }
+
+    inline bool ReconnectingWebSocket::is_receive_paused() const noexcept {
+        if (receive_paused_.load()) return true;
+        std::shared_ptr<WebSocketSession> s;
+        {
+            std::lock_guard<std::mutex> lk(session_mutex_);
+            s = session_;
+        }
+        return s && s->is_receive_paused();
     }
 
     inline void ReconnectingWebSocket::close(uint16_t code, const string& reason) {

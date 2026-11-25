@@ -114,9 +114,44 @@ namespace megohttp {
             // payload still needs permessage-deflate decoding. The decoder does
             // not decompress: it has no negotiation context, and inflating
             // before UTF-8 validation would validate the wrong bytes.
+            //
+            // This is the legacy whole-message path. When
+            // wants_incremental_messages() returns true, the decoder calls
+            // on_message_begin/data/end instead and never calls on_message.
             virtual VoidResult on_message(WsMessageType type,
                                           const byte_buffer& payload,
-                                          bool compressed) = 0;
+                                          bool compressed) {
+                (void)type;
+                (void)payload;
+                (void)compressed;
+                return VoidResult{};
+            }
+
+            // --- incremental receive (task book 6.6 / 12.1A) ---
+            // Return true to opt into begin/data/end delivery. The decoder
+            // still does framing and fragmentation; the caller owns
+            // decompression and UTF-8 validation.
+            virtual bool wants_incremental_messages() const { return false; }
+            virtual VoidResult on_message_begin(WsMessageType type, bool compressed) {
+                (void)type;
+                (void)compressed;
+                return VoidResult{};
+            }
+            // One frame payload (or decompressed chunk, if the caller inflates).
+            // Empty payloads are not delivered. The pointer is valid only for
+            // this call.
+            virtual VoidResult on_message_data(const uint8_t* data, size_t size) {
+                (void)data;
+                (void)size;
+                return VoidResult{};
+            }
+            virtual VoidResult on_message_end() { return VoidResult{}; }
+
+            // Consumer backpressure. While true, the decoder stops before the
+            // next DATA frame; control frames that are already buffered are
+            // still delivered so ping/close cannot be starved. feed(nullptr, 0)
+            // resumes parsing buffered bytes.
+            virtual bool pause_requested() const { return false; }
         };
 
         WsFrameDecoder(Callbacks& cbs, Limits limits = {});

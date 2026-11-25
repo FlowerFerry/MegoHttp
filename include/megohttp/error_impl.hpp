@@ -99,6 +99,7 @@ namespace megohttp {
             { ErrorCode::WsCompressionNegotiationFailed,      "WsCompressionNegotiationFailed" },
             { ErrorCode::WsCompressionMalformedData,          "WsCompressionMalformedData" },
             { ErrorCode::WsCompressionResourceExceeded,       "WsCompressionResourceExceeded" },
+            { ErrorCode::WsCompressionFailed,                 "WsCompressionFailed" },
 
             { ErrorCode::MultipartMediaTypeInvalid,    "MultipartMediaTypeInvalid" },
             { ErrorCode::MultipartPartHeaderInvalid,   "MultipartPartHeaderInvalid" },

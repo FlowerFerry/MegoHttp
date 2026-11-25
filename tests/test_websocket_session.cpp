@@ -15,10 +15,12 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -77,6 +79,84 @@ namespace {
         if (vend == std::string::npos) return {};
         while (vstart < vend && (head[vstart] == ' ' || head[vstart] == '\t')) ++vstart;
         return head.substr(vstart, vend - vstart);
+    }
+
+    struct ParsedClientFrame {
+        bool fin{false};
+        bool rsv1{false};
+        uint8_t opcode{0};
+        std::vector<uint8_t> payload;
+    };
+
+    // Parse as many complete CLIENT frames as the captured byte stream holds.
+    // Incomplete trailing bytes are ignored: the server records whatever recv
+    // returned, which may end mid-frame.
+    std::vector<ParsedClientFrame> parse_client_frames(const std::vector<uint8_t>& bytes) {
+        std::vector<ParsedClientFrame> out;
+        size_t i = 0;
+        while (i + 2 <= bytes.size()) {
+            const uint8_t b0 = bytes[i];
+            const uint8_t b1 = bytes[i + 1];
+            const bool masked = (b1 & 0x80) != 0;
+            size_t len = b1 & 0x7F;
+            size_t hdr = 2;
+            if (len == 126) {
+                if (i + 4 > bytes.size()) break;
+                len = (static_cast<size_t>(bytes[i + 2]) << 8) |
+                      static_cast<size_t>(bytes[i + 3]);
+                hdr = 4;
+            } else if (len == 127) {
+                if (i + 10 > bytes.size()) break;
+                len = 0;
+                for (int k = 0; k < 8; ++k) {
+                    len = (len << 8) | static_cast<size_t>(bytes[i + 2 + k]);
+                }
+                hdr = 10;
+            }
+            const size_t need = hdr + (masked ? 4 : 0) + len;
+            if (i + need > bytes.size()) break;
+
+            ParsedClientFrame f;
+            f.fin = (b0 & 0x80) != 0;
+            f.rsv1 = (b0 & 0x40) != 0;
+            f.opcode = b0 & 0x0F;
+            f.payload.assign(bytes.begin() + static_cast<std::ptrdiff_t>(i + hdr + (masked ? 4 : 0)),
+                             bytes.begin() + static_cast<std::ptrdiff_t>(i + need));
+            if (masked) {
+                const uint8_t* m = bytes.data() + i + hdr;
+                for (size_t k = 0; k < f.payload.size(); ++k) {
+                    f.payload[k] = static_cast<uint8_t>(f.payload[k] ^ m[k % 4]);
+                }
+            }
+            out.push_back(std::move(f));
+            i += need;
+        }
+        return out;
+    }
+
+    // A server->client frame: never masked.
+    std::vector<uint8_t> server_frame(WsOpcode op, const std::string& payload,
+                                      bool fin = true, bool rsv1 = false) {
+        std::vector<uint8_t> out;
+        uint8_t b0 = static_cast<uint8_t>(op);
+        if (fin) b0 |= 0x80;
+        if (rsv1) b0 |= 0x40;
+        out.push_back(b0);
+        const size_t n = payload.size();
+        if (n < 126) {
+            out.push_back(static_cast<uint8_t>(n));
+        } else if (n <= 0xFFFF) {
+            out.push_back(126);
+            out.push_back(static_cast<uint8_t>(n >> 8));
+            out.push_back(static_cast<uint8_t>(n));
+        } else {
+            out.push_back(127);
+            for (int i = 7; i >= 0; --i) {
+                out.push_back(static_cast<uint8_t>(n >> (i * 8)));
+            }
+        }
+        out.insert(out.end(), payload.begin(), payload.end());
+        return out;
     }
 
     // A single-connection WebSocket server: handshake, then echo data frames.
@@ -180,13 +260,17 @@ namespace {
             }
 
             // --- echo any frames the client sends ---
+            std::vector<uint8_t> echo_buf;
             for (;;) {
                 int n = static_cast<int>(::recv(c, buf, sizeof buf, 0));
                 if (n <= 0) break;
                 client_frames_.insert(client_frames_.end(), buf, buf + n);
+                echo_buf.insert(echo_buf.end(), buf, buf + n);
                 // Echo the raw bytes back (a masked client frame unmasked would
-                // be wrong for a real server, so unmask then re-frame).
-                auto echo = unmask_and_reframe(buf, static_cast<size_t>(n));
+                // be wrong for a real server, so unmask then re-frame). The
+                // parser keeps a partial trailing frame for the next recv: TCP
+                // is free to split a frame.
+                auto echo = unmask_and_reframe(echo_buf);
                 if (!echo.empty()) {
                     ::send(c, reinterpret_cast<const char*>(echo.data()),
                            static_cast<int>(echo.size()), 0);
@@ -196,30 +280,37 @@ namespace {
         }
 
         // Client frames are masked; a server echoes the payload unmasked.
-        static std::vector<uint8_t> unmask_and_reframe(const char* data, size_t size) {
+        // `data` is consumed up to the last complete frame; a trailing partial
+        // frame stays in the buffer.
+        static std::vector<uint8_t> unmask_and_reframe(std::vector<uint8_t>& data) {
             std::vector<uint8_t> out;
             size_t i = 0;
-            while (i + 2 <= size) {
-                const uint8_t b0 = static_cast<uint8_t>(data[i]);
-                const uint8_t b1 = static_cast<uint8_t>(data[i + 1]);
+            while (i + 2 <= data.size()) {
+                const uint8_t b0 = data[i];
+                const uint8_t b1 = data[i + 1];
                 const bool masked = (b1 & 0x80) != 0;
                 size_t len = b1 & 0x7F;
                 size_t hdr = 2;
                 if (len == 126) {
-                    if (i + 4 > size) break;
-                    len = (static_cast<size_t>(static_cast<uint8_t>(data[i + 2])) << 8) |
-                          static_cast<size_t>(static_cast<uint8_t>(data[i + 3]));
+                    if (i + 4 > data.size()) break;
+                    len = (static_cast<size_t>(data[i + 2]) << 8) |
+                          static_cast<size_t>(data[i + 3]);
                     hdr = 4;
                 } else if (len == 127) {
-                    break;  // not needed for these tests
+                    if (i + 10 > data.size()) break;
+                    len = 0;
+                    for (int k = 0; k < 8; ++k) {
+                        len = (len << 8) | static_cast<size_t>(data[i + 2 + k]);
+                    }
+                    hdr = 10;
                 }
                 size_t need = hdr + (masked ? 4 : 0) + len;
-                if (i + need > size) break;
+                if (i + need > data.size()) break;
 
-                std::vector<uint8_t> payload(data + i + hdr + (masked ? 4 : 0),
-                                             data + i + need);
+                std::vector<uint8_t> payload(data.begin() + static_cast<std::ptrdiff_t>(i + hdr + (masked ? 4 : 0)),
+                                             data.begin() + static_cast<std::ptrdiff_t>(i + need));
                 if (masked) {
-                    const uint8_t* m = reinterpret_cast<const uint8_t*>(data + i + hdr);
+                    const uint8_t* m = data.data() + i + hdr;
                     for (size_t k = 0; k < payload.size(); ++k) {
                         payload[k] = static_cast<uint8_t>(payload[k] ^ m[k % 4]);
                     }
@@ -228,14 +319,20 @@ namespace {
                 out.push_back(b0);
                 if (payload.size() < 126) {
                     out.push_back(static_cast<uint8_t>(payload.size()));
-                } else {
+                } else if (payload.size() <= 0xFFFF) {
                     out.push_back(126);
                     out.push_back(static_cast<uint8_t>(payload.size() >> 8));
                     out.push_back(static_cast<uint8_t>(payload.size()));
+                } else {
+                    out.push_back(127);
+                    for (int k = 7; k >= 0; --k) {
+                        out.push_back(static_cast<uint8_t>(payload.size() >> (k * 8)));
+                    }
                 }
                 out.insert(out.end(), payload.begin(), payload.end());
                 i += need;
             }
+            data.erase(data.begin(), data.begin() + static_cast<std::ptrdiff_t>(i));
             return out;
         }
 
@@ -611,6 +708,7 @@ TEST_CASE("ws session closes with a close frame", "[websocket][session]") {
     CHECK(fx.session->state() != WebSocketState::Open);
 }
 
+#if MEGOHTTP_HAS_WEBSOCKET_DEFLATE
 TEST_CASE("ws session negotiates permessage-deflate and sets RSV1", "[websocket][session][deflate]") {
     sock_init();
     WsEchoServer srv;
@@ -721,4 +819,692 @@ TEST_CASE("ws session rejects a compressed frame without negotiation",
     REQUIRE(wait_until([&] { return opened.load(); }));
     REQUIRE(wait_until([&] { return errored.load(); }));
     CHECK(seen.code() == ErrorCode::WsProtocolError);
+}
+#endif
+
+TEST_CASE("ws incremental receive delivers begin/data/end and keeps on_message off",
+          "[websocket][session]") {
+    sock_init();
+    WsEchoServer srv;
+    REQUIRE(srv.start());
+
+    std::vector<uint8_t> greeting;
+    auto a = server_frame(WsOpcode::Text, "hello ", false);
+    auto ping = server_frame(WsOpcode::Ping, "k", true);
+    auto b = server_frame(WsOpcode::Continuation, "world", true);
+    greeting.insert(greeting.end(), a.begin(), a.end());
+    greeting.insert(greeting.end(), ping.begin(), ping.end());
+    greeting.insert(greeting.end(), b.begin(), b.end());
+    srv.set_greeting(greeting);
+
+    SessionFixture fx;
+    REQUIRE(fx.connect(srv.port()));
+
+    std::atomic<bool> opened{false};
+    std::atomic<int> begins{0};
+    std::atomic<int> ends{0};
+    std::atomic<bool> whole_called{false};
+    std::atomic<bool> begin_compressed{true};
+    WsMessageType begin_type{WsMessageType::Binary};
+    std::mutex chunks_mutex;
+    std::vector<std::string> chunks;
+
+    fx.session = std::make_shared<WebSocketSession>(fx.stream, WebSocketOptions{}, fx.exec);
+    fx.session->on_message([&](WsMessageType, const std::vector<uint8_t>&) {
+        whole_called.store(true);
+    });
+    fx.session->set_incremental_message_callbacks(
+        [&](WsMessageType t, bool compressed) {
+            begin_type = t;
+            begin_compressed.store(compressed);
+            begins.fetch_add(1);
+        },
+        [&](const uint8_t* data, size_t size) {
+            std::lock_guard<std::mutex> lk(chunks_mutex);
+            chunks.emplace_back(reinterpret_cast<const char*>(data), size);
+            return true;
+        },
+        [&]() { ends.fetch_add(1); });
+
+    fx.on_loop([&] {
+        fx.session->start(string("localhost"), string("/"), Headers{},
+                          [&](const Error&) { opened.store(true); });
+    });
+    REQUIRE(wait_until([&] { return opened.load(); }));
+    REQUIRE(wait_until([&] { return ends.load() == 1; }));
+
+    CHECK(begins.load() == 1);
+    CHECK(begin_type == WsMessageType::Text);
+    CHECK(!begin_compressed.load());
+    CHECK(!whole_called.load());
+    std::lock_guard<std::mutex> lk(chunks_mutex);
+    REQUIRE(chunks.size() == 2);
+    CHECK(chunks[0] == "hello ");
+    CHECK(chunks[1] == "world");
+}
+
+TEST_CASE("ws incremental receive pause stops before the next data frame and resumes",
+          "[websocket][session]") {
+    sock_init();
+    WsEchoServer srv;
+    REQUIRE(srv.start());
+
+    std::vector<uint8_t> greeting;
+    auto a = server_frame(WsOpcode::Text, "one", false);
+    auto ping = server_frame(WsOpcode::Ping, "k", true);
+    auto b = server_frame(WsOpcode::Continuation, "two", true);
+    greeting.insert(greeting.end(), a.begin(), a.end());
+    greeting.insert(greeting.end(), ping.begin(), ping.end());
+    greeting.insert(greeting.end(), b.begin(), b.end());
+    srv.set_greeting(greeting);
+
+    SessionFixture fx;
+    REQUIRE(fx.connect(srv.port()));
+
+    std::atomic<bool> opened{false};
+    std::atomic<bool> end_called{false};
+    std::mutex chunks_mutex;
+    std::vector<std::string> chunks;
+
+    fx.session = std::make_shared<WebSocketSession>(fx.stream, WebSocketOptions{}, fx.exec);
+    fx.session->set_incremental_message_callbacks(
+        [](WsMessageType, bool) {},
+        [&](const uint8_t* data, size_t size) {
+            std::lock_guard<std::mutex> lk(chunks_mutex);
+            chunks.emplace_back(reinterpret_cast<const char*>(data), size);
+            return chunks.size() != 1;        // pause after the first frame
+        },
+        [&]() { end_called.store(true); });
+
+    fx.on_loop([&] {
+        fx.session->start(string("localhost"), string("/"), Headers{},
+                          [&](const Error&) { opened.store(true); });
+    });
+    REQUIRE(wait_until([&] { return opened.load(); }));
+    REQUIRE(wait_until([&] {
+        std::lock_guard<std::mutex> lk(chunks_mutex);
+        return chunks.size() == 1;
+    }));
+    CHECK(fx.session->is_receive_paused());
+    CHECK(!end_called.load());
+    // The buffered ping must still be processed while paused: the client
+    // auto-pongs even though the next data frame is held back.
+    REQUIRE(wait_until([&] {
+        const auto frames = parse_client_frames(srv.client_frames());
+        for (const auto& f : frames) {
+            if (f.opcode == 0x0A) return true;
+        }
+        return false;
+    }));
+
+    fx.session->resume_receive();
+    REQUIRE(wait_until([&] { return end_called.load(); }));
+    CHECK(!fx.session->is_receive_paused());
+    std::lock_guard<std::mutex> lk(chunks_mutex);
+    REQUIRE(chunks.size() == 2);
+    CHECK(chunks[0] == "one");
+    CHECK(chunks[1] == "two");
+}
+
+#if MEGOHTTP_HAS_WEBSOCKET_DEFLATE
+TEST_CASE("ws incremental receive decompresses a compressed message per frame",
+          "[websocket][session][deflate]") {
+    sock_init();
+    WsEchoServer srv;
+    REQUIRE(srv.start());
+    srv.accept_deflate("permessage-deflate");
+
+    SessionFixture fx;
+    REQUIRE(fx.connect(srv.port()));
+
+    std::atomic<bool> opened{false};
+    std::atomic<bool> sent{false};
+    std::atomic<bool> end_called{false};
+    std::atomic<bool> whole_called{false};
+    std::atomic<bool> begin_compressed{false};
+    std::string received;
+    std::mutex received_mutex;
+
+    WebSocketOptions opts;
+    opts.enable_deflate = true;
+    opts.max_frame_size = 32;   // force the compressed payload across frames
+    fx.session = std::make_shared<WebSocketSession>(fx.stream, opts, fx.exec);
+    fx.session->on_message([&](WsMessageType, const std::vector<uint8_t>&) {
+        whole_called.store(true);
+    });
+    fx.session->set_incremental_message_callbacks(
+        [&](WsMessageType, bool compressed) { begin_compressed.store(compressed); },
+        [&](const uint8_t* data, size_t size) {
+            std::lock_guard<std::mutex> lk(received_mutex);
+            received.append(reinterpret_cast<const char*>(data), size);
+            return true;
+        },
+        [&]() { end_called.store(true); });
+
+    fx.on_loop([&] {
+        fx.session->start(string("localhost"), string("/"), Headers{},
+                          [&](const Error&) { opened.store(true); });
+    });
+    REQUIRE(wait_until([&] { return opened.load(); }));
+    REQUIRE(fx.session->negotiated_deflate().enabled);
+
+    std::string payload;
+    for (int i = 0; i < 100; ++i) {
+        payload += "compressed incremental receive payload ";
+    }
+    fx.on_loop([&] {
+        fx.session->send_text(string(payload.c_str()), [&](const Error& e) {
+            CHECK(!e);
+            sent.store(true);
+        });
+    });
+    REQUIRE(wait_until([&] { return sent.load(); }));
+    REQUIRE(wait_until([&] { return end_called.load(); }));
+    CHECK(begin_compressed.load());
+    CHECK(!whole_called.load());
+    std::lock_guard<std::mutex> lk(received_mutex);
+    CHECK(received == payload);
+}
+#endif
+
+TEST_CASE("ws incremental send produces one message and lets ping interleave",
+          "[websocket][session]") {
+    sock_init();
+    WsEchoServer srv;
+    REQUIRE(srv.start());
+
+    SessionFixture fx;
+    REQUIRE(fx.connect(srv.port()));
+
+    std::atomic<bool> opened{false};
+    std::atomic<bool> done{false};
+    std::atomic<bool> got{false};
+    std::atomic<bool> errored{false};
+    Error completion;
+    Error session_error;
+    std::string received;
+
+    fx.session = std::make_shared<WebSocketSession>(fx.stream, WebSocketOptions{}, fx.exec);
+    fx.session->on_error([&](const Error& e) {
+        session_error = e;
+        errored.store(true);
+    });
+    fx.session->on_message([&](WsMessageType type, const std::vector<uint8_t>& data) {
+        if (type == WsMessageType::Text) {
+            received.assign(data.begin(), data.end());
+            got.store(true);
+        }
+    });
+    fx.on_loop([&] {
+        fx.session->start(string("localhost"), string("/"), Headers{},
+                          [&](const Error&) { opened.store(true); });
+    });
+    REQUIRE(wait_until([&] { return opened.load(); }));
+
+    fx.on_loop([&] {
+        CHECK(static_cast<bool>(fx.session->send_begin(WsMessageType::Text)));
+        CHECK(fx.session->is_sending_message());
+        CHECK(static_cast<bool>(fx.session->send_data(
+            reinterpret_cast<const uint8_t*>("hello "), 6)));
+        fx.session->send_ping(std::vector<uint8_t>{0x6B});
+        CHECK(static_cast<bool>(fx.session->send_data(
+            reinterpret_cast<const uint8_t*>("world"), 5)));
+        auto r = fx.session->send_end([&](const Error& e) {
+            completion = e;
+            done.store(true);
+        });
+        CHECK(static_cast<bool>(r));
+        CHECK(!fx.session->is_sending_message());
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    CHECK(!completion);
+    CHECK(!errored);
+    INFO("session error: " << std::string(session_error.message().begin(),
+                                          session_error.message().end()));
+    CHECK(static_cast<int>(session_error.code()) == 0);
+    const auto sent_frames = parse_client_frames(srv.client_frames());
+    INFO("client frames=" << sent_frames.size() << " bytes=" << srv.client_frames().size());
+    CHECK(sent_frames.size() >= 4);
+    REQUIRE(wait_until([&] { return got.load(); }));
+    CHECK(received == "hello world");
+
+    REQUIRE(wait_until([&] { return parse_client_frames(srv.client_frames()).size() >= 4; }));
+    const auto frames = parse_client_frames(srv.client_frames());
+    std::vector<ParsedClientFrame> data_frames;
+    bool saw_ping = false;
+    for (const auto& f : frames) {
+        if (f.opcode == 0x09) saw_ping = true;
+        if (f.opcode == 0x01 || f.opcode == 0x00) data_frames.push_back(f);
+    }
+    CHECK(saw_ping);
+    REQUIRE(data_frames.size() >= 2);
+    CHECK(data_frames.front().opcode == 0x01);
+    CHECK(!data_frames.front().fin);
+    CHECK(!data_frames.front().rsv1);
+    CHECK(data_frames.back().opcode == 0x00);
+    CHECK(data_frames.back().fin);
+    std::string wire_text;
+    for (const auto& f : data_frames) {
+        wire_text.append(f.payload.begin(), f.payload.end());
+    }
+    CHECK(wire_text == "hello world");
+}
+
+#if MEGOHTTP_HAS_WEBSOCKET_DEFLATE
+TEST_CASE("ws incremental compressed send reassembles and fragments by wire size",
+          "[websocket][session][deflate]") {
+    sock_init();
+    WsEchoServer srv;
+    REQUIRE(srv.start());
+    srv.accept_deflate("permessage-deflate");
+
+    SessionFixture fx;
+    REQUIRE(fx.connect(srv.port()));
+
+    std::atomic<bool> opened{false};
+    std::atomic<bool> done{false};
+    std::atomic<bool> got{false};
+    Error completion;
+    std::string received;
+
+    WebSocketOptions opts;
+    opts.enable_deflate = true;
+    opts.max_frame_size = 64;   // force several compressed frames
+    fx.session = std::make_shared<WebSocketSession>(fx.stream, opts, fx.exec);
+    fx.session->on_message([&](WsMessageType type, const std::vector<uint8_t>& data) {
+        if (type == WsMessageType::Text) {
+            received.assign(data.begin(), data.end());
+            got.store(true);
+        }
+    });
+    fx.on_loop([&] {
+        fx.session->start(string("localhost"), string("/"), Headers{},
+                          [&](const Error&) { opened.store(true); });
+    });
+    REQUIRE(wait_until([&] { return opened.load(); }));
+    REQUIRE(fx.session->negotiated_deflate().enabled);
+
+    std::string payload;
+    for (int i = 0; i < 300; ++i) payload += "compressible incremental payload ";
+
+    fx.on_loop([&] {
+        CHECK(static_cast<bool>(fx.session->send_begin(WsMessageType::Text)));
+        for (size_t off = 0; off < payload.size(); off += 37) {
+            const size_t take = (std::min)(size_t{37}, payload.size() - off);
+            auto r = fx.session->send_data(
+                reinterpret_cast<const uint8_t*>(payload.data() + off), take);
+            CHECK(static_cast<bool>(r));
+        }
+        auto r = fx.session->send_end([&](const Error& e) {
+            completion = e;
+            done.store(true);
+        });
+        CHECK(static_cast<bool>(r));
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    CHECK(!completion);
+    REQUIRE(wait_until([&] { return got.load(); }));
+    CHECK(received == payload);
+
+    REQUIRE(wait_until([&] {
+        const auto fs = parse_client_frames(srv.client_frames());
+        return fs.size() >= 2;
+    }));
+    const auto frames = parse_client_frames(srv.client_frames());
+    std::vector<ParsedClientFrame> data_frames;
+    for (const auto& f : frames) {
+        if (f.opcode == 0x01 || f.opcode == 0x00) data_frames.push_back(f);
+    }
+    REQUIRE(data_frames.size() >= 2);
+    CHECK(data_frames.front().opcode == 0x01);
+    CHECK(data_frames.front().rsv1);
+    CHECK(!data_frames.front().fin);
+    for (size_t i = 1; i < data_frames.size(); ++i) {
+        CHECK(data_frames[i].opcode == 0x00);
+        CHECK(!data_frames[i].rsv1);
+    }
+    CHECK(data_frames.back().fin);
+}
+#endif
+
+TEST_CASE("ws incremental compressed empty message keeps the context in sync",
+          "[websocket][session][deflate]") {
+#if MEGOHTTP_HAS_WEBSOCKET_DEFLATE
+    sock_init();
+    WsEchoServer srv;
+    REQUIRE(srv.start());
+    srv.accept_deflate("permessage-deflate");
+
+    SessionFixture fx;
+    REQUIRE(fx.connect(srv.port()));
+
+    std::atomic<bool> opened{false};
+    std::atomic<bool> first_done{false};
+    std::atomic<bool> second_done{false};
+    std::atomic<int> messages{0};
+    std::vector<std::string> received;
+    std::mutex received_mutex;
+
+    WebSocketOptions opts;
+    opts.enable_deflate = true;
+    fx.session = std::make_shared<WebSocketSession>(fx.stream, opts, fx.exec);
+    fx.session->on_message([&](WsMessageType, const std::vector<uint8_t>& data) {
+        std::lock_guard<std::mutex> lk(received_mutex);
+        received.emplace_back(data.begin(), data.end());
+        messages.fetch_add(1);
+    });
+    fx.on_loop([&] {
+        fx.session->start(string("localhost"), string("/"), Headers{},
+                          [&](const Error&) { opened.store(true); });
+    });
+    REQUIRE(wait_until([&] { return opened.load(); }));
+    REQUIRE(fx.session->negotiated_deflate().enabled);
+
+    fx.on_loop([&] {
+        CHECK(static_cast<bool>(fx.session->send_begin(WsMessageType::Text)));
+        auto r = fx.session->send_end([&](const Error& e) {
+            CHECK(!e);
+            first_done.store(true);
+        });
+        CHECK(static_cast<bool>(r));
+    });
+    REQUIRE(wait_until([&] { return first_done.load(); }));
+
+    // A second compressed message proves both zlib contexts advanced together.
+    fx.on_loop([&] {
+        fx.session->send_text(string("after-empty"), [&](const Error& e) {
+            CHECK(!e);
+            second_done.store(true);
+        });
+    });
+    REQUIRE(wait_until([&] { return second_done.load(); }));
+    REQUIRE(wait_until([&] { return messages.load() == 2; }));
+
+    std::lock_guard<std::mutex> lk(received_mutex);
+    REQUIRE(received.size() == 2);
+    CHECK(received[0].empty());
+    CHECK(received[1] == "after-empty");
+#endif
+}
+
+TEST_CASE("ws incremental send validates state and message size",
+          "[websocket][session]") {
+    sock_init();
+    WsEchoServer srv;
+    REQUIRE(srv.start());
+
+    SessionFixture fx;
+    REQUIRE(fx.connect(srv.port()));
+
+    std::atomic<bool> opened{false};
+    std::atomic<bool> done{false};
+    Error completion;
+
+    WebSocketOptions opts;
+    opts.max_message_size = 8;
+    fx.session = std::make_shared<WebSocketSession>(fx.stream, opts, fx.exec);
+    fx.on_loop([&] {
+        fx.session->start(string("localhost"), string("/"), Headers{},
+                          [&](const Error&) { opened.store(true); });
+    });
+    REQUIRE(wait_until([&] { return opened.load(); }));
+
+    fx.on_loop([&] {
+        auto no_begin = fx.session->send_data(
+            reinterpret_cast<const uint8_t*>("x"), 1);
+        CHECK(!no_begin);
+        CHECK(no_begin.error().code() == ErrorCode::WsInvalidState);
+        auto no_end = fx.session->send_end();
+        CHECK(!no_end);
+        CHECK(no_end.error().code() == ErrorCode::WsInvalidState);
+
+        CHECK(static_cast<bool>(fx.session->send_begin(WsMessageType::Text)));
+        auto twice = fx.session->send_begin(WsMessageType::Text);
+        CHECK(!twice);
+        CHECK(twice.error().code() == ErrorCode::WsInvalidState);
+
+        bool sync_rejected = false;
+        fx.session->send_text(string("x"), [&](const Error& e) {
+            sync_rejected = (e.code() == ErrorCode::WsInvalidState);
+        });
+        CHECK(sync_rejected);
+
+        auto too_large = fx.session->send_data(
+            reinterpret_cast<const uint8_t*>("123456789"), 9);
+        CHECK(!too_large);
+        CHECK(too_large.error().code() == ErrorCode::WsMessageTooLarge);
+
+        CHECK(static_cast<bool>(fx.session->send_data(
+            reinterpret_cast<const uint8_t*>("1234"), 4)));
+        auto r = fx.session->send_end([&](const Error& e) {
+            completion = e;
+            done.store(true);
+        });
+        CHECK(static_cast<bool>(r));
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    CHECK(!completion);
+}
+
+TEST_CASE("ws send queue rejects before compressing and keeps the message usable",
+          "[websocket][session]") {
+    sock_init();
+    WsEchoServer srv;
+    REQUIRE(srv.start());
+
+    SessionFixture fx;
+    REQUIRE(fx.connect(srv.port()));
+
+    std::atomic<bool> opened{false};
+    std::atomic<bool> got{false};
+    std::string received;
+
+    WebSocketOptions opts;
+    opts.max_send_queue_bytes = 32;
+    fx.session = std::make_shared<WebSocketSession>(fx.stream, opts, fx.exec);
+    fx.session->on_message([&](WsMessageType, const std::vector<uint8_t>& data) {
+        received.assign(data.begin(), data.end());
+        got.store(true);
+    });
+    fx.on_loop([&] {
+        fx.session->start(string("localhost"), string("/"), Headers{},
+                          [&](const Error&) { opened.store(true); });
+    });
+    REQUIRE(wait_until([&] { return opened.load(); }));
+
+    std::atomic<bool> done{false};
+    Error completion;
+    fx.on_loop([&] {
+        REQUIRE(static_cast<bool>(fx.session->send_begin(WsMessageType::Text)));
+        std::vector<uint8_t> too_big(100, 'x');
+        auto r = fx.session->send_data(too_big);
+        CHECK(!r);
+        CHECK(r.error().code() == ErrorCode::WsSendQueueFull);
+        CHECK(fx.session->is_sending_message());   // rejection is retryable
+
+        CHECK(static_cast<bool>(fx.session->send_data(
+            reinterpret_cast<const uint8_t*>("ok"), 2)));
+        auto end = fx.session->send_end([&](const Error& e) {
+            completion = e;
+            done.store(true);
+        });
+        CHECK(static_cast<bool>(end));
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    CHECK(!completion);
+    REQUIRE(wait_until([&] { return got.load(); }));
+    CHECK(received == "ok");
+}
+
+TEST_CASE("ws compressed sends from two threads keep the deflate context ordered",
+          "[websocket][session][deflate]") {
+#if MEGOHTTP_HAS_WEBSOCKET_DEFLATE
+    sock_init();
+    WsEchoServer srv;
+    REQUIRE(srv.start());
+    srv.accept_deflate("permessage-deflate");
+
+    SessionFixture fx;
+    REQUIRE(fx.connect(srv.port()));
+
+    std::atomic<bool> opened{false};
+    std::atomic<int> completions{0};
+    std::atomic<int> messages{0};
+    std::vector<std::string> received;
+    std::mutex received_mutex;
+
+    WebSocketOptions opts;
+    opts.enable_deflate = true;
+    fx.session = std::make_shared<WebSocketSession>(fx.stream, opts, fx.exec);
+    fx.session->on_message([&](WsMessageType, const std::vector<uint8_t>& data) {
+        std::lock_guard<std::mutex> lk(received_mutex);
+        received.emplace_back(data.begin(), data.end());
+        messages.fetch_add(1);
+    });
+    fx.on_loop([&] {
+        fx.session->start(string("localhost"), string("/"), Headers{},
+                          [&](const Error&) { opened.store(true); });
+    });
+    REQUIRE(wait_until([&] { return opened.load(); }));
+
+    auto send_one = [&](const char* text) {
+        fx.session->send_text(string(text), [&](const Error& e) {
+            CHECK(!e);
+            completions.fetch_add(1);
+        });
+    };
+    std::thread t1([&] { send_one("alpha alpha alpha alpha alpha"); });
+    std::thread t2([&] { send_one("beta beta beta beta beta"); });
+    t1.join();
+    t2.join();
+
+    REQUIRE(wait_until([&] { return completions.load() == 2; }));
+    REQUIRE(wait_until([&] { return messages.load() == 2; }));
+    std::lock_guard<std::mutex> lk(received_mutex);
+    REQUIRE(received.size() == 2);
+    const bool alpha = received[0].find("alpha") != std::string::npos ||
+                       received[1].find("alpha") != std::string::npos;
+    const bool beta = received[0].find("beta") != std::string::npos ||
+                      received[1].find("beta") != std::string::npos;
+    CHECK(alpha);
+    CHECK(beta);
+#endif
+}
+
+TEST_CASE("ws compressed send data rejection does not consume the deflate context",
+          "[websocket][session][deflate]") {
+#if MEGOHTTP_HAS_WEBSOCKET_DEFLATE
+    sock_init();
+    WsEchoServer srv;
+    REQUIRE(srv.start());
+    srv.accept_deflate("permessage-deflate");
+
+    SessionFixture fx;
+    REQUIRE(fx.connect(srv.port()));
+
+    std::atomic<bool> opened{false};
+    std::atomic<bool> done{false};
+    std::atomic<bool> got{false};
+    Error completion;
+    std::string received;
+
+    WebSocketOptions opts;
+    opts.enable_deflate = true;
+    opts.max_send_queue_bytes = 800;
+    fx.session = std::make_shared<WebSocketSession>(fx.stream, opts, fx.exec);
+    fx.session->on_message([&](WsMessageType, const std::vector<uint8_t>& data) {
+        received.assign(data.begin(), data.end());
+        got.store(true);
+    });
+    fx.on_loop([&] {
+        fx.session->start(string("localhost"), string("/"), Headers{},
+                          [&](const Error&) { opened.store(true); });
+    });
+    REQUIRE(wait_until([&] { return opened.load(); }));
+    REQUIRE(fx.session->negotiated_deflate().enabled);
+
+    fx.on_loop([&] {
+        CHECK(static_cast<bool>(fx.session->send_begin(WsMessageType::Text)));
+        std::vector<uint8_t> too_big(400, 'z');
+        auto rejected = fx.session->send_data(too_big);
+        CHECK(!rejected);
+        CHECK(rejected.error().code() == ErrorCode::WsSendQueueFull);
+
+        // The rejected chunk must not have been fed to zlib: the next accepted
+        // chunk must decode as exactly "ok", not "zzz...ok".
+        CHECK(static_cast<bool>(fx.session->send_data(
+            reinterpret_cast<const uint8_t*>("ok"), 2)));
+        auto r = fx.session->send_end([&](const Error& e) {
+            completion = e;
+            done.store(true);
+        });
+        CHECK(static_cast<bool>(r));
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    CHECK(!completion);
+    REQUIRE(wait_until([&] { return got.load(); }));
+    CHECK(received == "ok");
+#endif
+}
+
+TEST_CASE("ws whole-message send fragments at max_frame_size", "[websocket][session]") {
+    sock_init();
+    WsEchoServer srv;
+    REQUIRE(srv.start());
+
+    SessionFixture fx;
+    REQUIRE(fx.connect(srv.port()));
+
+    std::atomic<bool> opened{false};
+    std::atomic<bool> sent{false};
+    std::atomic<bool> got{false};
+    std::string received;
+    std::string payload(500, 'f');
+
+    WebSocketOptions opts;
+    opts.max_frame_size = 64;
+    fx.session = std::make_shared<WebSocketSession>(fx.stream, opts, fx.exec);
+    fx.session->on_message([&](WsMessageType, const std::vector<uint8_t>& data) {
+        received.assign(data.begin(), data.end());
+        got.store(true);
+    });
+    fx.on_loop([&] {
+        fx.session->start(string("localhost"), string("/"), Headers{},
+                          [&](const Error&) { opened.store(true); });
+    });
+    REQUIRE(wait_until([&] { return opened.load(); }));
+
+    fx.on_loop([&] {
+        fx.session->send_text(string(payload.c_str()), [&](const Error& e) {
+            CHECK(!e);
+            sent.store(true);
+        });
+    });
+    REQUIRE(wait_until([&] { return sent.load(); }));
+    REQUIRE(wait_until([&] { return got.load(); }));
+    CHECK(received == payload);
+
+    REQUIRE(wait_until([&] { return parse_client_frames(srv.client_frames()).size() >= 2; }));
+    const auto frames = parse_client_frames(srv.client_frames());
+    std::vector<ParsedClientFrame> data_frames;
+    for (const auto& f : frames) {
+        if (f.opcode == 0x01 || f.opcode == 0x00) data_frames.push_back(f);
+    }
+    REQUIRE(data_frames.size() >= 2);
+    CHECK(data_frames.front().opcode == 0x01);
+    CHECK(!data_frames.front().fin);
+    for (size_t i = 1; i < data_frames.size(); ++i) {
+        CHECK(data_frames[i].opcode == 0x00);
+    }
+    CHECK(data_frames.back().fin);
+    std::string wire_text;
+    for (const auto& f : data_frames) {
+        wire_text.append(f.payload.begin(), f.payload.end());
+    }
+    CHECK(wire_text == payload);
 }

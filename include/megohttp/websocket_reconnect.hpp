@@ -45,6 +45,9 @@ namespace megohttp {
         using OpenCallback = std::function<void(const Error&)>;
         using MessageCallback =
             std::function<void(WsMessageType, const std::vector<uint8_t>&)>;
+        using MessageBeginCallback = WebSocketSession::MessageBeginCallback;
+        using MessageDataCallback = WebSocketSession::MessageDataCallback;
+        using MessageEndCallback = WebSocketSession::MessageEndCallback;
         using CloseCallback = std::function<void(uint16_t code, const string& reason)>;
         using ErrorCallback = std::function<void(const Error&)>;
         // Session-level terminal, exactly once: user close, budget exhausted,
@@ -98,6 +101,28 @@ namespace megohttp {
         bool send_binary(const std::vector<uint8_t>& data,
                          std::function<void(const Error&)> on_complete = nullptr);
 
+        // Incremental send on the CURRENT physical connection. The message is
+        // bound to that connection: a disconnect aborts it and the send_end
+        // callback fires with the disconnect error. It is never queued or
+        // replayed on a reconnect (task book 12.2).
+        VoidResult send_begin(WsMessageType type);
+        VoidResult send_data(const uint8_t* data, size_t size);
+        VoidResult send_data(string_view data);
+        VoidResult send_data(const std::vector<uint8_t>& data);
+        VoidResult send_end(std::function<void(const Error&)> on_complete = nullptr);
+        bool is_sending_message() const noexcept;
+
+        // Incremental receive. Callbacks are stored on the logical session and
+        // applied to every new physical connection. A message interrupted by a
+        // disconnect does not receive an end callback; the disconnect is
+        // reported through on_error/on_close.
+        void set_incremental_message_callbacks(MessageBeginCallback begin,
+                                               MessageDataCallback data,
+                                               MessageEndCallback end);
+        void pause_receive();
+        void resume_receive();
+        bool is_receive_paused() const noexcept;
+
         // Graceful close of the logical session: sends a close frame, then
         // stops reconnecting.
         void close(uint16_t code = 1000, const string& reason = {});
@@ -143,10 +168,15 @@ namespace megohttp {
 
         OpenCallback open_cb_;
         MessageCallback message_cb_;
+        MessageBeginCallback inc_message_begin_cb_;
+        MessageDataCallback inc_message_data_cb_;
+        MessageEndCallback inc_message_end_cb_;
         CloseCallback close_cb_;
         ErrorCallback error_cb_;
         SessionEndCallback end_cb_;
         ReconnectEvents events_;
+
+        std::atomic<bool> receive_paused_{false};
 
         std::atomic<bool> started_{false};
         std::atomic<bool> stopped_{false};      // user closed or session ended
