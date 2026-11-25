@@ -3,6 +3,7 @@
 
 #include <megohttp/config.hpp>
 #include <megohttp/error.hpp>
+#include <megohttp/file_source.hpp>
 #include <megohttp/request.hpp>
 #include <megohttp/string_adapter.hpp>
 
@@ -47,6 +48,22 @@ namespace megohttp {
                                   string_view filename,
                                   string_view content_type,
                                   std::vector<uint8_t> data);
+
+        // A file field backed by a FileSource. The worker thread reads the
+        // file; the multipart body pulls chunks through the source's bounded
+        // queue. When the file size is known, apply_to() emits Content-Length.
+        VoidResult add_file_field(string_view name,
+                                  string_view filename,
+                                  string_view content_type,
+                                  std::shared_ptr<FileSource> source);
+
+        // Convenience overload: opens the path (synchronously) and adds the
+        // resulting FileSource. Read errors surface through the body source.
+        VoidResult add_file_field(string_view name,
+                                  string_view filename,
+                                  string_view content_type,
+                                  string_view path,
+                                  FileSource::Options options = {});
 
         // A file field produced on demand. `size` lets the builder emit an exact
         // Content-Length; leave it nullopt to fall back to chunked transfer.

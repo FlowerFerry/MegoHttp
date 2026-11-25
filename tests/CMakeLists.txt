@@ -24,6 +24,7 @@ set(MGHTTP_TEST_SOURCES
     test_streaming.cpp
     test_streaming_integration.cpp
     test_streaming_network.cpp
+    test_file_source.cpp
     test_multipart.cpp
     test_multipart_response.cpp
     test_multipart_continuous.cpp

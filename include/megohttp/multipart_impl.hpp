@@ -216,6 +216,26 @@ namespace megohttp {
         return VoidResult{};
     }
 
+    inline VoidResult MultipartBuilder::add_file_field(
+        string_view name, string_view filename, string_view content_type,
+        std::shared_ptr<FileSource> source) {
+        if (!source) {
+            return Error{ErrorCode::InvalidArgument, ErrorPhase::None,
+                         string("multipart file field has no source")};
+        }
+        return add_stream_field(name, filename, content_type,
+                                source->body_source(), source->size());
+    }
+
+    inline VoidResult MultipartBuilder::add_file_field(
+        string_view name, string_view filename, string_view content_type,
+        string_view path, FileSource::Options options) {
+        auto opened = FileSource::open(path, options);
+        if (!opened) return opened.error();
+        return add_file_field(name, filename, content_type,
+                              std::move(opened.value()));
+    }
+
     inline VoidResult MultipartBuilder::add_stream_field(string_view name,
                                                          string_view filename,
                                                          string_view content_type,

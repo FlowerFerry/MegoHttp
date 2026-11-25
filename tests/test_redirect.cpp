@@ -225,6 +225,10 @@ TEST_CASE("303 redirect turns POST into GET and drops the body", "[redirect]") {
     Client c(following());
     Request req(Method::Post, to_s(url_on(srv.port(), "/start")));
     req.set_body("hello");
+    // Caller-supplied framing must be dropped with the body on 303. The
+    // library-generated Content-Length never lived in Request::headers(), so
+    // only this explicit header proves the cleanup path.
+    req.headers().set("content-length", "5");
 
     auto r = c.request_sync(req);
     REQUIRE(r);
@@ -237,7 +241,8 @@ TEST_CASE("303 redirect turns POST into GET and drops the body", "[redirect]") {
     CHECK(seen[1].path == "/done");
     // No body headers left over on the second hop.
     const std::string h1 = read_file_head(seen[1]);
-    CHECK(h1.find("content-length: 5") == std::string::npos);
+    CHECK(h1.find("content-length:") == std::string::npos);
+    CHECK(h1.find("transfer-encoding:") == std::string::npos);
 }
 
 TEST_CASE("307 preserves the method and the body", "[redirect]") {

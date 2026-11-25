@@ -2374,6 +2374,13 @@ namespace megohttp {
                     // its coding go with it. Leaving either behind would put a
                     // Content-Encoding on a request that carries no body.
                     next_req.set_compress_body(Request::Compression::None);
+                    // A caller (or FileSource::attach_to) may have supplied
+                    // framing for the body that no longer exists. Leaving
+                    // Content-Length here makes the GET claim a body and hang
+                    // the server waiting for bytes.
+                    next_req.headers().remove("content-length");
+                    next_req.headers().remove("transfer-encoding");
+                    next_req.headers().remove("trailer");
                     s->wire_coding = Request::Compression::None;
                     s->encoded_body.clear();
                 } else if (redirect_detail::preserves_body(status)) {
