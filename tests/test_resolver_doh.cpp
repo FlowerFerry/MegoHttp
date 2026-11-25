@@ -31,6 +31,8 @@
 #include <unistd.h>
 #endif
 
+#include "process_job.hpp"
+
 namespace {
 
 using namespace megohttp;
@@ -67,11 +69,14 @@ public:
 
     void stop() {
 #if defined(_WIN32)
-        if (pid_ > 0) {
-            std::string c = "taskkill /F /PID " + std::to_string(pid_) + " > nul 2>&1";
-            std::system(c.c_str());
+        if (job_assigned_) {
+            job_.terminate();
+            pid_ = 0;
+        } else if (pid_ > 0) {
+            mghttp_test::terminate_tree(static_cast<DWORD>(pid_));
             pid_ = 0;
         }
+        job_.close();
 #endif
     }
 
@@ -93,14 +98,11 @@ private:
         si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
 
         PROCESS_INFORMATION pi{};
-        std::vector<char> mutable_cmd(cmd.begin(), cmd.end());
-        mutable_cmd.push_back('\0');
-        const BOOL ok = CreateProcessA(nullptr, mutable_cmd.data(), nullptr, nullptr,
-                                       TRUE, 0, nullptr, nullptr, &si, &pi);
+        const BOOL ok = mghttp_test::spawn_in_job(cmd, si, 0, pi, job_);
+        job_assigned_ = job_.assigned();
         CloseHandle(wr);
         if (!ok) { CloseHandle(rd); return false; }
         pid_ = static_cast<int>(pi.dwProcessId);
-        CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
 
         std::string banner;
@@ -129,6 +131,8 @@ private:
 
 #if defined(_WIN32)
     int pid_{0};
+    mghttp_test::ProcessJob job_;
+    bool job_assigned_{false};
 #endif
     uint16_t port_{0};
 };

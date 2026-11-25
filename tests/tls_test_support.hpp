@@ -36,6 +36,8 @@
 #   include <unistd.h>
 #endif
 
+#include "process_job.hpp"
+
 namespace tls_test_support {
 
 inline bool wait_until(std::function<bool()> pred, int max_ms = 10000) {
@@ -157,17 +159,30 @@ public:
         if (std::sscanf(buf, "READY %d %d", &pid, &p) != 2) return false;
         pid_ = static_cast<unsigned long>(pid);
         port_ = static_cast<uint16_t>(p);
+#if defined(_WIN32)
+        HANDLE hp = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE,
+                                static_cast<DWORD>(pid_));
+        if (hp) {
+            job_assigned_ = job_.assign(hp);
+            CloseHandle(hp);
+        }
+#endif
         return port_ != 0;
     }
 
     uint16_t port() const noexcept { return port_; }
 
     ~PythonTlsServer() {
-        if (pid_ != 0) {
-            std::string kill = "taskkill /F /PID " + std::to_string(pid_);
-            kill += " >NUL 2>&1";
-            std::system(kill.c_str());
+#if defined(_WIN32)
+        if (job_assigned_) {
+            job_.terminate();
+            pid_ = 0;
+        } else if (pid_ != 0) {
+            mghttp_test::terminate_tree(static_cast<DWORD>(pid_));
+            pid_ = 0;
         }
+        job_.close();
+#endif
         if (pipe_) {
             _pclose(pipe_);
             pipe_ = nullptr;
@@ -182,6 +197,8 @@ private:
     FILE* pipe_{nullptr};
     uint16_t port_{0};
     unsigned long pid_{0};
+    mghttp_test::ProcessJob job_;
+    bool job_assigned_{false};
 };
 
 inline megohttp::TlsConfig make_config(const char* hostname, const char* ca) {

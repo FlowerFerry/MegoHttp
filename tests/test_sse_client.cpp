@@ -371,3 +371,109 @@ TEST_CASE("SSE is accepted when the Content-Type carries a charset parameter",
     cli.shutdown();
     srv.stop();
 }
+
+TEST_CASE("Client SSE flow can start paused before the first event",
+          "[sse][client][backpressure]") {
+    init_winsock();
+    TinySseServer srv("data: one\n\ndata: two\n\n");
+    if (!srv.start()) {
+        std::printf("SKIP: could not start SSE server\n");
+        return;
+    }
+
+    Client cli;
+    string url;
+    {
+        string_builder b;
+        detail::sb_append(b, "http://127.0.0.1:");
+        detail::sb_append(b, to_view(format("{}", srv.port())));
+        url = b.release();
+    }
+    Request req(Method::Get, url);
+
+    auto flow = std::make_shared<Request::SseFlow>();
+    flow->pause();
+    std::atomic<int> events{0};
+    std::atomic<int> done{0};
+
+    req.set_sse_callback(
+        [&events](const SseEvent&) {
+            ++events;
+            return VoidResult{};
+        },
+        {},
+        flow);
+
+    cli.request(req, [&done](Result<Response> r) {
+        (void)r;
+        done.store(1);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    CHECK(events.load() == 0);
+    CHECK(!done.load());
+
+    flow->resume();
+    CHECK(wait_until([&] { return done.load() == 1; }));
+    CHECK(events.load() == 2);
+
+    cli.shutdown();
+    srv.stop();
+}
+
+TEST_CASE("Client SSE flow pauses delivery and resume drains the rest",
+          "[sse][client][backpressure]") {
+    init_winsock();
+    TinySseServer srv("data: one\n\ndata: two\n\n");
+    if (!srv.start()) {
+        std::printf("SKIP: could not start SSE server\n");
+        return;
+    }
+
+    Client cli;
+    string url;
+    {
+        string_builder b;
+        detail::sb_append(b, "http://127.0.0.1:");
+        detail::sb_append(b, to_view(format("{}", srv.port())));
+        url = b.release();
+    }
+    Request req(Method::Get, url);
+
+    auto flow = std::make_shared<Request::SseFlow>();
+    std::atomic<int> events{0};
+    std::atomic<int> done{0};
+
+    req.set_sse_callback(
+        [&events, &flow](const SseEvent& e) {
+            (void)e;
+            ++events;
+            if (events.load() == 1) {
+                flow->pause();
+            }
+            return VoidResult{};
+        },
+        {},
+        flow);
+    CHECK(req.sse_flow() == flow);
+
+    cli.request(req, [&done](Result<Response> r) {
+        (void)r;
+        done.store(1);
+    });
+
+    REQUIRE(wait_until([&] { return events.load() == 1; }));
+    CHECK(!done.load());
+    // Give a leaked second delivery a chance to appear.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK(events.load() == 1);
+
+    CHECK(flow->is_paused());
+    flow->resume();
+    CHECK(!flow->is_paused());
+    CHECK(wait_until([&] { return done.load() == 1; }));
+    CHECK(events.load() == 2);
+
+    cli.shutdown();
+    srv.stop();
+}

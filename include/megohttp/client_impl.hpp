@@ -341,6 +341,10 @@ namespace megohttp {
             // from its in-flight set and possibly fire a shutdown-drained callback.
             std::function<void()> on_retired;
 
+            // Internal: breaks a paused Exchange's self-hold when the request
+            // terminates without going through Exchange::fail() (shutdown).
+            std::function<void()> on_terminal_cleanup;
+
             // Connection pool plumbing (phase 5). `pool` is null when pooling is
             // disabled, in which case every request opens and closes its own
             // connection exactly as before Phase 5.
@@ -406,6 +410,10 @@ namespace megohttp {
             // Fires the terminal callback exactly once.
             void finish(Result<Response> result) {
                 if (finished.exchange(true)) return;
+                if (on_terminal_cleanup) {
+                    auto cleanup = std::move(on_terminal_cleanup);
+                    cleanup();
+                }
                 if (total_timer) total_timer->cancel();
                 if (dns_timer) dns_timer->cancel();
                 if (connect_stage_timer) { connect_stage_timer->cancel(); connect_stage_timer.reset(); }
@@ -571,6 +579,11 @@ namespace megohttp {
         public:
             Exchange(std::shared_ptr<RequestState> state)
                 : state_(std::move(state)), parser_(nullptr) {}
+
+            // Internal: the request reached a terminal state through a path
+            // that does not call fail() (Client shutdown). Break the paused
+            // self-hold so the Exchange can be destroyed.
+            void clear_pause_hold() { pause_hold_.reset(); }
 
             void set_parser(std::unique_ptr<ResponseParser> p) {
                 parser_ = std::move(p);
@@ -1001,6 +1014,13 @@ namespace megohttp {
                             "text/event-stream");
                     }
                     head_ = std::move(rh);
+                    if (head_->status_code == 204 ||
+                        head_->status_code < 200 || head_->status_code >= 300) {
+                        // No SSE body to parse. Keep the status intact for the
+                        // caller (SseSession decides 204 vs retryable error);
+                        // requiring text/event-stream here would erase it.
+                        return VoidResult{};
+                    }
                     if (!is_sse) {
                         // The caller asked for SSE and the server sent something
                         // else. Silently buffering the body would make the
@@ -1012,6 +1032,7 @@ namespace megohttp {
                         struct SseBridge : SseParser::Callbacks {
                             std::function<VoidResult(const SseEvent&)> user_cb;
                             std::optional<Error>* err_slot;
+                            std::shared_ptr<Request::BodySinkFlow> flow;
                             VoidResult on_event(const SseEvent& e) override {
                                 try { return user_cb(e); }
                                 catch (...) {
@@ -1022,13 +1043,38 @@ namespace megohttp {
                                 }
                             }
                             void on_comment(string_view) override {}
+                            bool pause_requested() const override {
+                                return flow && flow->is_paused();
+                            }
                         };
                         auto bridge = std::make_shared<SseBridge>();
                         bridge->user_cb = *sse_cb;
                         bridge->err_slot = &sse_error_;
+                        bridge->flow = state_->request.sse_flow();
                         sse_parser_ = std::make_unique<SseParser>(
                             *bridge, state_->request.sse_limits());
                         sse_bridge_ = bridge;
+
+                        // resume() comes from the caller's thread; replay must
+                        // run on the I/O context.
+                        sse_flow_ = bridge->flow;
+                        if (sse_flow_) {
+                            sse_paused_ = sse_flow_->is_paused();
+                            if (sse_paused_) {
+                                sse_parser_->pause();
+                                pause_hold_ = shared_from_this();
+                            }
+                            std::weak_ptr<Exchange> weak = shared_from_this();
+                            auto exec = state_->executor;
+                            sse_flow_->set_wake([weak, exec]() {
+                                if (!exec) return;
+                                exec->post([weak]() {
+                                    auto self = weak.lock();
+                                    if (!self || self->complete_) return;
+                                    self->resume_sse();
+                                });
+                            });
+                        }
                         return VoidResult{};
                     }
                 }
@@ -1252,12 +1298,33 @@ namespace megohttp {
                 // S6.1-01: SSE
 #if MEGOHTTP_HAS_SSE
                 if (sse_parser_) {
+                    // A flow may have been paused from another thread since
+                    // the previous chunk; honor it before dispatching anything
+                    // from this one.
+                    if (!sse_paused_ && sse_flow_ && sse_flow_->is_paused()) {
+                        sse_parser_->pause();
+                        sse_paused_ = true;
+                        if (!pause_hold_) pause_hold_ = shared_from_this();
+                    }
                     auto r = sse_parser_->feed(data, size);
                     if (!r) return r;
                     if (sse_error_) {
                         auto e = std::move(*sse_error_);
                         sse_error_.reset();
                         return e;
+                    }
+                    if (sse_parser_->is_paused()) {
+                        // The parser stopped at a line boundary and retained
+                        // the rest of this chunk. Stop socket reads until the
+                        // caller resumes; the decoder (if any) may still hand
+                        // one more output block to feed(), which is retained
+                        // under max_paused_buffer_bytes.
+                        sse_paused_ = true;
+                        // No read is outstanding while paused, so nothing in
+                        // the transport keeps the Exchange alive. Hold it until
+                        // the caller resumes.
+                        if (!pause_hold_) pause_hold_ = shared_from_this();
+                        if (sse_flow_) sse_flow_->pause();
                     }
                     return VoidResult{};
                 }
@@ -1356,6 +1423,14 @@ namespace megohttp {
                     }
                 }
 
+                // An SSE flow pause retains bytes (and possibly a complete
+                // event) in the parser. Reporting the terminal now would drop
+                // them; resume_sse() finishes this after the caller resumes.
+                if (sse_paused_) {
+                    sse_deferred_complete_ = true;
+                    return VoidResult{};
+                }
+
                 // A paused multipart stream means the caller has not consumed the
                 // last block yet. The HTTP message is complete, but reporting the
                 // terminal now would hand the caller a "success" while its own
@@ -1388,6 +1463,7 @@ namespace megohttp {
             // destroyed and answered "client is shutting down").
             VoidResult finish_complete_side() {
                 complete_ = true;
+                pause_hold_.reset();
 
                 // multipart completeness is INDEPENDENT of HTTP framing
                 // completeness. The HTTP message can end while the multipart
@@ -1505,6 +1581,43 @@ namespace megohttp {
                 }
             }
         private:
+            // Runs on the I/O context after the caller resumes an SSE flow.
+            // Parses the bytes retained by the parser's pause, then either
+            // resumes reading or finishes a completion that arrived while
+            // paused.
+            void resume_sse() {
+                // Keep the Exchange alive through the replay even though the
+                // paused state no longer has an outstanding transport read.
+                auto keep = std::move(pause_hold_);
+                if (complete_ || state_->finished.load()) return;
+                if (!sse_paused_) { read_more(); return; }
+                sse_paused_ = false;
+#if MEGOHTTP_HAS_SSE
+                if (sse_parser_) {
+                    auto r = sse_parser_->resume();
+                    if (!r) { fail(r.error()); return; }
+                    if (sse_error_) {
+                        auto e = std::move(*sse_error_);
+                        sse_error_.reset();
+                        fail(e);
+                        return;
+                    }
+                    if (sse_parser_->is_paused()) {
+                        sse_paused_ = true;
+                        pause_hold_ = shared_from_this();
+                        return;
+                    }
+                }
+#endif
+                if (sse_deferred_complete_) {
+                    sse_deferred_complete_ = false;
+                    auto r = finish_complete_side();
+                    if (!r) fail(r.error());
+                    return;
+                }
+                read_more();
+            }
+
             // Feeds bytes to the parser and decides what happens next.
             //
             // The bytes live in a view owned by the stream and are gone the
@@ -1528,6 +1641,7 @@ namespace megohttp {
                 }
                 if (sink_paused_) return;
                 if (multipart_paused_) return;
+                if (sse_paused_) return;
                 read_more();
             }
 
@@ -1536,6 +1650,7 @@ namespace megohttp {
                 // would deliver them before the caller asked for them.
                 if (sink_paused_) return;
                 if (multipart_paused_) return;
+                if (sse_paused_) return;
                 // The transport allows exactly one outstanding read. The
                 // Expect: 100-continue path can reach here after on_informational
                 // has already started the body send, and finish_body_streaming
@@ -1605,6 +1720,8 @@ namespace megohttp {
             }
 
             void fail(const Error& e) {
+                // Break a paused-self hold before the terminal path.
+                pause_hold_.reset();
                 disarm_send_timer();
                 disarm_recv_timer();
                 // A pending BodySource backpressure retry must not fire after the
@@ -1700,6 +1817,9 @@ namespace megohttp {
             // carry it to the caller.
             std::optional<ResponseHead> head_;
             bool complete_{false};
+            // Set while an SSE flow pause has no outstanding transport read.
+            // Broken on resume, failure, or completion.
+            std::shared_ptr<Exchange> pause_hold_;
             // S5.7-01: multipart response. Mutually exclusive with buffer_sink_
             // and body_sink_. When set, decoded body bytes go to the parser
             // instead of being buffered or delivered raw.
@@ -1713,6 +1833,11 @@ namespace megohttp {
             // enclosing deliver_decoded_checked.
             std::optional<Error> sse_error_;
 #endif
+            // Kept outside the SSE guard: the read loop and completion path
+            // reference these flags even when SSE is compiled out.
+            std::shared_ptr<Request::BodySinkFlow> sse_flow_;
+            bool sse_paused_{false};
+            bool sse_deferred_complete_{false};
 
             std::shared_ptr<MultipartSink> multipart_sink_;
             std::unique_ptr<MultipartResponseParser> multipart_parser_;
@@ -3322,6 +3447,10 @@ namespace megohttp {
             // stores a reference to it), and the Exchange must keep itself alive
             // while the exchange is in flight. It does so via shared_from_this().
             auto exchange = std::make_shared<detail::Exchange>(st);
+            std::weak_ptr<detail::Exchange> weak_exchange = exchange;
+            st->on_terminal_cleanup = [weak_exchange]() {
+                if (auto ex = weak_exchange.lock()) ex->clear_pause_hold();
+            };
             auto parser = std::make_unique<ResponseParser>(
                 *exchange, st->options.parser_limits);
             // The parser must know the request method: a response to HEAD never

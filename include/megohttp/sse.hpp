@@ -57,6 +57,11 @@ namespace megohttp {
             size_t max_line_length{64 * 1024};
             // Total bytes of one event's accumulated data + id + type.
             size_t max_event_bytes{1024 * 1024};
+            // Bytes accepted while the parser is paused. The Client stops
+            // reading once a pause is requested, but one already-decoded or
+            // already-read chunk can still be handed over; this caps that
+            // hand-over instead of buffering without bound. 0 = unlimited.
+            size_t max_paused_buffer_bytes{4 * 1024 * 1024};
         };
 
         struct Callbacks {
@@ -65,6 +70,11 @@ namespace megohttp {
             virtual VoidResult on_event(const SseEvent& event) = 0;
             // Called for a comment line. Not an error to ignore.
             virtual void on_comment(string_view comment) {}
+            // Checked after every complete line. Returning true stops parsing
+            // at that line boundary; the remaining input is retained by the
+            // parser until resume() is called. This is event/line granularity,
+            // not mid-line granularity.
+            virtual bool pause_requested() const { return false; }
         };
 
         SseParser(Callbacks& cbs, Limits limits = {});
@@ -77,11 +87,26 @@ namespace megohttp {
 
         // Feed body bytes. Safe to call with any split, including one byte at a
         // time: field names, values and line endings may all straddle a call.
+        // If the parser is paused, bytes are retained (bounded by
+        // Limits::max_paused_buffer_bytes) and consumed by resume().
         VoidResult feed(const uint8_t* data, size_t size);
 
         // Signal end of stream. A partially accumulated event is discarded:
         // WHATWG says a stream that ends mid-event never dispatches it.
         VoidResult feed_eof();
+
+        // True when a callback asked for a pause and feed() stopped at a line
+        // boundary. Callers must stop reading the response until resume().
+        bool is_paused() const noexcept;
+
+        // Start paused before any byte is fed. Used when a flow is already
+        // paused when the response head arrives; subsequent feed() input is
+        // retained until resume().
+        void pause() noexcept;
+
+        // Resume parsing bytes retained by the pause and clear the paused
+        // state. Must run on the same thread that calls feed().
+        VoidResult resume();
 
         // Id to send as Last-Event-ID on a reconnect, empty when none was seen.
         const string& last_event_id() const noexcept;

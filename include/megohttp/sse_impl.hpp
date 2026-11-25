@@ -48,6 +48,11 @@ namespace megohttp {
         Limits limits_;
         Callbacks& cbs_;
         bool failed_{false};
+        // Set when a line-boundary pause was requested. Input arriving while
+        // paused is retained here, not discarded, because the owner of the
+        // current buffer is about to invalidate it.
+        bool paused_{false};
+        byte_buffer paused_bytes_;
 
         VoidResult fail(ErrorCode code, const char* msg) {
             failed_ = true;
@@ -191,7 +196,24 @@ namespace megohttp {
                 return Error{ErrorCode::SseEventTooLarge, ErrorPhase::Receive,
                              string("SSE parser already failed")};
             }
+            if (paused_) {
+                return append_paused(data, size);
+            }
+            return feed_unpaused(data, size);
+        }
 
+        VoidResult append_paused(const uint8_t* data, size_t size) {
+            if (size == 0) return VoidResult{};
+            if (limits_.max_paused_buffer_bytes != 0 &&
+                paused_bytes_.size() + size > limits_.max_paused_buffer_bytes) {
+                return fail(ErrorCode::SseEventTooLarge,
+                            "SSE paused buffer exceeded max_paused_buffer_bytes");
+            }
+            paused_bytes_.insert(paused_bytes_.end(), data, data + size);
+            return VoidResult{};
+        }
+
+        VoidResult feed_unpaused(const uint8_t* data, size_t size) {
             // A UTF-8 BOM is ignored, but only at byte 0 of the stream.
             if (first_feed_) {
                 first_feed_ = false;
@@ -217,11 +239,27 @@ namespace megohttp {
                     auto r = finish_line();
                     if (!r) return r;
                     pending_cr_ = true;
+                    if (cbs_.pause_requested()) {
+                        paused_ = true;
+                        if (i + 1 < size) {
+                            auto a = append_paused(data + i + 1, size - i - 1);
+                            if (!a) return a;
+                        }
+                        return VoidResult{};
+                    }
                     continue;
                 }
                 if (c == '\n') {
                     auto r = finish_line();
                     if (!r) return r;
+                    if (cbs_.pause_requested()) {
+                        paused_ = true;
+                        if (i + 1 < size) {
+                            auto a = append_paused(data + i + 1, size - i - 1);
+                            if (!a) return a;
+                        }
+                        return VoidResult{};
+                    }
                     continue;
                 }
 
@@ -238,8 +276,26 @@ namespace megohttp {
             return VoidResult{};
         }
 
+        VoidResult resume() {
+            if (failed_) {
+                return Error{ErrorCode::SseEventTooLarge, ErrorPhase::Receive,
+                             string("SSE parser already failed")};
+            }
+            if (!paused_) return VoidResult{};
+            paused_ = false;
+            if (paused_bytes_.empty()) return VoidResult{};
+            // Keep the buffer alive for the duration of the call; feed_unpaused
+            // may pause again and append its own remainder to paused_bytes_.
+            byte_buffer pending;
+            pending.swap(paused_bytes_);
+            return feed_unpaused(pending.data(), pending.size());
+        }
+
         VoidResult feed_eof() {
             if (failed_) return VoidResult{};
+            // The owner must resume() first: a paused parser still holds bytes
+            // (and possibly a complete event) that EOF must not discard.
+            if (paused_) return VoidResult{};
             // A trailing CR is a complete line ending on its own.
             if (pending_cr_) {
                 pending_cr_ = false;
@@ -271,6 +327,18 @@ namespace megohttp {
 
     inline VoidResult SseParser::feed_eof() {
         return impl_->feed_eof();
+    }
+
+    inline bool SseParser::is_paused() const noexcept {
+        return impl_->paused_;
+    }
+
+    inline void SseParser::pause() noexcept {
+        impl_->paused_ = true;
+    }
+
+    inline VoidResult SseParser::resume() {
+        return impl_->resume();
     }
 
     inline const string& SseParser::last_event_id() const noexcept {

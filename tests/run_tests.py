@@ -4,6 +4,11 @@ import os, subprocess, sys, glob
 TIMEOUT_S = 120
 RETRY_ON_TIMEOUT = {"test_core", "test_multi_tu"}
 
+def kill_process_tree(pid):
+    if os.name == 'nt':
+        subprocess.run(['taskkill', '/F', '/T', '/PID', str(pid)],
+                       capture_output=True)
+
 def discover_tests(build_dir):
     pattern = os.path.join(build_dir, "tests", "test_*.exe")
     return sorted(os.path.basename(p)[:-4] for p in glob.glob(pattern))
@@ -12,11 +17,20 @@ def run_one(build_dir, name):
     exe = os.path.join(build_dir, "tests", f"{name}.exe")
     if not os.path.exists(exe):
         return ("MISSING", f"{name}: binary not found")
+    p = subprocess.Popen([exe], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
-        p = subprocess.run([exe], capture_output=True, timeout=TIMEOUT_S)
+        out_b, err_b = p.communicate(timeout=TIMEOUT_S)
     except subprocess.TimeoutExpired:
+        kill_process_tree(p.pid)
+        try:
+            out_b, err_b = p.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            out_b, err_b = p.communicate()
         return ("TIMEOUT", f"{name}: exceeded {TIMEOUT_S}s")
-    out = p.stdout.decode("utf-8", "replace").strip()
+    out = out_b.decode("utf-8", "replace").strip()
+    if err_b:
+        out += "\n" + err_b.decode("utf-8", "replace").strip()
     # Catch2 v3 format: "All tests passed" appears when there is at least one
     # assertion; a suite that only skips all cases still exits 0 and prints
     # "test cases: N | N passed".

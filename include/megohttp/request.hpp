@@ -209,10 +209,19 @@ namespace megohttp {
         // as text/event-stream instead of delivered raw; Content-Encoding is
         // still decoded first (HTTP framing -> decoding -> SSE).
         // Mutually exclusive with BodySink and MultipartSink.
+        //
+        // Optional flow: pause_receive-equivalent backpressure. When attached,
+        // calling flow->pause() (from the callback or any thread) stops the
+        // parser after the current line and stops socket reads; flow->resume()
+        // replays the retained bytes. Without a flow the parser still bounds
+        // its buffers but the caller has no way to ask for a pause.
         using SseCallback = std::function<VoidResult(const SseEvent&)>;
-        void set_sse_callback(SseCallback cb, SseParser::Limits limits = {});
+        using SseFlow = BodySinkFlow;
+        void set_sse_callback(SseCallback cb, SseParser::Limits limits = {},
+                              std::shared_ptr<SseFlow> flow = nullptr);
         const std::optional<SseCallback>& sse_callback() const noexcept;
         const SseParser::Limits& sse_limits() const noexcept;
+        const std::shared_ptr<SseFlow>& sse_flow() const noexcept;
 #endif
 
         // --- Content coding ---

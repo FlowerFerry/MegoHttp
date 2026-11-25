@@ -10,25 +10,6 @@ namespace megohttp {
     // SseSession implementation
     // -------------------------------------------------------------------------
 
-    namespace sse_detail {
-        // Bridge between SseParser callbacks and SseSession.
-        class ParserBridge : public SseParser::Callbacks {
-        public:
-            SseSession* session{nullptr};
-
-            VoidResult on_event(const SseEvent& event) override;
-            void on_comment(string_view comment) override {
-                (void)comment;  // Comments are ignored per spec
-            }
-        };
-    }
-
-    inline VoidResult sse_detail::ParserBridge::on_event(const SseEvent& event) {
-        if (!session) return VoidResult{};
-        session->deliver_event(event);
-        return VoidResult{};
-    }
-
     inline SseSession::SseSession(std::shared_ptr<Executor> executor,
                                   RequestSubmitter submitter,
                                   Request request,
@@ -38,6 +19,7 @@ namespace megohttp {
         , request_(std::move(request))
         , reconnect_policy_(std::move(reconnect_policy))
         , session_start_(Clock::now())
+        , flow_(std::make_shared<Request::BodySinkFlow>())
     {
     }
 
@@ -72,7 +54,25 @@ namespace megohttp {
             return;  // Already cancelled
         }
         active_.store(false);
+        // A paused request has no outstanding read; let the Client drain and
+        // finish it so the transport/state is not stranded.
+        if (flow_) flow_->resume();
         terminate();
+    }
+
+    inline void SseSession::pause_receive() {
+        if (flow_) flow_->pause();
+    }
+
+    inline void SseSession::resume_receive() {
+        if (!flow_ || cancelled_.load() || !active_.load()) return;
+        // The Client owns the SSE parser and its retained bytes. Resuming the
+        // flow posts the parser replay and read restart onto the I/O context.
+        flow_->resume();
+    }
+
+    inline bool SseSession::is_receive_paused() const noexcept {
+        return flow_ && flow_->is_paused();
     }
 
     inline std::optional<string> SseSession::last_event_id() const {
@@ -130,14 +130,6 @@ namespace megohttp {
             return;
         }
 
-        // Create parser bridge
-        auto bridge = std::make_shared<sse_detail::ParserBridge>();
-        bridge->session = this;
-        parser_bridge_ = bridge;
-
-        // Create parser
-        parser_ = std::make_unique<SseParser>(*bridge);
-
         // Prepare request with Last-Event-ID. The condition is "do we have an
         // id to resume from", NOT "is this a retry": WHATWG defines the header
         // as the last event id the client saw, whatever the reason for the new
@@ -152,45 +144,17 @@ namespace megohttp {
             }
         }
 
-        // Set up body sink to feed parser. The completion callback receives
-        // VoidResult: an error (or empty success) once.
-        req.set_body_sink(
-            [this](string_view chunk) -> bool {
-                if (parser_ && !cancelled_.load()) {
-                    auto result = parser_->feed(
-                        reinterpret_cast<const uint8_t*>(chunk.data()), chunk.size());
-                    if (!result) {
-                        schedule_reconnect(result.error());
-                        return false;  // Pause (actually: terminate via reconnect)
-                    }
-                }
-                return true;  // Continue
+        // Let the Client own the SSE parser. That path already implements the
+        // HTTP-framing -> Content-Encoding -> SSE order, retained-byte replay
+        // on pause, and deferred terminal completion. flow_ turns a
+        // pause_receive() into real socket backpressure.
+        req.set_sse_callback(
+            [this](const SseEvent& event) {
+                deliver_event(event);
+                return VoidResult{};
             },
-            [this](VoidResult r) {
-                if (cancelled_.load()) {
-                    return;
-                }
-                if (!r) {
-                    // Body failed. The reconnect decision belongs to the
-                    // submitter callback too, but a body-level failure here
-                    // means the connection broke mid-stream.
-                    schedule_reconnect(r.error());
-                    return;
-                }
-                // Body complete - server closed the connection cleanly.
-                if (parser_) {
-                    parser_->feed_eof();
-                }
-                if (!reconnect_policy_.auto_reconnect) {
-                    terminate();
-                } else {
-                    // A clean EOF from an SSE server is still a disconnect;
-                    // the spec says reconnect unless the server said 204.
-                    schedule_reconnect(Error{ErrorCode::ConnectionClosed,
-                                             ErrorPhase::Receive,
-                                             string("SSE stream ended")});
-                }
-            });
+            {},
+            flow_);
 
         // Submit request through the injected submitter (no Client dependency).
         submitter_(std::move(req), [this](Result<Response> result) {
@@ -198,7 +162,11 @@ namespace megohttp {
                 return;
             }
             if (!result) {
-                schedule_reconnect(result.error());
+                if (result.error().code() == ErrorCode::SseInvalidContentType) {
+                    terminate(result.error());
+                } else {
+                    schedule_reconnect(result.error());
+                }
                 return;
             }
 
@@ -251,6 +219,13 @@ namespace megohttp {
             // incremented, and the next attempt would send no Last-Event-ID.
             // The reset belongs to deliver_event(), i.e. to actually receiving
             // an event, which is what proves the reconnect worked.
+            if (!reconnect_policy_.auto_reconnect) {
+                terminate();
+            } else {
+                schedule_reconnect(Error{ErrorCode::ConnectionClosed,
+                                         ErrorPhase::Receive,
+                                         string("SSE stream ended")});
+            }
         });
     }
 
@@ -311,8 +286,6 @@ namespace megohttp {
 
     inline void SseSession::terminate(const Error& err) {
         active_.store(false);
-        parser_.reset();
-        parser_bridge_.reset();
 
         ErrorCallback err_cb;
         CompleteCallback done_cb;
@@ -333,8 +306,6 @@ namespace megohttp {
 
     inline void SseSession::terminate() {
         active_.store(false);
-        parser_.reset();
-        parser_bridge_.reset();
 
         CompleteCallback done_cb;
         {

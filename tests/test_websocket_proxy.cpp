@@ -33,6 +33,8 @@
 #include <windows.h>
 #endif
 
+#include "process_job.hpp"
+
 using namespace megohttp;
 using namespace std::chrono_literals;
 
@@ -72,14 +74,12 @@ namespace {
             si.dwFlags = STARTF_USESHOWWINDOW;
             si.wShowWindow = SW_HIDE;
             PROCESS_INFORMATION pi{};
-            std::vector<char> buf(cmd.begin(), cmd.end());
-            buf.push_back('\0');
-            if (!CreateProcessA(nullptr, buf.data(), nullptr, nullptr, FALSE,
-                                CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+            if (!mghttp_test::spawn_in_job(cmd, si, CREATE_NO_WINDOW, pi, job_, FALSE)) {
                 return false;
             }
+            job_assigned_ = job_.assigned();
             hproc_ = pi.hProcess;
-            CloseHandle(pi.hThread);
+            pid_ = pi.dwProcessId;
             return true;
         }
 
@@ -110,12 +110,19 @@ namespace {
         std::string output() const { return read(); }
 
         void stop() {
+            if (job_assigned_) {
+                job_.terminate();
+            } else if (pid_ != 0) {
+                mghttp_test::terminate_tree(pid_);
+            }
+            job_.close();
             if (hproc_) {
                 TerminateProcess(hproc_, 0);
                 WaitForSingleObject(hproc_, 3000);
                 CloseHandle(hproc_);
                 hproc_ = nullptr;
             }
+            pid_ = 0;
             if (!out_file_.empty()) {
                 DeleteFileA(out_file_.c_str());
                 out_file_.clear();
@@ -132,6 +139,9 @@ namespace {
         }
 
         HANDLE hproc_{nullptr};
+        DWORD pid_{0};
+        mghttp_test::ProcessJob job_;
+        bool job_assigned_{false};
         std::string out_file_;
     };
 

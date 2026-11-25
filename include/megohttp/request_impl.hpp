@@ -38,6 +38,7 @@ namespace megohttp {
 #if MEGOHTTP_HAS_SSE
         std::optional<Request::SseCallback> sse_callback;
         SseParser::Limits sse_limits;
+        std::shared_ptr<Request::SseFlow> sse_flow;
 #endif
         // Content coding. Upload compression is opt-in and implemented for
         // buffered bodies in content_encoder.hpp; response decoding is on by
@@ -220,6 +221,10 @@ namespace megohttp {
         impl_->body_sink = std::move(sink);
         impl_->body_sink_complete = std::move(complete);
         impl_->body_sink_flow.reset();
+#if MEGOHTTP_HAS_SSE
+        impl_->sse_callback.reset();
+        impl_->sse_flow.reset();
+#endif
         // One consumer per body. Leaving the multipart sink attached would make
         // the Client pick one of two pipelines by accident.
         impl_->multipart_sink.reset();
@@ -230,6 +235,10 @@ namespace megohttp {
         impl_->body_sink = std::move(sink);
         impl_->body_sink_complete = std::move(complete);
         impl_->body_sink_flow = std::move(flow);
+#if MEGOHTTP_HAS_SSE
+        impl_->sse_callback.reset();
+        impl_->sse_flow.reset();
+#endif
         impl_->multipart_sink.reset();
     }
 
@@ -243,6 +252,10 @@ namespace megohttp {
         impl_->body_sink.reset();
         impl_->body_sink_complete.reset();
         impl_->body_sink_flow.reset();
+#if MEGOHTTP_HAS_SSE
+        impl_->sse_callback.reset();
+        impl_->sse_flow.reset();
+#endif
     }
 
     inline const std::shared_ptr<MultipartSink>& Request::multipart_sink() const noexcept {
@@ -270,9 +283,11 @@ namespace megohttp {
     }
 
 #if MEGOHTTP_HAS_SSE
-    inline void Request::set_sse_callback(SseCallback cb, SseParser::Limits limits) {
+    inline void Request::set_sse_callback(SseCallback cb, SseParser::Limits limits,
+                                          std::shared_ptr<SseFlow> flow) {
         impl_->sse_callback = std::move(cb);
         impl_->sse_limits = limits;
+        impl_->sse_flow = std::move(flow);
         // Mutually exclusive with BodySink and MultipartSink.
         impl_->body_sink.reset();
         impl_->body_sink_complete.reset();
@@ -287,6 +302,10 @@ namespace megohttp {
 
     inline const SseParser::Limits& Request::sse_limits() const noexcept {
         return impl_->sse_limits;
+    }
+
+    inline const std::shared_ptr<Request::SseFlow>& Request::sse_flow() const noexcept {
+        return impl_->sse_flow;
     }
 #endif
 

@@ -10,6 +10,11 @@ import re
 import subprocess
 import sys
 
+def kill_process_tree(pid):
+    if os.name == 'nt':
+        subprocess.run(['taskkill', '/F', '/T', '/PID', str(pid)],
+                       capture_output=True)
+
 R = r'D:\_mego_openlib\MegoHttp'
 # subdir is '' for Ninja (single-config) and 'Release' for the VS generator.
 # Getting this wrong reports the PREVIOUS run's numbers, because the glob simply
@@ -31,11 +36,19 @@ def run(name, subdir):
     fa = tc = 0
     fails = []
     for e in exes:
+        p = subprocess.Popen([e], cwd=os.path.dirname(e),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
-            q = subprocess.run([e], cwd=os.path.dirname(e), capture_output=True,
-                               text=True, errors='replace', timeout=200)
-            rc, out = q.returncode, q.stdout + q.stderr
+            out_b, err_b = p.communicate(timeout=200)
+            rc = p.returncode
+            out = out_b.decode('utf-8', 'replace') + err_b.decode('utf-8', 'replace')
         except subprocess.TimeoutExpired:
+            kill_process_tree(p.pid)
+            try:
+                out_b, err_b = p.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                out_b, err_b = p.communicate()
             rc, out = -1, ''
             fails.append(os.path.basename(e) + '(timeout)')
         if rc != 0:

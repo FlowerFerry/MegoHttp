@@ -33,6 +33,8 @@
 #include <mutex>
 #include <optional>
 
+#if MEGOHTTP_HAS_SSE
+
 namespace megohttp {
 
     // Forward declaration
@@ -71,6 +73,14 @@ namespace megohttp {
         // will fire.
         void cancel();
 
+        // Pause/resume event delivery. pause_receive() can be called from the
+        // event callback or any other thread; delivery stops at the next line
+        // boundary and socket reads stop. resume_receive() replays the bytes
+        // retained by the parser before allowing more reads.
+        void pause_receive();
+        void resume_receive();
+        bool is_receive_paused() const noexcept;
+
         // Query state.
         bool is_active() const { return active_.load(); }
         bool is_cancelled() const { return cancelled_.load(); }
@@ -106,9 +116,9 @@ namespace megohttp {
         size_t reconnect_attempts_{0};
         TimePoint session_start_;
 
-        // Parser
-        std::unique_ptr<SseParser> parser_;
-        std::shared_ptr<SseParser::Callbacks> parser_bridge_;
+        // Backpressure for the current physical connection. The Request carries
+        // it into the Client's SSE path.
+        std::shared_ptr<Request::BodySinkFlow> flow_;
 
         // Synchronization
         mutable std::mutex mutex_;
@@ -117,5 +127,7 @@ namespace megohttp {
 } // namespace megohttp
 
 #include <megohttp/sse_session_impl.hpp>
+
+#endif // MEGOHTTP_HAS_SSE
 
 #endif // MEGOHTTP_SSE_SESSION_HPP_INCLUDED

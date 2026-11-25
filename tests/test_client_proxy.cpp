@@ -30,6 +30,8 @@
 #  include <unistd.h>
 #endif
 
+#include "process_job.hpp"
+
 using namespace megohttp;
 
 namespace {
@@ -178,11 +180,14 @@ public:
 
     void stop() {
 #if defined(_WIN32)
-        if (pid_ > 0) {
-            const std::string cmd = "taskkill /F /PID " + std::to_string(pid_) + " > nul 2>&1";
-            std::system(cmd.c_str());
+        if (job_assigned_) {
+            // Closing the job with KILL_ON_JOB_CLOSE terminates the tree.
+            pid_ = 0;
+        } else if (pid_ > 0) {
+            mghttp_test::terminate_tree(static_cast<DWORD>(pid_));
             pid_ = 0;
         }
+        job_.close();
 #endif
         if (!recording_.empty()) std::remove(recording_.c_str());
     }
@@ -216,15 +221,12 @@ private:
         si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
 
         PROCESS_INFORMATION pi{};
-        std::vector<char> mutable_cmd(cmd.begin(), cmd.end());
-        mutable_cmd.push_back('\0');
-        const BOOL ok = CreateProcessA(nullptr, mutable_cmd.data(), nullptr, nullptr, TRUE, 0,
-                                       nullptr, nullptr, &si, &pi);
+        const BOOL ok = mghttp_test::spawn_in_job(cmd, si, 0, pi, job_);
+        job_assigned_ = job_.assigned();
         CloseHandle(write_h);
         if (!ok) { CloseHandle(read_h); return false; }
 
         pid_ = static_cast<int>(pi.dwProcessId);
-        CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
 
         std::string banner;
@@ -264,6 +266,8 @@ private:
     uint16_t port_{0};
     int pid_{0};
     std::string recording_;
+    mghttp_test::ProcessJob job_;
+    bool job_assigned_{false};
 };
 
 // Returns the library's owning string so Request can take it directly:
@@ -592,11 +596,14 @@ public:
 
     void stop() {
 #if defined(_WIN32)
-        if (pid_ > 0) {
-            std::string cmd = "taskkill /F /PID " + std::to_string(pid_) + " > nul 2>&1";
-            std::system(cmd.c_str());
+        if (job_assigned_) {
+            job_.terminate();
+            pid_ = 0;
+        } else if (pid_ > 0) {
+            mghttp_test::terminate_tree(static_cast<DWORD>(pid_));
             pid_ = 0;
         }
+        job_.close();
 #endif
     }
 
@@ -618,15 +625,12 @@ private:
         si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
 
         PROCESS_INFORMATION pi{};
-        std::vector<char> mutable_cmd(cmd.begin(), cmd.end());
-        mutable_cmd.push_back('\0');
-        const BOOL ok = CreateProcessA(nullptr, mutable_cmd.data(), nullptr, nullptr, TRUE, 0,
-                                       nullptr, nullptr, &si, &pi);
+        const BOOL ok = mghttp_test::spawn_in_job(cmd, si, 0, pi, job_);
+        job_assigned_ = job_.assigned();
         CloseHandle(write_h);
         if (!ok) { CloseHandle(read_h); return false; }
 
         pid_ = static_cast<int>(pi.dwProcessId);
-        CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
 
         std::string banner;
@@ -649,6 +653,8 @@ private:
 
     uint16_t port_{0};
     int pid_{0};
+    mghttp_test::ProcessJob job_;
+    bool job_assigned_{false};
 };
 
 // The fixture certificate covers "localhost", so the URL names localhost even

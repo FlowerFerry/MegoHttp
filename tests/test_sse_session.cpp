@@ -314,3 +314,56 @@ TEST_CASE("sse session stops on 204", "[sse][session]") {
     client.shutdown();
     srv.stop();
 }
+
+TEST_CASE("sse session pause_receive stops delivery until resume",
+          "[sse][session][backpressure]") {
+    sock_init();
+    SseDroppingServer srv;
+    SseDroppingServer::Reply r;
+    r.status_line = "HTTP/1.1 200 OK";
+    r.body = "data: first\n\ndata: second\n\n";
+    REQUIRE(srv.start({r}));
+
+    Client client;
+    Request req(Method::Get, string("http://127.0.0.1"));
+    {
+        string_builder b;
+        detail::sb_append(b, "http://127.0.0.1:");
+        detail::sb_append(b, to_view(format("{}", srv.port())));
+        detail::sb_append(b, "/events");
+        req.set_url(to_view(b.release()));
+    }
+
+    SseReconnectPolicy policy;
+    policy.auto_reconnect = false;
+
+    auto session = client.request_sse(req, policy);
+
+    std::atomic<int> events{0};
+    std::atomic<int> completed{0};
+    session->on_event([&](const SseEvent& e) {
+        (void)e;
+        ++events;
+        if (events.load() == 1) {
+            session->pause_receive();
+        }
+    });
+    session->on_complete([&] { completed.fetch_add(1); });
+
+    session->start();
+
+    REQUIRE(wait_until([&] { return events.load() == 1; }));
+    CHECK(session->is_receive_paused());
+    std::this_thread::sleep_for(50ms);
+    CHECK(events.load() == 1);
+    CHECK(completed.load() == 0);
+
+    session->resume_receive();
+    CHECK(wait_until([&] { return completed.load() > 0; }));
+    CHECK(events.load() == 2);
+    CHECK(srv.connections() == 1);
+
+    session->cancel();
+    client.shutdown();
+    srv.stop();
+}

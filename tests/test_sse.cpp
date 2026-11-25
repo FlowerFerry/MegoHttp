@@ -20,14 +20,19 @@ namespace {
         std::vector<SseEvent> events;
         std::vector<std::string> comments;
         bool paused = false;
+        bool pause_on_first_event = false;
 
         VoidResult on_event(const SseEvent& e) override {
             events.push_back(e);
+            if (pause_on_first_event && events.size() == 1) {
+                paused = true;
+            }
             return VoidResult{};
         }
         void on_comment(string_view c) override {
             comments.emplace_back(c.data(), c.size());
         }
+        bool pause_requested() const override { return paused; }
     };
 
     std::string str(const string& s) { return std::string(s.data(), s.size()); }
@@ -292,4 +297,73 @@ TEST_CASE("sse rejects an over-large event", "[sse]") {
     REQUIRE(!r);
     CHECK(r.error().code() == ErrorCode::SseEventTooLarge);
     CHECK(p.is_failed());
+}
+
+TEST_CASE("sse pause stops at an event boundary and resume drains retained bytes",
+          "[sse][backpressure]") {
+    Recorder rec;
+    rec.pause_on_first_event = true;
+    SseParser p(rec);
+
+    REQUIRE(feed_all(p, "data: one\n\ndata: two\n\n"));
+
+    REQUIRE(p.is_paused());
+    REQUIRE(rec.events.size() == 1);
+    CHECK(str(rec.events[0].data) == "one");
+
+    // Input that arrives while paused is retained, not delivered.
+    REQUIRE(feed_all(p, "data: three\n\n"));
+    CHECK(rec.events.size() == 1);
+
+    rec.paused = false;
+    REQUIRE(p.resume());
+    CHECK(!p.is_paused());
+    REQUIRE(rec.events.size() == 3);
+    CHECK(str(rec.events[1].data) == "two");
+    CHECK(str(rec.events[2].data) == "three");
+}
+
+TEST_CASE("sse pause and resume keep CRLF split semantics", "[sse][backpressure]") {
+    Recorder rec;
+    rec.pause_on_first_event = true;
+    SseParser p(rec);
+
+    REQUIRE(feed_all(p, "data: one\r\n\r\ndata: two\r\n\r\n"));
+    REQUIRE(p.is_paused());
+    REQUIRE(rec.events.size() == 1);
+
+    rec.paused = false;
+    REQUIRE(p.resume());
+    REQUIRE(rec.events.size() == 2);
+    CHECK(str(rec.events[0].data) == "one");
+    CHECK(str(rec.events[1].data) == "two");
+}
+
+TEST_CASE("sse paused buffer is bounded", "[sse][backpressure]") {
+    Recorder rec;
+    rec.pause_on_first_event = true;
+    SseParser::Limits lim;
+    lim.max_paused_buffer_bytes = 4;
+    SseParser p(rec, lim);
+
+    auto r = feed_all(p, "data: one\n\ndata: two\n\n");
+    REQUIRE(!r);
+    CHECK(r.error().code() == ErrorCode::SseEventTooLarge);
+    CHECK(p.is_failed());
+    CHECK(rec.events.size() == 1);
+}
+
+TEST_CASE("sse parser can start paused before the first byte", "[sse][backpressure]") {
+    Recorder rec;
+    SseParser p(rec);
+    p.pause();
+    CHECK(p.is_paused());
+
+    REQUIRE(feed_all(p, "data: one\n\ndata: two\n\n"));
+    CHECK(rec.events.empty());
+
+    REQUIRE(p.resume());
+    REQUIRE(rec.events.size() == 2);
+    CHECK(str(rec.events[0].data) == "one");
+    CHECK(str(rec.events[1].data) == "two");
 }
