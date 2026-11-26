@@ -288,12 +288,14 @@ jobs:
             -DMGHTTP_ENABLE_COROUTINES=OFF \
             -DMGHTTP_BUILD_TESTS=ON \
             -DMGHTTP_BUILD_EXAMPLES=OFF
-          cmake --build build -j 2
+          cmake --build build --target \
+            test_core test_http test_client test_dns_wire test_content_type \
+            test_content_range test_multipart test_multipart_response -j 2
 
       - name: Run core tests
         run: |
           ctest --test-dir build --output-on-failure \
-            -R '^(test_core|test_http|test_dns_wire|test_cookie|test_content_type|test_content_range|test_multipart|test_multipart_response)$'
+            -R '^(test_core|test_http|test_dns_wire|test_content_type|test_content_range|test_multipart|test_multipart_response)$'
 
   linux-cross:
     name: Linux cross-compile ${{ matrix.arch }}

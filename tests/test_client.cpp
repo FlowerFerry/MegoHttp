@@ -16,6 +16,7 @@
 #include <atomic>
 #include <mutex>
 #include <chrono>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -29,6 +30,9 @@
 #   include <netinet/in.h>
 #   include <sys/socket.h>
 #   include <unistd.h>
+#   include <sys/time.h>
+using SOCKET = int;
+constexpr int INVALID_SOCKET = -1;
 #endif
 
 using namespace megohttp;
