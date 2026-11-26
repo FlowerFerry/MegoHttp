@@ -114,12 +114,10 @@ namespace megohttp {
         // Body sink for streaming download; nullopt if using buffer mode (default).
         // When set, body_bytes() will be empty and body_is_buffered() false.
         //
-        // Returning false asks the client to PAUSE delivery. Pausing stops the
-        // reads, so a slow consumer actually stops the socket instead of the
-        // library buffering everything it cannot deliver. Delivery resumes when
-        // the caller signals the attached BodySinkFlow; without one attached the
-        // return value cannot be acted on and delivery continues (the historical
-        // behaviour, kept so existing callers are not broken silently).
+        // Returning false means PAUSE delivery. A BodySink requires an attached
+        // BodySinkFlow; without one a submit is rejected synchronously with
+        // InvalidArgument, because there would be no way to resume. Delivery
+        // resumes when the caller signals the attached flow.
         using BodySink = std::function<bool(string_view chunk)>;
         using BodySinkComplete = std::function<void(VoidResult)>;
 
@@ -142,8 +140,11 @@ namespace megohttp {
             std::shared_ptr<struct BodySinkFlowState> state_;
         };
 
+        // Kept for source compatibility, but a request using this overload is
+        // rejected at submit with InvalidArgument: false cannot pause without a
+        // resume channel.
         void set_body_sink(BodySink sink, BodySinkComplete complete);
-        // Same, with backpressure control.
+        // Streaming download with proper pause/resume. Use this overload.
         void set_body_sink(BodySink sink, BodySinkComplete complete,
                            std::shared_ptr<BodySinkFlow> flow);
         const std::optional<BodySink>& body_sink() const noexcept;

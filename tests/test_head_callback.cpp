@@ -248,12 +248,14 @@ TEST_CASE("the head callback fires before the streaming body starts",
         if (h.content_length) content_length = *h.content_length;
         head_seen = true;
     });
+    auto flow = std::make_shared<Request::BodySinkFlow>();
     req.set_body_sink(
         [&](string_view) {
             body_seen = true;
             return true;
         },
-        [&](VoidResult) { complete_seen = true; });
+        [&](VoidResult) { complete_seen = true; },
+        flow);
 
     auto r = c.request_sync(req);
     REQUIRE(r);
@@ -505,12 +507,14 @@ TEST_CASE("a throwing head callback fails the request before any body",
     req.set_head_callback([](const ResponseHead&) {
         throw std::runtime_error("head callback failure");
     });
+    auto flow = std::make_shared<Request::BodySinkFlow>();
     req.set_body_sink(
         [&](string_view) {
             body_seen = true;
             return true;
         },
-        [](VoidResult) {});
+        [](VoidResult) {},
+        flow);
 
     auto r = c.request_sync(req);
     REQUIRE(!r);

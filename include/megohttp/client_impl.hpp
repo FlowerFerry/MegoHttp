@@ -1359,17 +1359,19 @@ namespace megohttp {
                                      string("response body sink threw an exception")};
                     }
                     if (!keep_going) {
-                        // The sink asked to pause. With a flow attached the read
-                        // loop stops here and only restarts on resume(); without
-                        // one there is no way to signal a resume, so the
-                        // historical "keep going" behaviour is the only
-                        // non-hanging option.
-                        if (sink_flow_) {
-                            sink_paused_ = true;
-                            // The flow's own flag must agree, otherwise resume()
-                            // sees "was not paused" and never fires the wake-up.
-                            sink_flow_->pause();
+                        // The sink asked to pause. An accepted streaming request
+                        // always has a BodySinkFlow (submit rejects the other
+                        // configuration), so this should be reachable only for
+                        // a defect. Still fail closed: silently continuing would
+                        // turn a requested pause into unbounded delivery.
+                        if (!sink_flow_) {
+                            return Error{ErrorCode::InvalidArgument, ErrorPhase::Receive,
+                                         string("BodySink returned false without a BodySinkFlow")};
                         }
+                        sink_paused_ = true;
+                        // The flow's own flag must agree, otherwise resume()
+                        // sees "was not paused" and never fires the wake-up.
+                        sink_flow_->pause();
                     }
                 }
                 return VoidResult{};
@@ -2198,6 +2200,22 @@ namespace megohttp {
             st->cookie_jar = options.cookie_jar;
             st->options = opt_override ? *opt_override : options;
             st->pool = pool;
+
+            // A streaming BodySink must have a BodySinkFlow. The sink's false
+            // return means "pause", and pause without a resume channel would
+            // either hang forever or be silently ignored. Reject the
+            // configuration synchronously, on the submitting thread, before the
+            // request is registered; the caller can fix the request and submit
+            // it again. This is the same contract class as invalid ClientOptions:
+            // the request was never accepted.
+            if (req.body_sink().has_value() && !req.body_sink_flow()) {
+                st->self_hold.reset();
+                if (on_complete) {
+                    on_complete(Error{ErrorCode::InvalidArgument, ErrorPhase::None,
+                                      string("streaming BodySink requires a BodySinkFlow")});
+                }
+                return;
+            }
 
             // Request body compression (task book 7.3). Preparation happens
             // before the state is registered: a conflict or a missing encoder is

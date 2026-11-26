@@ -289,12 +289,14 @@ TEST_CASE("a streamed gzip response delivers decoded bytes to the sink",
     Request req(Method::Get, to_owning(url_for(srv.port())));
     std::string collected;
     bool completed = false;
+    auto flow = std::make_shared<Request::BodySinkFlow>();
     req.set_body_sink(
         [&collected](string_view chunk) {
             collected.append(chunk.data(), static_cast<size_t>(chunk.size()));
             return true;
         },
-        [&completed](VoidResult) { completed = true; });
+        [&completed](VoidResult) { completed = true; },
+        flow);
 
     auto r = c.request_sync(req);
     REQUIRE(r);

@@ -311,6 +311,7 @@ TEST_CASE("a streamed response keeps its status and headers",
 
     std::string collected;
     int completions = 0;
+    auto flow = std::make_shared<Request::BodySinkFlow>();
     req.set_body_sink(
         [&collected](string_view chunk) {
             collected.append(chunk.data(), static_cast<size_t>(chunk.size()));
@@ -319,7 +320,8 @@ TEST_CASE("a streamed response keeps its status and headers",
         [&completions](VoidResult r) {
             ++completions;
             CHECK(r.has_value());
-        });
+        },
+        flow);
 
     auto r = c.request_sync(req);
     REQUIRE(r);
@@ -366,12 +368,14 @@ TEST_CASE("a truncated streamed response reports the error to the sink",
 
     int completions = 0;
     bool saw_error = false;
+    auto flow = std::make_shared<Request::BodySinkFlow>();
     req.set_body_sink(
         [](string_view) { return true; },
         [&completions, &saw_error](VoidResult r) {
             ++completions;
             saw_error = !r.has_value();
-        });
+        },
+        flow);
 
     auto r = c.request_sync(req);
 
@@ -397,12 +401,14 @@ TEST_CASE("a throwing completion callback does not escape the error path",
     Request req(Method::Get, to_owning(url_for(srv.port())));
 
     std::atomic<int> completions{0};
+    auto flow = std::make_shared<Request::BodySinkFlow>();
     req.set_body_sink(
         [](string_view) { return true; },
         [&completions](VoidResult) {
             ++completions;
             throw std::runtime_error("sink completion blew up");
-        });
+        },
+        flow);
 
     // The throw is swallowed; the request still reports its own failure.
     auto r = c.request_sync(req);

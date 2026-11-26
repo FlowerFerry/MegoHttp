@@ -389,9 +389,47 @@ def handle_socks5(client, recorder, require_auth, name_map=None):
             pass
 
 
+def _parent_alive(pid):
+    """Best-effort liveness check for the C++ test process."""
+    if pid <= 0:
+        return True
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        kernel32.CloseHandle(handle)
+        return bool(ok) and code.value == STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _watch_parent(pid):
+    """Exit if the test executable disappears.
+
+    The Job Object covers normal teardown, but a force-killed test process or a
+    nested-job host can leave this proxy orphaned. The child must not outlive
+    the process that spawned it.
+    """
+    while True:
+        if not _parent_alive(pid):
+            os._exit(0)
+        time.sleep(1)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["forward", "connect", "socks5"], default="forward")
+    ap.add_argument("--parent-pid", type=int, default=0,
+                    help="Exit when this process disappears")
     ap.add_argument("--tls-cert")
     ap.add_argument("--tls-key")
     ap.add_argument("--require-auth", action="store_true")
@@ -406,6 +444,10 @@ def main():
     # malformed status code (huge number, non-numeric) instead of a real 2xx.
     ap.add_argument("--connect-status")
     args = ap.parse_args()
+
+    if args.parent_pid:
+        threading.Thread(target=_watch_parent, args=(args.parent_pid,),
+                         daemon=True).start()
 
     name_map = {}
     for pair in args.map:

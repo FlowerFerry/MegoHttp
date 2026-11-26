@@ -310,10 +310,48 @@ class DohHandler:
         conn.sendall(head.encode("latin-1") + body)
 
 
+def _parent_alive(pid):
+    """Best-effort liveness check for the C++ test process."""
+    if pid <= 0:
+        return True
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        kernel32.CloseHandle(handle)
+        return bool(ok) and code.value == STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _watch_parent(pid):
+    """Exit if the test executable disappears.
+
+    A Job Object handles normal test termination, but a force-killed test
+    process or a nested-job host can leave this server orphaned. This watchdog
+    closes that hole: the child must not outlive the process that spawned it.
+    """
+    while True:
+        if not _parent_alive(pid):
+            os._exit(0)
+        time.sleep(1)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cert", required=True)
     parser.add_argument("--key", required=True)
+    parser.add_argument("--parent-pid", type=int, default=0,
+                        help="Exit when this process disappears")
     parser.add_argument("--behaviour", default="normal",
                         choices=["normal", "wrong-status", "wrong-media-type",
                                  "truncated", "servfail", "nxdomain",
@@ -323,6 +361,10 @@ def main():
     parser.add_argument("--count-file", default=None,
                         help="Write the number of DNS answers served to this file")
     args = parser.parse_args()
+
+    if args.parent_pid:
+        threading.Thread(target=_watch_parent, args=(args.parent_pid,),
+                         daemon=True).start()
 
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

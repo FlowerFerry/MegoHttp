@@ -25,6 +25,11 @@ public:
         cmd += MEGOHTTP_TESTS_DIR;
         cmd += "/proxy_test_server.py\" ";
         cmd += args;
+#if defined(_WIN32)
+        // The proxy also watches this PID so a force-killed test executable
+        // cannot leave it orphaned when the Job Object is unavailable.
+        cmd += " --parent-pid " + std::to_string(GetCurrentProcessId());
+#endif
         return spawn(cmd);
     }
 

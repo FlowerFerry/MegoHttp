@@ -136,14 +136,31 @@ TEST_CASE("S3.2-04: Backpressure in streaming download", "[streaming][integratio
         };
         
         Request::BodySinkComplete complete = [](VoidResult) {};
+        auto flow = std::make_shared<Request::BodySinkFlow>();
         
-        req.set_body_sink(std::move(sink), std::move(complete));
+        req.set_body_sink(std::move(sink), std::move(complete), flow);
         
         // 验证接口设置正确
         REQUIRE(req.body_sink().has_value());
+        REQUIRE(req.body_sink_flow() == flow);
         
         // 注意：实际背压行为需要网络交互验证
     }
+}
+
+TEST_CASE("a BodySink without a BodySinkFlow is rejected at submit",
+          "[streaming][integration][backpressure]") {
+    // false now always means pause, so a sink without a resume channel is an
+    // invalid configuration. The rejection must be synchronous: the request is
+    // never accepted and no network work starts.
+    Client client;
+    Request req(Method::Get, "http://127.0.0.1:1/");
+    req.set_body_sink([](string_view) { return true; }, [](VoidResult) {});
+
+    auto r = client.request_sync(req);
+    REQUIRE(!r);
+    CHECK(r.error().code() == ErrorCode::InvalidArgument);
+    CHECK(r.error().phase() == ErrorPhase::None);
 }
 
 // ============================================================================

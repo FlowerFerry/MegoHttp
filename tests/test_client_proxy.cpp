@@ -153,8 +153,12 @@ public:
 #if defined(_WIN32)
         _putenv_s("MEGOHTTP_PROXY_RECORDING", recording_.c_str());
 #endif
-        const std::string cmd = "python \"" + std::string(MEGOHTTP_TESTS_DIR) +
-                                "/proxy_test_server.py\" --mode " + mode + " " + extra;
+        std::string cmd = "python \"" + std::string(MEGOHTTP_TESTS_DIR) +
+                          "/proxy_test_server.py\" --mode " + mode + " " + extra;
+#if defined(_WIN32)
+        // Keep the fixture tied to this test process even if it is force-killed.
+        cmd += " --parent-pid " + std::to_string(GetCurrentProcessId());
+#endif
         return spawn_and_read_banner(cmd);
     }
 

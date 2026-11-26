@@ -67,6 +67,9 @@ namespace {
             std::string cmd = "cmd.exe /c python -u \"" +
                               std::string(MEGOHTTP_TESTS_DIR) + "/" + script + "\"";
             if (!args.empty()) cmd += " " + args;
+            if (script == "proxy_test_server.py") {
+                cmd += " --parent-pid " + std::to_string(GetCurrentProcessId());
+            }
             cmd += " > \"" + out_file_ + "\" 2>&1";
 
             STARTUPINFOA si{};

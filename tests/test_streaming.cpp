@@ -114,7 +114,8 @@ TEST_CASE("S3.2-02: BodySink streaming download", "[streaming][body_sink]") {
             }
         };
         
-        req.set_body_sink(std::move(sink), std::move(complete));
+        req.set_body_sink(std::move(sink), std::move(complete),
+                          std::make_shared<Request::BodySinkFlow>());
         
         REQUIRE(req.body_sink().has_value());
         REQUIRE(req.body_sink_complete().has_value());
@@ -135,7 +136,8 @@ TEST_CASE("S3.2-02: BodySink streaming download", "[streaming][body_sink]") {
         
         Request::BodySinkComplete complete = [](VoidResult) {};
         
-        req.set_body_sink(std::move(sink), std::move(complete));
+        req.set_body_sink(std::move(sink), std::move(complete),
+                          std::make_shared<Request::BodySinkFlow>());
         REQUIRE(req.body_sink().has_value());
     }
     
@@ -187,7 +189,8 @@ TEST_CASE("S3.2: Streaming upload and download integration", "[streaming][integr
             return true;
         };
         Request::BodySinkComplete complete = [](VoidResult) {};
-        req.set_body_sink(std::move(sink), std::move(complete));
+        req.set_body_sink(std::move(sink), std::move(complete),
+                          std::make_shared<Request::BodySinkFlow>());
         
         REQUIRE(req.body_source().has_value());
         REQUIRE(req.body_sink().has_value());
@@ -225,7 +228,8 @@ TEST_CASE("S3.2: Edge cases", "[streaming][edge_cases]") {
         };
         Request::BodySinkComplete complete = [](VoidResult) {};
         
-        req.set_body_sink(std::move(sink), std::move(complete));
+        req.set_body_sink(std::move(sink), std::move(complete),
+                          std::make_shared<Request::BodySinkFlow>());
         REQUIRE(req.body_sink().has_value());
     }
     

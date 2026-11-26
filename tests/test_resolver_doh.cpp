@@ -61,6 +61,11 @@ public:
         cmd += MEGOHTTP_TESTS_DIR;
         cmd += "/doh_test_server.py\" --cert \"" + fixture("server-cert.pem") +
                "\" --key \"" + fixture("server-key.pem") + "\"";
+#if defined(_WIN32)
+        // Besides the Job Object, the Python server watches this PID so a
+        // force-killed test executable cannot leave it orphaned.
+        cmd += " --parent-pid " + std::to_string(GetCurrentProcessId());
+#endif
         if (behaviour) { cmd += " --behaviour "; cmd += behaviour; }
         return spawn(cmd);
     }
