@@ -152,6 +152,8 @@ namespace megohttp {
             std::lock_guard<std::mutex> lk(send_mutex_);
             send_queue_.clear();
             send_queue_bytes_ = 0;
+            send_queue_raw_bytes_ = 0;
+            incremental_pending_raw_bytes_ = 0;
             fatal_send_error_ = false;
             rx_incremental_active_ = false;
             rx_total_ = 0;
@@ -166,6 +168,7 @@ namespace megohttp {
                     incremental_completed_ = true;
                     incremental_complete_ = nullptr;
                     incremental_raw_bytes_ = 0;
+                    incremental_pending_raw_bytes_ = 0;
                 }
             }
             if (!notify) {
@@ -562,13 +565,14 @@ namespace megohttp {
                          string("send queue is full")};
         }
         send_queue_bytes_ += frame.size();
-        send_queue_.push_back(SendItem{std::move(frame), std::move(on_complete)});
+        send_queue_raw_bytes_ += size;
+        send_queue_.push_back(SendItem{std::move(frame), size, std::move(on_complete)});
         return VoidResult{};
     }
 
     inline VoidResult WebSocketSession::enqueue_payload_locked(
         WsOpcode first_opcode, const uint8_t* payload, size_t size, bool fin, bool rsv1,
-        std::function<void(const Error&)> on_complete) {
+        size_t raw_bytes, std::function<void(const Error&)> on_complete) {
         if (state() != WebSocketState::Open && state() != WebSocketState::Closing) {
             return Error{ErrorCode::WsNotOpen, ErrorPhase::TargetProtocol,
                          string("WebSocket session is not open")};
@@ -609,18 +613,35 @@ namespace megohttp {
         };
 
         size_t total = 0;
-        for (const auto& f : plan) total += wire_size(f.length);
+        uint64_t payload_total = 0;
+        for (const auto& f : plan) {
+            total += wire_size(f.length);
+            payload_total += f.length;
+        }
         if (!queue_has_capacity_locked(0, total)) {
             return Error{ErrorCode::WsSendQueueFull, ErrorPhase::TargetProtocol,
                          string("send queue is full")};
         }
 
+        // Attribute the caller's uncompressed bytes to the encoded frames so
+        // pending_send_raw_bytes() remains meaningful across fragmentation and
+        // compression. The last frame receives the rounding remainder.
+        size_t raw_remaining = raw_bytes;
         // Exactly one completion per logical payload, even when it spans many
         // frames: an error on any frame wins; success only comes from the last.
         auto done = std::make_shared<std::atomic<bool>>(false);
         for (size_t i = 0; i < plan.size(); ++i) {
             const auto& f = plan[i];
             const bool last = (i + 1 == plan.size());
+            size_t raw_share = 0;
+            if (last) {
+                raw_share = raw_remaining;
+            } else if (payload_total != 0) {
+                raw_share = static_cast<size_t>(
+                    (static_cast<uint64_t>(raw_bytes) * f.length) / payload_total);
+                raw_share = (std::min)(raw_share, raw_remaining);
+            }
+            raw_remaining -= raw_share;
             byte_buffer frame;
             ws_encode_frame(frame, f.opcode,
                             payload ? payload + f.offset : nullptr,
@@ -637,7 +658,8 @@ namespace megohttp {
                 };
             }
             send_queue_bytes_ += frame.size();
-            send_queue_.push_back(SendItem{std::move(frame), std::move(cb)});
+            send_queue_raw_bytes_ += raw_share;
+            send_queue_.push_back(SendItem{std::move(frame), raw_share, std::move(cb)});
         }
         return VoidResult{};
     }
@@ -670,7 +692,7 @@ namespace megohttp {
         };
 
         if (size == 0) {
-            return enqueue_payload_locked(opcode, nullptr, 0, true, false,
+            return enqueue_payload_locked(opcode, nullptr, 0, true, false, 0,
                                           completion);
         }
 
@@ -720,7 +742,7 @@ namespace megohttp {
         }
 #endif
         auto r = enqueue_payload_locked(opcode, body, body_size, true, compress,
-                                        completion);
+                                        size, completion);
         if (!r && compress) fatal_send_error_ = true;
         return r;
     }
@@ -738,6 +760,7 @@ namespace megohttp {
         incremental_active_ = true;
         incremental_type_ = type;
         incremental_raw_bytes_ = 0;
+        incremental_pending_raw_bytes_ = 0;
         incremental_first_frame_sent_ = false;
         incremental_compressed_ = false;
         incremental_completed_ = false;
@@ -805,6 +828,7 @@ namespace megohttp {
         std::vector<uint8_t> encoded;
         const uint8_t* body = data;
         size_t body_size = size;
+        size_t raw_for_queue = size;
 #if MEGOHTTP_HAS_WEBSOCKET_DEFLATE
         if (incremental_compressed_) {
             auto chunk = deflate_out_->compress_chunk(data, size);
@@ -818,15 +842,19 @@ namespace megohttp {
             body_size = encoded.size();
             if (body_size == 0) {
                 // zlib may buffer a small chunk; nothing to send yet. The bytes
-                // are still counted against the message/queue budget.
+                // are still counted against the message/queue budget and are
+                // attributed to the next emitted compressed frame.
+                incremental_pending_raw_bytes_ += size;
                 incremental_raw_bytes_ += size;
                 return VoidResult{};
             }
+            raw_for_queue += incremental_pending_raw_bytes_;
+            incremental_pending_raw_bytes_ = 0;
         }
 #endif
 
         auto r = enqueue_payload_locked(
-            opcode, body, body_size, false, rsv1,
+            opcode, body, body_size, false, rsv1, raw_for_queue,
             [this](const Error& e) { if (e) report_error(e); });
         if (!r) {
             // The compressed context has already consumed this chunk; the
@@ -902,20 +930,25 @@ namespace megohttp {
             tail.push_back(0x00);
         }
 
+        // The remainder of the message's raw input that has no emitted frame
+        // yet belongs to send_end's tail (or to a zero-length terminal frame).
+        const size_t raw_tail = incremental_pending_raw_bytes_;
+        incremental_pending_raw_bytes_ = 0;
+
         if (!tail.empty()) {
             const WsOpcode opcode = incremental_first_frame_sent_
                                         ? WsOpcode::Continuation
                                         : first_opcode;
             const bool rsv1 = !incremental_first_frame_sent_ && incremental_compressed_;
             auto r = enqueue_payload_locked(opcode, tail.data(), tail.size(), true,
-                                            rsv1, std::move(message_cb));
+                                            rsv1, raw_tail, std::move(message_cb));
             if (!r) return fail_enqueue(r.error());
         } else {
             const WsOpcode opcode = incremental_first_frame_sent_
                                         ? WsOpcode::Continuation
                                         : first_opcode;
             auto r = enqueue_payload_locked(opcode, nullptr, 0, true, false,
-                                            std::move(message_cb));
+                                            raw_tail, std::move(message_cb));
             if (!r) return fail_enqueue(r.error());
         }
 
@@ -928,6 +961,7 @@ namespace megohttp {
         incremental_completed_ = true;
         incremental_active_ = false;
         incremental_raw_bytes_ = 0;
+        incremental_pending_raw_bytes_ = 0;
         if (incremental_complete_) {
             incremental_ready_cb_ = std::move(incremental_complete_);
             incremental_ready_err_ = err;
@@ -967,6 +1001,11 @@ namespace megohttp {
     inline size_t WebSocketSession::pending_send_bytes() const noexcept {
         std::lock_guard<std::mutex> lk(send_mutex_);
         return send_queue_bytes_;
+    }
+
+    inline size_t WebSocketSession::pending_send_raw_bytes() const noexcept {
+        std::lock_guard<std::mutex> lk(send_mutex_);
+        return send_queue_raw_bytes_;
     }
 
     inline bool WebSocketSession::take_fatal_send_error() {
@@ -1148,12 +1187,14 @@ namespace megohttp {
     inline void WebSocketSession::pump_send_queue_now() {
         std::shared_ptr<std::vector<uint8_t>> buf;
         std::function<void(const Error&)> cb;
+        size_t raw_bytes = 0;
         {
             std::lock_guard<std::mutex> lk(send_mutex_);
             if (sending_ || send_queue_.empty()) return;
             sending_ = true;
             // Move the frame to the heap: the write callback needs it alive.
             buf = std::make_shared<std::vector<uint8_t>>(std::move(send_queue_.front().data));
+            raw_bytes = send_queue_.front().raw_bytes;
             cb = std::move(send_queue_.front().on_complete);
             send_queue_.pop_front();
         }
@@ -1161,12 +1202,13 @@ namespace megohttp {
         auto self = shared_from_this();
         stream_->async_write(
             buf->data(), buf->size(),
-            [this, self, buf, cb](Result<size_t> r) mutable {
+            [this, self, buf, cb, raw_bytes](Result<size_t> r) mutable {
                 {
                     std::lock_guard<std::mutex> lk(send_mutex_);
                     sending_ = false;
                     // The frame left the queue: release its share of the cap.
                     send_queue_bytes_ -= (std::min)(send_queue_bytes_, buf->size());
+                    send_queue_raw_bytes_ -= (std::min)(send_queue_raw_bytes_, raw_bytes);
                 }
                 if (cb) {
                     if (!r) cb(r.error());

@@ -142,6 +142,13 @@ namespace megohttp {
         // frame being written. The active message's uncompressed bytes are not
         // included; they are accounted at admission instead.
         size_t pending_send_bytes() const noexcept;
+        // Uncompressed input bytes represented by frames still in the send
+        // queue, including the frame being written. Compressed frames are
+        // attributed back to their original chunks; bytes buffered inside zlib
+        // with no emitted frame yet are not included. Control-frame payloads
+        // count as raw bytes as well. This is observability only; the queue cap
+        // still uses pending_send_bytes() plus the admission-time raw estimate.
+        size_t pending_send_raw_bytes() const noexcept;
         void send_ping(const std::vector<uint8_t>& payload = {},
                        std::function<void(const Error&)> on_complete = nullptr);
         void send_pong(const std::vector<uint8_t>& payload = {},
@@ -222,6 +229,7 @@ namespace megohttp {
                                      std::function<void(const Error&)> on_complete);
         VoidResult enqueue_payload_locked(WsOpcode first_opcode, const uint8_t* payload,
                                           size_t size, bool fin, bool rsv1,
+                                          size_t raw_bytes,
                                           std::function<void(const Error&)> on_complete);
         VoidResult send_text_locked(WsOpcode opcode, const uint8_t* data, size_t size,
                                     std::function<void(const Error&)> on_complete);
@@ -279,11 +287,14 @@ namespace megohttp {
 
         struct SendItem {
             std::vector<uint8_t> data;
+            size_t raw_bytes{0};
             std::function<void(const Error&)> on_complete;
         };
         std::deque<SendItem> send_queue_;
         // Bytes currently queued (front item included while it is being written).
         size_t send_queue_bytes_{0};
+        // Uncompressed input bytes represented by the queued frames above.
+        size_t send_queue_raw_bytes_{0};
         bool sending_{false};
         // At most one scheduled pump: AsioExecutor::is_in_loop_thread() is
         // always false (an external io_context may have many threads), so a
@@ -295,6 +306,10 @@ namespace megohttp {
         bool incremental_active_{false};
         WsMessageType incremental_type_{WsMessageType::Text};
         size_t incremental_raw_bytes_{0};
+        // Raw chunks already consumed by zlib but not yet represented by an
+        // emitted frame. They are moved into the send queue with the next
+        // compressed output (or send_end's tail).
+        size_t incremental_pending_raw_bytes_{0};
         bool incremental_first_frame_sent_{false};
         bool incremental_compressed_{false};
         std::function<void(const Error&)> incremental_complete_;

@@ -753,6 +753,47 @@ TEST_CASE("ws session negotiates permessage-deflate and sets RSV1", "[websocket]
     CHECK((f[1] & 0x80) != 0);     // masked, as a client frame must be
 }
 
+TEST_CASE("ws send queue exposes raw and wire occupancy", "[websocket][session][deflate][observability]") {
+    sock_init();
+    WsEchoServer srv;
+    REQUIRE(srv.start());
+    srv.accept_deflate("permessage-deflate");
+
+    SessionFixture fx;
+    REQUIRE(fx.connect(srv.port()));
+
+    std::atomic<bool> opened{false};
+    std::atomic<bool> sent{false};
+    WebSocketOptions opts;
+    opts.enable_deflate = true;
+    opts.max_frame_size = 64;  // force several compressed frames
+
+    fx.session = std::make_shared<WebSocketSession>(fx.stream, opts, fx.exec);
+    fx.on_loop([&] {
+        fx.session->start(string("localhost"), string("/"), Headers{},
+                          [&](const Error&) { opened.store(true); });
+    });
+    REQUIRE(wait_until([&] { return opened.load(); }));
+    REQUIRE(fx.session->negotiated_deflate().enabled);
+
+    std::string payload;
+    for (int i = 0; i < 200; ++i) payload += "compressible observable payload ";
+
+    fx.on_loop([&] {
+        fx.session->send_text(string(payload.c_str()),
+                              [&](const Error&) { sent.store(true); });
+        // send_text returns after compression/enqueue; the write completion
+        // cannot run until this loop callback returns.
+        CHECK(fx.session->pending_send_raw_bytes() == payload.size());
+        CHECK(fx.session->pending_send_bytes() > 0);
+        CHECK(fx.session->pending_send_bytes() < payload.size());
+    });
+
+    REQUIRE(wait_until([&] { return sent.load(); }));
+    REQUIRE(wait_until([&] { return fx.session->pending_send_raw_bytes() == 0; }));
+    CHECK(fx.session->pending_send_bytes() == 0);
+}
+
 TEST_CASE("ws session continues uncompressed when the server declines deflate",
           "[websocket][session][deflate]") {
     sock_init();
