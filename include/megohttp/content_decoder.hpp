@@ -61,7 +61,7 @@ namespace megohttp {
         virtual VoidResult flush() = 0;
 
         // Whether the decoder has finished (flush called and all output emitted).
-        virtual bool is_finished() const noexcept = false;
+        virtual bool is_finished() const noexcept = 0;
     };
 
     // --- Chain -----------------------------------------------------------

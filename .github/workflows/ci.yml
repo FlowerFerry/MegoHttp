@@ -1,0 +1,92 @@
+name: cross-platform
+
+# Cross-compile-only checks do not claim runtime evidence. The task book's
+# matrix distinguishes compile-only, cross-compile-only, native runtime and
+# local-service integration; these jobs provide the first two categories.
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android-cross:
+    name: Android arm64 cross-compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: true
+
+      - name: Configure and compile Android smoke target
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          cmake -S tests/cross_compile -B build-android -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/cmake/toolchains/android-ndk.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-21 \
+            -DMEGOHTTP_SOURCE_DIR="$GITHUB_WORKSPACE"
+          cmake --build build-android --verbose
+          ls -l build-android/libmegohttp_cross_smoke.a
+
+  ios-cross:
+    name: iOS arm64 cross-compile
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain versions
+        run: |
+          cmake --version
+          xcodebuild -version
+
+      - name: Configure and compile iOS smoke target
+        run: |
+          cmake -S tests/cross_compile -B build-ios -G Xcode \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/cmake/toolchains/ios.cmake" \
+            -DMEGOHTTP_SOURCE_DIR="$GITHUB_WORKSPACE"
+          cmake --build build-ios --config Release --target megohttp_cross_smoke
+          ls -l build-ios/Release/libmegohttp_cross_smoke.a
+
+  macos-trust:
+    name: macOS Keychain trust source
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install header-only dependency
+        run: brew install fmt
+
+      - name: Build and run the trust test
+        run: |
+          cmake -S . -B build-macos-trust -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMGHTTP_BACKEND_LIBUV=OFF \
+            -DMGHTTP_BACKEND_ASIO=ON \
+            -DMGHTTP_USE_UVW=OFF \
+            -DMGHTTP_TLS_NONE=ON \
+            -DMGHTTP_TLS_OPENSSL=OFF \
+            -DMGHTTP_TLS_MBEDTLS=OFF \
+            -DMGHTTP_USE_MEMESTRING=OFF \
+            -DMGHTTP_ENABLE_GZIP=OFF \
+            -DMGHTTP_ENABLE_BROTLI=OFF \
+            -DMGHTTP_ENABLE_SSE=OFF \
+            -DMGHTTP_ENABLE_WEBSOCKET=OFF \
+            -DMGHTTP_ENABLE_WEBSOCKET_DEFLATE=OFF \
+            -DMGHTTP_ENABLE_DOT=OFF \
+            -DMGHTTP_ENABLE_DOH=OFF \
+            -DMGHTTP_BUILD_TESTS=ON \
+            -DMGHTTP_BUILD_EXAMPLES=OFF \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix fmt)"
+          cmake --build build-macos-trust --target test_tls_trust -j2
+          ./build-macos-trust/tests/test_tls_trust

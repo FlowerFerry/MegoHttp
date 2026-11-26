@@ -38,6 +38,17 @@
 
 #include "process_job.hpp"
 
+#if !defined(_WIN32)
+// The fixture historically used the MSVC spellings. macOS/Linux expose the
+// POSIX popen/pclose names; keep one implementation for both test hosts.
+#   ifndef _popen
+#       define _popen popen
+#   endif
+#   ifndef _pclose
+#       define _pclose pclose
+#   endif
+#endif
+
 namespace tls_test_support {
 
 inline bool wait_until(std::function<bool()> pred, int max_ms = 10000) {

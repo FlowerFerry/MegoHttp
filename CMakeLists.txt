@@ -475,6 +475,22 @@ if(MGHTTP_TLS_MBEDTLS)
     endif()
 endif()
 
+if(APPLE)
+    # tls_trust::system_ca_bundle_path() exports macOS Keychain anchor
+    # certificates through Security.framework/CoreFoundation. iOS links the
+    # same frameworks even though its trust source is intentionally empty.
+    find_library(MGHTTP_SECURITY_FRAMEWORK Security)
+    find_library(MGHTTP_COREFOUNDATION_FRAMEWORK CoreFoundation)
+    if(MGHTTP_SECURITY_FRAMEWORK AND MGHTTP_COREFOUNDATION_FRAMEWORK)
+        target_link_libraries(megohttp INTERFACE
+            ${MGHTTP_SECURITY_FRAMEWORK} ${MGHTTP_COREFOUNDATION_FRAMEWORK})
+    else()
+        message(WARNING
+            "Security/CoreFoundation frameworks were not found; the macOS "
+            "Keychain trust export will not link.")
+    endif()
+endif()
+
 # A coding is only advertised as available when its library was actually found:
 # defining the flag without the library would make Accept-Encoding promise gzip
 # or br and then fail to decode what the server sends back.

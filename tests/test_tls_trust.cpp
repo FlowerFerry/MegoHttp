@@ -5,6 +5,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdio>
 #include <string>
 
 #if defined(_WIN32)
@@ -95,6 +96,38 @@ TEST_CASE("Windows system root store is exported as PEM", "[tls_trust]") {
     fread(&buf[0], 1, buf.size(), f);
     fclose(f);
     CHECK(buf.find("BEGIN CERTIFICATE") != std::string::npos);
+}
+
+#endif
+
+// ---------------------------------------------------------------------------
+// macOS Keychain anchor export
+// ---------------------------------------------------------------------------
+
+#if defined(MEGOHTTP_PLATFORM_MACOS) && MEGOHTTP_PLATFORM_MACOS
+
+TEST_CASE("macOS Keychain anchors are exported as PEM", "[tls_trust]") {
+    // The old implementation returned /etc/ssl/cert.pem, which is not the
+    // Keychain trust store and is not guaranteed to exist. Assert the real
+    // Keychain export: a non-empty file containing at least one PEM cert.
+    const string path = tls_trust::system_ca_bundle_path();
+    REQUIRE(!path.empty());
+
+    FILE* f = std::fopen(path.c_str(), "rb");
+    REQUIRE(f != nullptr);
+    std::fseek(f, 0, SEEK_END);
+    const long sz = std::ftell(f);
+    std::fclose(f);
+    REQUIRE(sz > 1000);
+
+    std::string buf(static_cast<size_t>(sz), 0);
+    f = std::fopen(path.c_str(), "rb");
+    REQUIRE(f != nullptr);
+    const size_t got = std::fread(buf.data(), 1, buf.size(), f);
+    std::fclose(f);
+    REQUIRE(got == buf.size());
+    CHECK(buf.find("BEGIN CERTIFICATE") != std::string::npos);
+    CHECK(buf.find("END CERTIFICATE") != std::string::npos);
 }
 
 #endif

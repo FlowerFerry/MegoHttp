@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace megohttp {
@@ -155,6 +156,14 @@ string default_ca_path();
 #   include <windows.h>
 #   include <wincrypt.h>
 #   pragma comment(lib, "crypt32")
+#elif defined(__APPLE__)
+#   include <TargetConditionals.h>
+#   if defined(TARGET_OS_OSX) && TARGET_OS_OSX
+#       include <CoreFoundation/CoreFoundation.h>
+#       include <Security/Security.h>
+#   endif
+#   include <cstdio>
+#   include <cstdlib>
 #else
 #   include <cstdio>
 #   include <cstdlib>
@@ -228,8 +237,105 @@ string system_ca_directory() { return {}; }   // Windows has no hashed CA dir
 
 #elif defined(__APPLE__)
 
-string system_ca_bundle_path() { return string("/etc/ssl/cert.pem"); }
-string system_ca_directory() { return string("/etc/ssl/certs"); }
+// macOS does not guarantee a CA bundle file (and /etc/ssl/cert.pem is not the
+// Keychain trust store). Export the anchor certificates from the system trust
+// store to PEM so the OpenSSL/mbedTLS backends can consume them. As with the
+// Windows ROOT export, this is an import, not native platform trust
+// evaluation: revocation checks and platform policy are not applied.
+#if defined(TARGET_OS_OSX) && TARGET_OS_OSX
+
+static std::string apple_base64_encode(const uint8_t* data, size_t size) {
+    static const char table[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((size + 2) / 3) * 4 + size / 48 + 2);
+    size_t column = 0;
+    for (size_t i = 0; i < size; i += 3) {
+        const uint32_t a = data[i];
+        const uint32_t b = (i + 1 < size) ? data[i + 1] : 0;
+        const uint32_t c = (i + 2 < size) ? data[i + 2] : 0;
+        const uint32_t n = (a << 16) | (b << 8) | c;
+        const size_t count = (i + 2 < size) ? 4 : ((i + 1 < size) ? 3 : 2);
+        char encoded[4] = {
+            table[(n >> 18) & 0x3f],
+            table[(n >> 12) & 0x3f],
+            count > 2 ? table[(n >> 6) & 0x3f] : '=',
+            count > 3 ? table[n & 0x3f] : '=',
+        };
+        out.append(encoded, count);
+        column += count;
+        if (column >= 64) {
+            out.push_back('\n');
+            column = 0;
+        }
+    }
+    if (column != 0) out.push_back('\n');
+    return out;
+}
+
+static std::string apple_export_anchor_certificates() {
+    CFArrayRef anchors = nullptr;
+    if (SecTrustCopyAnchorCertificates(&anchors) != errSecSuccess || !anchors) {
+        return {};
+    }
+
+    std::string pem;
+    const CFIndex count = CFArrayGetCount(anchors);
+    for (CFIndex i = 0; i < count; ++i) {
+        SecCertificateRef cert = reinterpret_cast<SecCertificateRef>(
+            const_cast<void*>(CFArrayGetValueAtIndex(anchors, i)));
+        if (!cert) continue;
+        CFDataRef data = SecCertificateCopyData(cert);
+        if (!data) continue;
+        const CFIndex length = CFDataGetLength(data);
+        if (length > 0) {
+            pem.append("-----BEGIN CERTIFICATE-----\n");
+            pem.append(apple_base64_encode(
+                reinterpret_cast<const uint8_t*>(CFDataGetBytePtr(data)),
+                static_cast<size_t>(length)));
+            pem.append("-----END CERTIFICATE-----\n");
+        }
+        CFRelease(data);
+    }
+    CFRelease(anchors);
+
+    if (pem.empty()) return {};
+
+    const char* tmp = std::getenv("TMPDIR");
+    std::string path = (tmp && *tmp) ? tmp : "/tmp";
+    if (path.back() != '/') path.push_back('/');
+    path.append("megohttp_trust_roots.pem");
+
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return {};
+    std::fwrite(pem.data(), 1, pem.size(), f);
+    std::fclose(f);
+    return path;
+}
+
+static const std::string& apple_bundle() {
+    // Export once: walking the system trust store on every handshake is slow
+    // and the trust store rarely changes inside one process.
+    static const std::string cached = apple_export_anchor_certificates();
+    return cached;
+}
+
+string system_ca_bundle_path() {
+    const std::string& p = apple_bundle();
+    return p.empty() ? string{} : string(p.data(), p.size());
+}
+
+string system_ca_directory() { return {}; }   // No hashed PEM directory on macOS
+
+#else
+
+// iOS does not expose the system trust store as a PEM bundle. Callers must
+// provide an explicit CA bundle for the OpenSSL/mbedTLS backend, or validate
+// with a platform API outside this header-only library.
+string system_ca_bundle_path() { return {}; }
+string system_ca_directory() { return {}; }
+
+#endif
 
 #elif defined(__linux__)
 
