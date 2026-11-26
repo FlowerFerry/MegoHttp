@@ -197,11 +197,10 @@ jobs:
             -DMGHTTP_BUILD_EXAMPLES=OFF
           cmake --build build -j 2
 
-      - name: Run core tests
+      - name: Run tests
         shell: bash
         run: |
-          ctest --test-dir build --output-on-failure \
-            -R '^(test_core|test_http|test_dns_wire|test_cookie|test_content_type|test_content_range|test_multipart|test_multipart_response)$'
+          ctest --test-dir build --output-on-failure
 
   linux-native:
     name: Linux ${{ matrix.name }}
