@@ -20,6 +20,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Checkout fmt 12.2.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: fmtlib/fmt
+          ref: 12.2.0
+          path: deps/fmt-12.2.0
+          fetch-depth: 1
+
+      - name: Checkout Asio 1.38.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: chriskohlhoff/asio
+          ref: asio-1-38-0
+          path: deps/asio-asio-1-38-0
+          fetch-depth: 1
+
       - name: Install Android NDK
         id: ndk
         uses: nttld/setup-ndk@v1
@@ -41,9 +57,25 @@ jobs:
 
   ios-cross:
     name: iOS arm64 cross-compile
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+
+      - name: Checkout fmt 12.2.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: fmtlib/fmt
+          ref: 12.2.0
+          path: deps/fmt-12.2.0
+          fetch-depth: 1
+
+      - name: Checkout Asio 1.38.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: chriskohlhoff/asio
+          ref: asio-1-38-0
+          path: deps/asio-asio-1-38-0
+          fetch-depth: 1
 
       - name: Show toolchain versions
         run: |
@@ -60,9 +92,17 @@ jobs:
 
   macos-trust:
     name: macOS Keychain trust source
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+
+      - name: Checkout Asio 1.38.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: chriskohlhoff/asio
+          ref: asio-1-38-0
+          path: deps/asio-asio-1-38-0
+          fetch-depth: 1
 
       - name: Install header-only dependency
         run: brew install fmt
