@@ -636,6 +636,9 @@ namespace megohttp {
         }
     };
 
+    inline WsFrameDecoder::WsFrameDecoder(Callbacks& cbs)
+        : WsFrameDecoder(cbs, Limits{}) {}
+
     inline WsFrameDecoder::WsFrameDecoder(Callbacks& cbs, Limits limits)
         : impl_(std::make_unique<Impl>(cbs, limits)) {}
 

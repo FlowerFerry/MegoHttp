@@ -154,7 +154,10 @@ namespace megohttp {
             virtual bool pause_requested() const { return false; }
         };
 
-        WsFrameDecoder(Callbacks& cbs, Limits limits = {});
+        // Overloads instead of a defaulted nested Limits argument; see the
+        // AppleClang note in multipart_response.hpp.
+        WsFrameDecoder(Callbacks& cbs);
+        WsFrameDecoder(Callbacks& cbs, Limits limits);
         ~WsFrameDecoder();
 
         WsFrameDecoder(const WsFrameDecoder&) = delete;

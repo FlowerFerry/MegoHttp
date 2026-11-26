@@ -58,7 +58,12 @@ namespace megohttp {
             virtual VoidResult on_complete() = 0;
         };
 
-        MultipartResponseParser(Callbacks& cbs, string_view boundary, Limits limits = {});
+        // Keep the two-argument form as a real overload instead of a default
+        // argument. AppleClang rejects `Limits limits = {}` here because the
+        // nested struct's default member initializers are needed while the
+        // enclosing class is still incomplete (C++ [class.mem]).
+        MultipartResponseParser(Callbacks& cbs, string_view boundary);
+        MultipartResponseParser(Callbacks& cbs, string_view boundary, Limits limits);
         ~MultipartResponseParser();
 
         MultipartResponseParser(const MultipartResponseParser&) = delete;

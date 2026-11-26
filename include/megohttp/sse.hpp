@@ -77,7 +77,10 @@ namespace megohttp {
             virtual bool pause_requested() const { return false; }
         };
 
-        SseParser(Callbacks& cbs, Limits limits = {});
+        // Overloads instead of a defaulted nested Limits argument; see the
+        // AppleClang note in multipart_response.hpp.
+        SseParser(Callbacks& cbs);
+        SseParser(Callbacks& cbs, Limits limits);
         ~SseParser();
 
         SseParser(const SseParser&) = delete;

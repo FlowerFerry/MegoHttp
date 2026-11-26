@@ -361,6 +361,10 @@ namespace megohttp {
                                                            string_view boundary,
                                                            Limits limits)
         : impl_(std::make_unique<Impl>(cbs, boundary, limits)) {}
+    inline MultipartResponseParser::MultipartResponseParser(Callbacks& cbs,
+                                                           string_view boundary)
+        : MultipartResponseParser(cbs, boundary, Limits{}) {}
+
     inline MultipartResponseParser::~MultipartResponseParser() = default;
     inline MultipartResponseParser::MultipartResponseParser(MultipartResponseParser&&) noexcept = default;
     inline MultipartResponseParser& MultipartResponseParser::operator=(MultipartResponseParser&&) noexcept = default;

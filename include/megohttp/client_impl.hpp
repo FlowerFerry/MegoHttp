@@ -741,7 +741,9 @@ namespace megohttp {
                 }
                 if (!r) { fail(r.error()); return; }
 
-                auto& [data, eof] = r.value();
+                auto& body = r.value();
+                auto& data = body.first;
+                const bool eof = body.second;
                 if (data.empty() && !eof) {
                     // Backpressure: Source not ready. Retry shortly.
                     //

@@ -313,6 +313,9 @@ namespace megohttp {
     // SseParser public API
     // -----------------------------------------------------------------------
 
+    inline SseParser::SseParser(Callbacks& cbs)
+        : SseParser(cbs, Limits{}) {}
+
     inline SseParser::SseParser(Callbacks& cbs, Limits limits)
         : impl_(std::make_unique<Impl>(cbs, limits)) {}
 

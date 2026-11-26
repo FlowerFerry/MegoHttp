@@ -204,6 +204,10 @@ namespace file_source_detail {
         if (impl_) impl_->close();
     }
 
+    inline Result<std::shared_ptr<FileSource>> FileSource::open(string_view path) {
+        return FileSource::open(path, Options{});
+    }
+
     inline Result<std::shared_ptr<FileSource>> FileSource::open(
         string_view path, Options options) {
         if (path.empty()) {

@@ -7,6 +7,15 @@ namespace megohttp {
         std::shared_ptr<Executor> executor,
         WsStreamProvider provider,
         WebSocketOptions ws_options,
+        WebSocketReconnectPolicy policy)
+        : ReconnectingWebSocket(std::move(executor), std::move(provider),
+                                std::move(ws_options), std::move(policy),
+                                TestHooks{}) {}
+
+    inline ReconnectingWebSocket::ReconnectingWebSocket(
+        std::shared_ptr<Executor> executor,
+        WsStreamProvider provider,
+        WebSocketOptions ws_options,
         WebSocketReconnectPolicy policy,
         TestHooks test_hooks)
         : executor_(std::move(executor))

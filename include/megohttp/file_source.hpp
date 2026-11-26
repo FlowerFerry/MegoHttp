@@ -36,8 +36,11 @@ namespace megohttp {
         // (it is normally called from the submitting thread); all subsequent
         // reads happen on the worker thread. size() is known for a regular
         // file and nullopt for a non-seekable source such as a device.
+        // Keep the defaulted form as an overload for the same AppleClang
+        // nested-default-member-initializer reason as MultipartResponseParser.
+        static Result<std::shared_ptr<FileSource>> open(string_view path);
         static Result<std::shared_ptr<FileSource>> open(string_view path,
-                                                        Options options = {});
+                                                        Options options);
 
         ~FileSource();
 

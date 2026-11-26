@@ -76,11 +76,17 @@ namespace megohttp {
             std::function<void(Duration delay, std::function<void()> fn)> schedule_after;
         };
 
+        // Overloads instead of a defaulted nested TestHooks argument; see the
+        // AppleClang note in multipart_response.hpp.
+        ReconnectingWebSocket(std::shared_ptr<Executor> executor,
+                              WsStreamProvider provider,
+                              WebSocketOptions ws_options,
+                              WebSocketReconnectPolicy policy);
         ReconnectingWebSocket(std::shared_ptr<Executor> executor,
                               WsStreamProvider provider,
                               WebSocketOptions ws_options,
                               WebSocketReconnectPolicy policy,
-                              TestHooks test_hooks = {});
+                              TestHooks test_hooks);
         ~ReconnectingWebSocket();
 
         void on_open(OpenCallback cb);
