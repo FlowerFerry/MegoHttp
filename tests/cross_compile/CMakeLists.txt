@@ -16,7 +16,7 @@ project(MegoHttpCrossCompile LANGUAGES CXX)
 set(MEGOHTTP_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.." CACHE PATH
     "MegoHttp repository root")
 set(MEGOHTTP_FMT_INCLUDE_DIR
-    "${MEGOHTTP_SOURCE_DIR}/deps/fmt-12.2.0/include"
+    "${MEGOHTTP_SOURCE_DIR}/deps/fmt-12.1.0/include"
     CACHE PATH "fmt headers")
 set(MEGOHTTP_ASIO_INCLUDE_DIR
     "${MEGOHTTP_SOURCE_DIR}/deps/asio-asio-1-38-0/asio/include"

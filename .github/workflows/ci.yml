@@ -20,12 +20,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout fmt 12.2.0 headers
+      - name: Checkout fmt 12.1.0 headers
         uses: actions/checkout@v4
         with:
           repository: fmtlib/fmt
-          ref: 12.2.0
-          path: deps/fmt-12.2.0
+          ref: 12.1.0
+          path: deps/fmt-12.1.0
           fetch-depth: 1
 
       - name: Checkout Asio 1.38.0 headers
@@ -61,12 +61,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout fmt 12.2.0 headers
+      - name: Checkout fmt 12.1.0 headers
         uses: actions/checkout@v4
         with:
           repository: fmtlib/fmt
-          ref: 12.2.0
-          path: deps/fmt-12.2.0
+          ref: 12.1.0
+          path: deps/fmt-12.1.0
           fetch-depth: 1
 
       - name: Checkout Asio 1.38.0 headers
@@ -141,12 +141,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout fmt 12.2.0 headers
+      - name: Checkout fmt 12.1.0 headers
         uses: actions/checkout@v4
         with:
           repository: fmtlib/fmt
-          ref: 12.2.0
-          path: deps/fmt-12.2.0
+          ref: 12.1.0
+          path: deps/fmt-12.1.0
           fetch-depth: 1
 
       - name: Checkout Asio 1.38.0 headers
@@ -165,7 +165,7 @@ jobs:
       - name: Build pinned fmt
         shell: bash
         run: |
-          cmake -S deps/fmt-12.2.0 -B fmt-build -G Ninja \
+          cmake -S deps/fmt-12.1.0 -B fmt-build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DFMT_TEST=OFF -DFMT_DOC=OFF -DFMT_INSTALL=ON \
             -DCMAKE_INSTALL_LIBDIR=lib \
@@ -229,12 +229,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout fmt 12.2.0 headers
+      - name: Checkout fmt 12.1.0 headers
         uses: actions/checkout@v4
         with:
           repository: fmtlib/fmt
-          ref: 12.2.0
-          path: deps/fmt-12.2.0
+          ref: 12.1.0
+          path: deps/fmt-12.1.0
           fetch-depth: 1
 
       - name: Checkout Asio 1.38.0 headers
@@ -253,7 +253,7 @@ jobs:
 
       - name: Build pinned fmt
         run: |
-          cmake -S deps/fmt-12.2.0 -B fmt-build -G Ninja \
+          cmake -S deps/fmt-12.1.0 -B fmt-build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
             -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }}" \
@@ -315,12 +315,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout fmt 12.2.0 headers
+      - name: Checkout fmt 12.1.0 headers
         uses: actions/checkout@v4
         with:
           repository: fmtlib/fmt
-          ref: 12.2.0
-          path: deps/fmt-12.2.0
+          ref: 12.1.0
+          path: deps/fmt-12.1.0
           fetch-depth: 1
 
       - name: Checkout Asio 1.38.0 headers

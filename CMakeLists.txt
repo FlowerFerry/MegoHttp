@@ -186,7 +186,7 @@ if(MSVC)
 endif()
 
 # fmt is the only formatter used anywhere in the library.
-set(FMT_ROOT "${MGHTTP_DEPS_DIR}/fmt-12.2.0")
+set(FMT_ROOT "${MGHTTP_DEPS_DIR}/fmt-12.1.0")
 if(MSVC)
     set(FMT_LIB "${FMT_ROOT}/${MGHTTP_DEP_BUILD}/Release/fmt.lib")
 else()
