@@ -88,7 +88,7 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/cmake/toolchains/ios.cmake" \
             -DMEGOHTTP_SOURCE_DIR="$GITHUB_WORKSPACE"
           cmake --build build-ios --config Release --target megohttp_cross_smoke
-          ls -l build-ios/Release/libmegohttp_cross_smoke.a
+          ls -l build-ios/Release-iphoneos/libmegohttp_cross_smoke.a
 
   macos-trust:
     name: macOS Keychain trust source
