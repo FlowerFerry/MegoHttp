@@ -130,3 +130,217 @@ jobs:
             -DCMAKE_PREFIX_PATH="$(brew --prefix fmt)"
           cmake --build build-macos-trust --target test_tls_trust -j2
           ./build-macos-trust/tests/test_tls_trust
+
+  windows-msvc:
+    name: Windows MSVC ${{ matrix.arch }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, x86]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout fmt 12.2.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: fmtlib/fmt
+          ref: 12.2.0
+          path: deps/fmt-12.2.0
+          fetch-depth: 1
+
+      - name: Checkout Asio 1.38.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: chriskohlhoff/asio
+          ref: asio-1-38-0
+          path: deps/asio-asio-1-38-0
+          fetch-depth: 1
+
+      - name: Select MSVC ${{ matrix.arch }}
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Build pinned fmt
+        shell: bash
+        run: |
+          cmake -S deps/fmt-12.2.0 -B fmt-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DFMT_TEST=OFF -DFMT_DOC=OFF -DFMT_INSTALL=ON \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/fmt-install"
+          cmake --build fmt-build --target install -j 2
+
+      - name: Configure MegoHttp
+        shell: bash
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="${GITHUB_WORKSPACE}/fmt-install" \
+            -DMGHTTP_BACKEND_LIBUV=OFF \
+            -DMGHTTP_BACKEND_ASIO=ON \
+            -DMGHTTP_USE_UVW=OFF \
+            -DMGHTTP_TLS_NONE=ON \
+            -DMGHTTP_TLS_OPENSSL=OFF \
+            -DMGHTTP_TLS_MBEDTLS=OFF \
+            -DMGHTTP_USE_MEMESTRING=OFF \
+            -DMGHTTP_ENABLE_GZIP=OFF \
+            -DMGHTTP_ENABLE_BROTLI=OFF \
+            -DMGHTTP_ENABLE_SSE=OFF \
+            -DMGHTTP_ENABLE_WEBSOCKET=OFF \
+            -DMGHTTP_ENABLE_WEBSOCKET_DEFLATE=OFF \
+            -DMGHTTP_ENABLE_DOT=OFF \
+            -DMGHTTP_ENABLE_DOH=OFF \
+            -DMGHTTP_ENABLE_COROUTINES=OFF \
+            -DMGHTTP_BUILD_TESTS=ON \
+            -DMGHTTP_BUILD_EXAMPLES=OFF
+          cmake --build build -j 2
+
+      - name: Run core tests
+        shell: bash
+        run: |
+          ctest --test-dir build --output-on-failure \
+            -R '^(test_core|test_http|test_dns_wire|test_cookie|test_content_type|test_content_range|test_multipart|test_multipart_response)$'
+
+  linux-native:
+    name: Linux ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: GCC x64
+            cxx: g++
+            arch: x64
+            cxx_flags: ""
+          - name: GCC x86
+            cxx: g++
+            arch: x86
+            cxx_flags: "-m32"
+          - name: Clang x64
+            cxx: clang++
+            arch: x64
+            cxx_flags: ""
+          - name: Clang x86
+            cxx: clang++
+            arch: x86
+            cxx_flags: "-m32"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout fmt 12.2.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: fmtlib/fmt
+          ref: 12.2.0
+          path: deps/fmt-12.2.0
+          fetch-depth: 1
+
+      - name: Checkout Asio 1.38.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: chriskohlhoff/asio
+          ref: asio-1-38-0
+          path: deps/asio-asio-1-38-0
+          fetch-depth: 1
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build g++ clang g++-multilib
+
+      - name: Build pinned fmt
+        run: |
+          cmake -S deps/fmt-12.2.0 -B fmt-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+            -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }}" \
+            -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.cxx_flags }}" \
+            -DFMT_TEST=OFF -DFMT_DOC=OFF -DFMT_INSTALL=ON \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_INSTALL_PREFIX="${PWD}/fmt-install"
+          cmake --build fmt-build --target install -j 2
+
+      - name: Configure MegoHttp
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+            -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }}" \
+            -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.cxx_flags }}" \
+            -DCMAKE_PREFIX_PATH="${PWD}/fmt-install" \
+            -DMGHTTP_BACKEND_LIBUV=OFF \
+            -DMGHTTP_BACKEND_ASIO=ON \
+            -DMGHTTP_USE_UVW=OFF \
+            -DMGHTTP_TLS_NONE=ON \
+            -DMGHTTP_TLS_OPENSSL=OFF \
+            -DMGHTTP_TLS_MBEDTLS=OFF \
+            -DMGHTTP_USE_MEMESTRING=OFF \
+            -DMGHTTP_ENABLE_GZIP=OFF \
+            -DMGHTTP_ENABLE_BROTLI=OFF \
+            -DMGHTTP_ENABLE_SSE=OFF \
+            -DMGHTTP_ENABLE_WEBSOCKET=OFF \
+            -DMGHTTP_ENABLE_WEBSOCKET_DEFLATE=OFF \
+            -DMGHTTP_ENABLE_DOT=OFF \
+            -DMGHTTP_ENABLE_DOH=OFF \
+            -DMGHTTP_ENABLE_COROUTINES=OFF \
+            -DMGHTTP_BUILD_TESTS=ON \
+            -DMGHTTP_BUILD_EXAMPLES=OFF
+          cmake --build build -j 2
+
+      - name: Run core tests
+        run: |
+          ctest --test-dir build --output-on-failure \
+            -R '^(test_core|test_http|test_dns_wire|test_cookie|test_content_type|test_content_range|test_multipart|test_multipart_response)$'
+
+  linux-cross:
+    name: Linux cross-compile ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            processor: aarch64
+            compiler: aarch64-linux-gnu-g++
+            package: g++-aarch64-linux-gnu
+          - arch: armv7l
+            processor: armv7l
+            compiler: arm-linux-gnueabihf-g++
+            package: g++-arm-linux-gnueabihf
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout fmt 12.2.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: fmtlib/fmt
+          ref: 12.2.0
+          path: deps/fmt-12.2.0
+          fetch-depth: 1
+
+      - name: Checkout Asio 1.38.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: chriskohlhoff/asio
+          ref: asio-1-38-0
+          path: deps/asio-asio-1-38-0
+          fetch-depth: 1
+
+      - name: Install cross compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build ${{ matrix.package }}
+
+      - name: Configure and compile smoke target
+        run: |
+          cmake -S tests/cross_compile -B build-linux-${{ matrix.arch }} -G Ninja \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.processor }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMEGOHTTP_SOURCE_DIR="$GITHUB_WORKSPACE"
+          cmake --build build-linux-${{ matrix.arch }} --verbose
+          ls -l build-linux-${{ matrix.arch }}/libmegohttp_cross_smoke.a
