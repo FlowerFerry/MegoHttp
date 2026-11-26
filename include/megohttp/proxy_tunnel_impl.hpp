@@ -1,6 +1,8 @@
 #ifndef MEGOHTTP_PROXY_TUNNEL_IMPL_HPP_INCLUDED
 #define MEGOHTTP_PROXY_TUNNEL_IMPL_HPP_INCLUDED
 
+#include <megohttp/resolver.hpp>
+
 #include <charconv>
 #include <memory>
 #include <string>
@@ -145,8 +147,26 @@ namespace megohttp {
                                             uint16_t port,
                                             TunnelCallback done) {
                 using namespace proxy_detail::socks5;
-                auto req = std::make_shared<byte_buffer>(
-                    build_connect(kAtypDomain, to_view(host), nullptr, 0, port));
+                // An address literal must use the IPv4/IPv6 ATYP. Sending
+                // "127.0.0.1" as kAtypDomain makes the proxy interpret it as a
+                // DNS name; some proxies then fail, and a local-DNS mode that
+                // asked for an address on the wire has not been honoured.
+                auto literal = parse_ip_literal(to_view(host), port);
+                std::shared_ptr<byte_buffer> req;
+                if (!literal.empty() &&
+                    literal.front().family == ResolvedAddress::Family::IPv4) {
+                    req = std::make_shared<byte_buffer>(build_connect(
+                        kAtypIpv4, {}, literal.front().bytes.data(),
+                        literal.front().bytes.size(), port));
+                } else if (!literal.empty() &&
+                           literal.front().family == ResolvedAddress::Family::IPv6) {
+                    req = std::make_shared<byte_buffer>(build_connect(
+                        kAtypIpv6, {}, literal.front().bytes.data(),
+                        literal.front().bytes.size(), port));
+                } else {
+                    req = std::make_shared<byte_buffer>(build_connect(
+                        kAtypDomain, to_view(host), nullptr, 0, port));
+                }
                 transport->async_write(
                     req->data(), req->size(),
                     [transport, req, done](Result<size_t> w) mutable {

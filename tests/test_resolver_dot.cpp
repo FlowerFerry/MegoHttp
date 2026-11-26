@@ -34,6 +34,7 @@
 #endif
 
 #include "process_job.hpp"
+#include "proxy_server_fixture.hpp"
 
 namespace {
 
@@ -504,6 +505,307 @@ TEST_CASE("DoT system bootstrap resolves a named endpoint", "[dot][s5a][bootstra
     REQUIRE(got);
     REQUIRE(got.value().size() == 1);
     CHECK(got.value()[0].text == string("192.0.2.1"));
+}
+
+
+// -----------------------------------------------------------------------
+// S5A.4-01 / 9-A.4: DoT through a proxy. The endpoint name example.test is
+// only resolvable by the proxy's --map, so a successful lookup proves the
+// proxy tunnel was actually used. DoT TLS identity remains example.test.
+// -----------------------------------------------------------------------
+
+namespace {
+
+DotOptions dot_proxy_options(uint16_t dot_port, uint16_t proxy_port,
+                             ProxyType type) {
+    DotOptions o;
+    o.server_name = string("example.test");
+    // No endpoint bootstrap: the proxy resolves the CONNECT/SOCKS5 target.
+    o.port = dot_port;
+    o.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.proxy.proxy.type = type;
+    o.proxy.proxy.host = string("proxy.test");
+    o.proxy.proxy.port = proxy_port;
+    o.proxy_bootstrap_ip = string("127.0.0.1");
+    o.use_system_bootstrap = false;
+    if (type == ProxyType::Https) {
+        o.proxy.tls.ca_file = string(fixture("ca.pem").c_str());
+        o.proxy.tls.hostname = string("localhost");
+    }
+    o.connect_timeout = std::chrono::seconds(5);
+    return o;
+}
+
+std::string proxy_args(ProxyType type) {
+    std::string args = "--mode ";
+    if (type == ProxyType::Socks5) {
+        args += "socks5 --map example.test=127.0.0.1";
+    } else {
+        args += "connect --map example.test=127.0.0.1";
+        if (type == ProxyType::Https) {
+            args += " --tls-cert \"";
+            args += fixture("server-cert.pem");
+            args += "\" --tls-key \"";
+            args += fixture("server-key.pem");
+            args += "\"";
+        }
+    }
+    return args;
+}
+
+} // namespace
+
+TEST_CASE("DoT goes through an HTTP proxy and bootstraps the proxy name",
+          "[dot][s5a][proxy]") {
+    DotTestServer srv;
+    REQUIRE(srv.start());
+    mghttp_test::ProxyServerFixture proxy;
+    REQUIRE(proxy.start(proxy_args(ProxyType::Http)));
+
+    auto ex = detail::make_default_executor();
+    REQUIRE(ex);
+    auto resolver = std::make_shared<DotResolver>(
+        ex, dot_proxy_options(srv.port(), proxy.port(), ProxyType::Http));
+
+    std::atomic<bool> done{false};
+    Result<AddressList> got = Error{ErrorCode::Unknown};
+    resolver->resolve(string("example.com"), 443, [&](Result<AddressList> r) {
+        got = std::move(r);
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    if (!got) {
+        UNSCOPED_INFO("DoT HTTP proxy failed: "
+                      << megohttp::to_string(got.error().code())
+                      << " phase=" << megohttp::to_string(got.error().phase())
+                      << " msg=" << std::string(got.error().message().data(),
+                                                 got.error().message().size()));
+    }
+    REQUIRE(got);
+    CHECK(got.value().size() == 1);
+}
+
+TEST_CASE("DoT goes through an HTTPS proxy with independent TLS identity",
+          "[dot][s5a][proxy][tls]") {
+    DotTestServer srv;
+    REQUIRE(srv.start());
+    mghttp_test::ProxyServerFixture proxy;
+    REQUIRE(proxy.start(proxy_args(ProxyType::Https)));
+
+    auto ex = detail::make_default_executor();
+    REQUIRE(ex);
+    auto resolver = std::make_shared<DotResolver>(
+        ex, dot_proxy_options(srv.port(), proxy.port(), ProxyType::Https));
+
+    std::atomic<bool> done{false};
+    Result<AddressList> got = Error{ErrorCode::Unknown};
+    resolver->resolve(string("example.com"), 443, [&](Result<AddressList> r) {
+        got = std::move(r);
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    if (!got) {
+        UNSCOPED_INFO("DoT HTTPS proxy failed: "
+                      << megohttp::to_string(got.error().code())
+                      << " phase=" << megohttp::to_string(got.error().phase())
+                      << " msg=" << std::string(got.error().message().data(),
+                                                 got.error().message().size()));
+    }
+    REQUIRE(got);
+    CHECK(got.value().size() == 1);
+}
+
+TEST_CASE("DoT goes through SOCKS5 with remote DNS", "[dot][s5a][proxy][socks5]") {
+    DotTestServer srv;
+    REQUIRE(srv.start());
+    mghttp_test::ProxyServerFixture proxy;
+    REQUIRE(proxy.start(proxy_args(ProxyType::Socks5)));
+
+    auto ex = detail::make_default_executor();
+    REQUIRE(ex);
+    auto resolver = std::make_shared<DotResolver>(
+        ex, dot_proxy_options(srv.port(), proxy.port(), ProxyType::Socks5));
+
+    std::atomic<bool> done{false};
+    Result<AddressList> got = Error{ErrorCode::Unknown};
+    resolver->resolve(string("example.com"), 443, [&](Result<AddressList> r) {
+        got = std::move(r);
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    if (!got) {
+        UNSCOPED_INFO("DoT SOCKS5 proxy failed: "
+                      << megohttp::to_string(got.error().code())
+                      << " phase=" << megohttp::to_string(got.error().phase())
+                      << " msg=" << std::string(got.error().message().data(),
+                                                 got.error().message().size()));
+    }
+    REQUIRE(got);
+    CHECK(got.value().size() == 1);
+}
+
+
+TEST_CASE("DoT proxy handshake is bounded by connect_timeout",
+          "[dot][s5a][proxy][timeout]") {
+    // The proxy accepts TCP and then stalls before its TLS handshake. The
+    // connection-stage timer must end the DoT lookup, not leave it waiting for
+    // the proxy's 2 s delay and then failing for an unrelated reason.
+    mghttp_test::ProxyServerFixture proxy;
+    std::string args = "--mode connect --tls-cert \"";
+    args += fixture("server-cert.pem");
+    args += "\" --tls-key \"";
+    args += fixture("server-key.pem");
+    args += "\" --tls-handshake-delay 2 --map example.test=127.0.0.1";
+    REQUIRE(proxy.start(args));
+
+    DotOptions o = dot_proxy_options(1, proxy.port(), ProxyType::Https);
+    o.connect_timeout = std::chrono::milliseconds(300);
+
+    auto ex = detail::make_default_executor();
+    REQUIRE(ex);
+    auto resolver = std::make_shared<DotResolver>(ex, o);
+
+    std::atomic<bool> done{false};
+    Result<AddressList> got = Error{ErrorCode::Unknown};
+    const auto started = std::chrono::steady_clock::now();
+    resolver->resolve(string("example.com"), 443, [&](Result<AddressList> r) {
+        got = std::move(r);
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }, 5000));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    REQUIRE(!got);
+    CHECK(got.error().code() == ErrorCode::TimeoutConnect);
+    CHECK(elapsed < std::chrono::milliseconds(2500));
+}
+
+
+TEST_CASE("DoT proxy authentication uses the proxy credential only",
+          "[dot][s5a][proxy][auth]") {
+    DotTestServer srv;
+    REQUIRE(srv.start());
+    mghttp_test::ProxyServerFixture proxy;
+    REQUIRE(proxy.start(proxy_args(ProxyType::Http) + " --require-auth"));
+
+    DotOptions o = dot_proxy_options(srv.port(), proxy.port(), ProxyType::Http);
+    o.proxy.proxy.username = string("alice");
+    o.proxy.proxy.password = string("s3cret");
+
+    auto ex = detail::make_default_executor();
+    REQUIRE(ex);
+    auto resolver = std::make_shared<DotResolver>(ex, o);
+
+    std::atomic<bool> done{false};
+    Result<AddressList> got = Error{ErrorCode::Unknown};
+    resolver->resolve(string("example.com"), 443, [&](Result<AddressList> r) {
+        got = std::move(r);
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    REQUIRE(got);
+    CHECK(got.value().size() == 1);
+}
+
+
+TEST_CASE("DoT SOCKS5 local DNS sends the bootstrap address",
+          "[dot][s5a][proxy][socks5]") {
+    DotTestServer srv;
+    REQUIRE(srv.start());
+    mghttp_test::ProxyServerFixture proxy;
+    REQUIRE(proxy.start("--mode socks5 --map example.test=127.0.0.1"));
+
+    DotOptions o = dot_proxy_options(srv.port(), proxy.port(), ProxyType::Socks5);
+    o.proxy.proxy.socks5_remote_dns = false;
+    o.bootstrap_ip = string("127.0.0.1");
+
+    auto ex = detail::make_default_executor();
+    REQUIRE(ex);
+    auto resolver = std::make_shared<DotResolver>(ex, o);
+
+    std::atomic<bool> done{false};
+    Result<AddressList> got = Error{ErrorCode::Unknown};
+    resolver->resolve(string("example.com"), 443, [&](Result<AddressList> r) {
+        got = std::move(r);
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    if (!got) {
+        UNSCOPED_INFO("DoT SOCKS5 local DNS failed: "
+                      << megohttp::to_string(got.error().code())
+                      << " phase=" << megohttp::to_string(got.error().phase())
+                      << " msg=" << std::string(got.error().message().data(),
+                                                 got.error().message().size()));
+    }
+    REQUIRE(got);
+    CHECK(got.value().size() == 1);
+}
+
+
+TEST_CASE("DoT bootstrap address does not replace the certificate identity",
+          "[dot][s5a][bootstrap]") {
+    DotTestServer srv;
+    REQUIRE(srv.start());
+
+    DotOptions o;
+    o.server_name = string("example.test");   // cert SAN includes this name
+    o.bootstrap_ip = string("127.0.0.1");     // only the dial address
+    o.port = srv.port();
+    o.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.use_system_bootstrap = false;
+    o.connect_timeout = std::chrono::seconds(5);
+
+    auto ex = detail::make_default_executor();
+    REQUIRE(ex);
+    auto resolver = std::make_shared<DotResolver>(ex, o);
+
+    std::atomic<bool> done{false};
+    Result<AddressList> got = Error{ErrorCode::Unknown};
+    resolver->resolve(string("example.com"), 443, [&](Result<AddressList> r) {
+        got = std::move(r);
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    if (!got) {
+        UNSCOPED_INFO("DoT bootstrap identity failed: "
+                      << megohttp::to_string(got.error().code())
+                      << " phase=" << megohttp::to_string(got.error().phase())
+                      << " msg=" << std::string(got.error().message().data(),
+                                                 got.error().message().size()));
+    }
+    REQUIRE(got);
+    CHECK(got.value().size() == 1);
+}
+
+
+TEST_CASE("DoT validates the HTTPS proxy identity separately", "[dot][s5a][proxy][tls]") {
+    mghttp_test::ProxyServerFixture proxy;
+    REQUIRE(proxy.start(proxy_args(ProxyType::Https)));
+
+    DotOptions o = dot_proxy_options(1, proxy.port(), ProxyType::Https);
+    // The proxy presents server-cert.pem; this CA cannot validate it.
+    o.proxy.tls.ca_file = string(fixture("untrusted-ca.pem").c_str());
+
+    auto ex = detail::make_default_executor();
+    REQUIRE(ex);
+    auto resolver = std::make_shared<DotResolver>(ex, o);
+
+    std::atomic<bool> done{false};
+    Result<AddressList> got = Error{ErrorCode::Unknown};
+    resolver->resolve(string("example.com"), 443, [&](Result<AddressList> r) {
+        got = std::move(r);
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    REQUIRE(!got);
+    CHECK(got.error().phase() == ErrorPhase::ProxyTls);
 }
 
 #endif // MEGOHTTP_HAS_DOT && !MGHTTP_TLS_NONE

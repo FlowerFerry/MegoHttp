@@ -200,7 +200,7 @@ def handle_forward(client, recorder, use_tls, require_auth=False, first=b""):
 
 
 def handle_connect(client, recorder, use_tls, require_auth=False, first=b"",
-                   forced_status=None):
+                   forced_status=None, name_map=None):
     """CONNECT tunnel: 2xx only after the tunnel is real."""
     raw = recv_until(client, b"\r\n\r\n", first)
     request_line, headers, leftover = parse_head(raw)
@@ -237,7 +237,7 @@ def handle_connect(client, recorder, use_tls, require_auth=False, first=b"",
     port = int(port_s or "443")
 
     try:
-        upstream = connect_target(host, port)
+        upstream = connect_target(host, port, name_map)
     except OSError:
         client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
         client.close()
@@ -483,7 +483,7 @@ def main():
                     threading.Thread(target=handle_connect,
                                      args=(client, recorder, ctx is not None,
                                            args.require_auth, first,
-                                           args.connect_status),
+                                           args.connect_status, name_map),
                                      daemon=True).start()
                 else:
                     threading.Thread(target=handle_forward,

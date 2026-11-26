@@ -19,6 +19,7 @@
 #include <megohttp/dns_wire.hpp>
 #include <megohttp/error.hpp>
 #include <megohttp/executor.hpp>
+#include <megohttp/proxy.hpp>
 #include <megohttp/resolver.hpp>
 #include <megohttp/string_adapter.hpp>
 #include <megohttp/tls_stream.hpp>
@@ -46,7 +47,16 @@ namespace megohttp {
     struct DotOptions {
         string server_name;                 // SNI + cert identity (e.g. "dns.quad9.net")
         string bootstrap_ip;                // optional numeric IP to connect to
+        // Optional numeric IP for a named proxy endpoint. Without it a named
+        // proxy uses system DNS only when use_system_bootstrap is true; the
+        // strict default never recurses into the DoT resolver itself.
+        string proxy_bootstrap_ip;
         uint16_t port{853};                 // RFC 7858 default
+        // Proxy for the DoT TCP+TLS connection. This is a real byte-stream
+        // tunnel: CONNECT for HTTP/HTTPS proxies, RFC 1928 for SOCKS5. The
+        // proxy layer's TLS identity is in ProxyOptions::tls; the DoT endpoint
+        // identity remains server_name + tls below.
+        ProxyOptions proxy{};
         Duration connect_timeout{std::chrono::seconds(10)};
         TlsConfig tls;                      // CA, client cert, verify settings
 
@@ -56,10 +66,10 @@ namespace megohttp {
         bool accept_no_data{true};
 
         // Bootstrap mode (task book 9-A.4). When false (default, strict mode),
-        // a named endpoint with no bootstrap_ip is a ConfigurationError — the
-        // resolver will NOT fall back to the system DNS. When true, the resolver
-        // resolves server_name through the system resolver before connecting;
-        // this exposes the endpoint name to system DNS but avoids manual IP config.
+        // a named endpoint or proxy with no matching bootstrap IP is a
+        // ConfigurationError - no system-DNS fallback. When true, those names
+        // may be resolved through the system resolver; this exposes them to
+        // system DNS but avoids manual IP configuration.
         bool use_system_bootstrap{false};
 
         // TTL-driven answer cache (task book 9-A.6). Positive entries expire on
@@ -115,6 +125,8 @@ namespace megohttp {
         // cancel checks in resolve()). That is why there is no mutex: the loop
         // serializes every mutation.
         std::shared_ptr<Connection> conn_;
+        ProxyOptions active_proxy_;   // selected proxy (no_proxy/from_env applied)
+        bool use_proxy_{false};
 
         // The next DNS message ID to allocate. 0 is reserved (the protocol uses
         // it only in queries the client didn't write), so start at 1.
@@ -145,6 +157,7 @@ namespace megohttp {
         bool bootstrap_failed_{false};
 
         // Create the TCP+TLS connection with already-resolved addresses.
+        // When use_proxy_ is true these are the proxy's addresses.
         void create_connection(AddressList addrs);
 
         // Maximum concurrent queries on one connection. RFC 7858 doesn't specify
@@ -155,6 +168,7 @@ namespace megohttp {
         static constexpr size_t kReadBufSize = 4096;
 
         void ensure_connection();
+        void fail_pending(const Error&);
         void on_connection_ready();
         void on_connection_failed(const Error&);
         void submit_queries();
@@ -169,12 +183,15 @@ namespace megohttp {
     // has pending callbacks.
     class DotResolver::Connection : public std::enable_shared_from_this<DotResolver::Connection> {
     public:
-        Connection(std::shared_ptr<Executor> executor, DotOptions options)
-            : executor_(std::move(executor)), options_(std::move(options)) {}
+        Connection(std::shared_ptr<Executor> executor, DotOptions options,
+                   bool via_proxy)
+            : executor_(std::move(executor)),
+              options_(std::move(options)),
+              via_proxy_(via_proxy) {}
 
-        // Begin connecting: TCP -> TLS -> read loop.
-        // `addrs` must be pre-resolved addresses to dial.
-        // on_ready fires exactly once with success or failure.
+        // Begin connecting: TCP -> (proxy tunnel) -> TLS -> read loop.
+        // `addrs` are the addresses of the direct endpoint, or of the proxy
+        // when via_proxy is true. on_ready fires exactly once.
         void connect(AddressList addrs, std::function<void(const Error*)> on_ready);
 
         // Write a DNS message (already length-prefixed by the caller).
@@ -193,10 +210,16 @@ namespace megohttp {
     private:
         enum class State { Connecting, Open, Closed, Failed };
         State state_{State::Connecting};
+        void start_tls(std::shared_ptr<AsyncByteStream> base);
+        void fail_connect(Error error);
+
         std::shared_ptr<Executor> executor_;
         DotOptions options_;
+        bool via_proxy_{false};
         std::shared_ptr<TcpStream> tcp_;
+        std::shared_ptr<AsyncByteStream> transport_;
         std::shared_ptr<TlsStream> tls_;
+        std::shared_ptr<Timer> connect_timer_;
 
         std::function<void(const Error*)> connect_cb_;
         std::function<void(Result<byte_buffer>)> read_cb_;

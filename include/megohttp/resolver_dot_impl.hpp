@@ -22,6 +22,7 @@
 
 #include <megohttp/resolver_dot.hpp>
 #include <megohttp/dns_wire.hpp>   // explicit: the impl needs the codec's types
+#include <megohttp/proxy_tunnel.hpp> // real CONNECT / SOCKS5 tunnel
 #include <megohttp/resolver.hpp>   // SystemResolver for bootstrap resolution
 
 #if MEGOHTTP_HAS_DOT
@@ -29,6 +30,7 @@
 #include <megohttp/format.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 
@@ -49,87 +51,208 @@ namespace megohttp {
                                          static_cast<uint16_t>(p[1]));
         }
 
+        // The proxy handshake may read past its own response (the tunnel's
+        // first TLS record can share a read with the CONNECT head). Keep that
+        // prefix in front of the TLS layer instead of dropping it.
+        class PrefixedStream final : public AsyncByteStream {
+        public:
+            PrefixedStream(std::shared_ptr<AsyncByteStream> inner,
+                           byte_buffer prefix)
+                : inner_(std::move(inner)), prefix_(std::move(prefix)) {}
+
+            void start(ReadyCallback on_ready) override {
+                if (on_ready) on_ready(VoidResult{});
+            }
+            void async_read_some(ReadCallback cb) override {
+                if (!prefix_.empty()) {
+                    byte_buffer held = std::move(prefix_);
+                    if (cb) {
+                        cb(string_view(
+                            reinterpret_cast<const char*>(held.data()),
+                            static_cast<string_view::size_type>(held.size())));
+                    }
+                    return;
+                }
+                inner_->async_read_some(std::move(cb));
+            }
+            void async_write(const uint8_t* data, size_t size,
+                             WriteCallback cb) override {
+                inner_->async_write(data, size, std::move(cb));
+            }
+            void async_close(CloseCallback cb) override {
+                inner_->async_close(std::move(cb));
+            }
+            bool is_open() const noexcept override {
+                return inner_ && inner_->is_open();
+            }
+            string_view tls_protocol() const noexcept override {
+                return inner_ ? inner_->tls_protocol() : string_view();
+            }
+
+        private:
+            std::shared_ptr<AsyncByteStream> inner_;
+            byte_buffer prefix_;
+        };
+
     } // namespace dot_detail
 
     // -----------------------------------------------------------------------
     // Connection: TCP -> TLS -> framed read loop
     // -----------------------------------------------------------------------
 
-    inline void DotResolver::Connection::connect(AddressList addrs, std::function<void(const Error*)> on_ready) {
+    inline void DotResolver::Connection::connect(
+        AddressList addrs, std::function<void(const Error*)> on_ready) {
         connect_cb_ = std::move(on_ready);
 
         if (!executor_) {
-            state_ = State::Failed;
-            auto cb = std::move(connect_cb_);
-            connect_cb_ = nullptr;
-            if (cb) {
-                Error e{ErrorCode::DnsResolveFailed, ErrorPhase::Resolve,
-                        string("DoT connection has no executor")};
-                cb(&e);
-            }
+            fail_connect(Error{ErrorCode::DnsResolveFailed, ErrorPhase::Resolve,
+                              string("DoT connection has no executor")});
             return;
         }
 
-        // The caller must provide addresses (strict bootstrap IP or system-resolved).
+        // The caller must provide addresses (bootstrap IP, proxy bootstrap, or
+        // system-resolved when that mode is enabled).
         if (addrs.empty()) {
-            state_ = State::Failed;
-            auto cb = std::move(connect_cb_);
-            connect_cb_ = nullptr;
-            if (cb) {
-                cb(new Error{ErrorCode::ConfigurationError, ErrorPhase::Resolve,
-                             string("DoT connection has no address to dial")});
-            }
+            fail_connect(Error{ErrorCode::ConfigurationError, ErrorPhase::Resolve,
+                               string("DoT connection has no address to dial")});
             return;
         }
 
         auto self = shared_from_this();
+
+        // The race bounds DNS/TCP, but a proxy can accept TCP and then stall
+        // its CONNECT/SOCKS5 reply, and a TLS peer can accept TCP and never
+        // finish the handshake. One connection-stage timer covers the whole
+        // path from dial to Open, including those stages.
+        if (options_.connect_timeout != Duration::zero()) {
+            connect_timer_ = executor_->schedule_after(
+                options_.connect_timeout, [self]() {
+                    if (self->state_ != State::Connecting) return;
+                    self->connect_timer_.reset();
+                    self->fail_connect(Error{
+                        ErrorCode::TimeoutConnect, ErrorPhase::Resolve,
+                        string("DoT connection stage timed out")});
+                });
+        }
+
         ConnectOptions copts;
         copts.connect_timeout = options_.connect_timeout;
 
         connect_race(executor_, std::move(addrs), copts,
             [self](Result<std::shared_ptr<AsyncByteStream>> conn) {
+                if (!self || self->state_ == State::Closed ||
+                    self->state_ == State::Failed) {
+                    if (conn && conn.value()) conn.value()->async_close(nullptr);
+                    return;
+                }
                 if (!conn) {
-                    self->state_ = State::Failed;
-                    auto cb = std::move(self->connect_cb_);
-                    self->connect_cb_ = nullptr;
-                    if (cb) cb(new Error(conn.error()));
+                    self->fail_connect(conn.error());
                     return;
                 }
 
-                self->tcp_ = std::dynamic_pointer_cast<TcpStream>(conn.value());
-
-                TlsConfig cfg = self->options_.tls;
-                // SNI and certificate identity come from the CONFIGURED name, not
-                // from the address actually dialled. A bootstrap IP changes where
-                // the bytes go, never who they must prove they are (9-A.4).
-                cfg.hostname = self->options_.server_name;
-
-                auto tls = make_tls_stream(conn.value(), cfg);
-                if (!tls) {
-                    self->state_ = State::Failed;
-                    auto cb = std::move(self->connect_cb_);
-                    self->connect_cb_ = nullptr;
-                    if (cb) cb(new Error{ErrorCode::TlsHandshakeFailed, ErrorPhase::Resolve,
-                                         string("failed to create the DoT TLS stream")});
+                auto base = conn.value();
+                self->transport_ = base;
+                if (!self->via_proxy_) {
+                    self->tcp_ = std::dynamic_pointer_cast<TcpStream>(base);
+                    self->start_tls(base);
                     return;
                 }
-                tls->set_error_phase(ErrorPhase::Resolve, ErrorPhase::Resolve);
-                self->tls_ = tls;
 
-                tls->start([self, tls](VoidResult r) {
-                    if (!r) {
-                        self->state_ = State::Failed;
-                        auto cb = std::move(self->connect_cb_);
-                        self->connect_cb_ = nullptr;
-                        if (cb) cb(new Error(r.error()));
-                        return;
-                    }
-                    self->state_ = State::Open;
-                    auto cb = std::move(self->connect_cb_);
-                    self->connect_cb_ = nullptr;
-                    if (cb) cb(nullptr);   // success
-                });
+                // The proxy carries the byte stream. The target name handed to
+                // the proxy is the configured bootstrap address when present;
+                // otherwise the proxy resolves server_name under its own
+                // remote-DNS rules. The DoT TLS identity below is ALWAYS
+                // server_name, never the address the proxy dialled.
+                string target;
+                if (!self->options_.bootstrap_ip.empty()) {
+                    target = self->options_.bootstrap_ip;
+                } else {
+                    target = self->options_.server_name;
+                }
+
+                proxy_tunnel::establish(
+                    base, self->options_.proxy, to_view(target),
+                    self->options_.port, string_view("MegoHttp/0.1"), nullptr,
+                    [self](Result<proxy_tunnel::TunnelResult> tunneled) {
+                        if (!self || self->state_ == State::Closed ||
+                            self->state_ == State::Failed) {
+                            if (tunneled && tunneled.value().stream) {
+                                tunneled.value().stream->async_close(nullptr);
+                            }
+                            return;
+                        }
+                        if (!tunneled) {
+                            self->fail_connect(tunneled.error());
+                            return;
+                        }
+                        auto base = tunneled.value().stream;
+                        if (!tunneled.value().leftover.empty()) {
+                            base = std::make_shared<dot_detail::PrefixedStream>(
+                                base, std::move(tunneled.value().leftover));
+                        }
+                        self->transport_ = base;
+                        self->start_tls(base);
+                    });
             });
+    }
+
+    inline void DotResolver::Connection::start_tls(
+        std::shared_ptr<AsyncByteStream> base) {
+        if (state_ != State::Connecting || !base) {
+            if (base) base->async_close(nullptr);
+            return;
+        }
+
+        TlsConfig cfg = options_.tls;
+        // SNI and certificate identity come from the CONFIGURED name, not from
+        // the address actually dialled. A bootstrap IP or proxy changes where
+        // the bytes go, never who they must prove they are (9-A.4).
+        cfg.hostname = options_.server_name;
+
+        auto tls = make_tls_stream(base, cfg);
+        if (!tls) {
+            fail_connect(Error{ErrorCode::TlsHandshakeFailed,
+                               ErrorPhase::Resolve,
+                               string("failed to create the DoT TLS stream")});
+            return;
+        }
+        tls->set_error_phase(ErrorPhase::Resolve, ErrorPhase::Resolve);
+        tls_ = tls;
+
+        auto self = shared_from_this();
+        tls->start([self, tls](VoidResult r) {
+            if (!self || self->state_ == State::Closed ||
+                self->state_ == State::Failed) {
+                return;
+            }
+            if (!r) {
+                self->fail_connect(r.error());
+                return;
+            }
+            self->state_ = State::Open;
+            if (self->connect_timer_) {
+                self->connect_timer_->cancel();
+                self->connect_timer_.reset();
+            }
+            auto cb = std::move(self->connect_cb_);
+            self->connect_cb_ = nullptr;
+            if (cb) cb(nullptr);
+        });
+    }
+
+    inline void DotResolver::Connection::fail_connect(Error error) {
+        if (state_ == State::Closed || state_ == State::Failed) return;
+        state_ = State::Failed;
+        if (connect_timer_) {
+            connect_timer_->cancel();
+            connect_timer_.reset();
+        }
+        auto cb = std::move(connect_cb_);
+        connect_cb_ = nullptr;
+        if (tls_) tls_->async_close(nullptr);
+        else if (transport_) transport_->async_close(nullptr);
+        else if (tcp_) tcp_->async_close(nullptr);
+        if (cb) cb(&error);
     }
 
     inline void DotResolver::Connection::write(byte_buffer data,
@@ -220,9 +343,14 @@ namespace megohttp {
     }
 
     inline void DotResolver::Connection::close() {
-        if (state_ == State::Closed || state_ == State::Failed) return;
+        if (state_ == State::Closed) return;
         state_ = State::Closed;
+        if (connect_timer_) {
+            connect_timer_->cancel();
+            connect_timer_.reset();
+        }
         if (tls_) tls_->async_close(nullptr);
+        else if (transport_) transport_->async_close(nullptr);
         else if (tcp_) tcp_->async_close(nullptr);
         connect_cb_ = nullptr;
         read_cb_ = nullptr;
@@ -333,104 +461,156 @@ namespace megohttp {
         return handle;
     }
 
+    inline void DotResolver::fail_pending(const Error& e) {
+        auto pending = std::move(pending_);
+        pending_.clear();
+        for (auto& kv : pending) {
+            if (kv.second && kv.second->cb && kv.second->cancel &&
+                !kv.second->cancel->is_cancelled()) {
+                kv.second->cb(e);
+            }
+        }
+    }
+
     inline void DotResolver::ensure_connection() {
         if (conn_) return;
 
-        // S5A.4-01: resolve the bootstrap address.
-        // Strict mode (default): bootstrap_ip or server_name must be an IP literal.
-        // System bootstrap mode: resolve server_name via system resolver first.
-        AddressList addrs;
-        if (!options_.bootstrap_ip.empty()) {
-            addrs = parse_ip_literal(to_view(options_.bootstrap_ip), options_.port);
+        // Apply an explicit proxy or an environment-selected one, including
+        // NO_PROXY. The selection happens here so the connection code knows
+        // whether the addresses it receives belong to the proxy or the DoT
+        // endpoint.
+        ProxyOptions selected = options_.proxy;
+        bool via_proxy = false;
+        if (selected.proxy.is_set() || selected.from_env) {
+            auto decision = proxy_detail::select_proxy(
+                selected,
+                [](const char* name) -> const char* { return std::getenv(name); },
+                to_view(options_.server_name), options_.port, true);
+            if (!decision) {
+                fail_pending(decision.error());
+                return;
+            }
+            selected.proxy = decision.value().config;
+            via_proxy = selected.proxy.is_set();
         }
-        if (addrs.empty() && !options_.server_name.empty()) {
-            addrs = parse_ip_literal(to_view(options_.server_name), options_.port);
+        active_proxy_ = selected;
+        use_proxy_ = via_proxy;
+
+        // The socket goes to the proxy when one is active; otherwise to the DoT
+        // endpoint. Bootstrap resolution applies to whichever name is dialled.
+        const string dial_host = via_proxy ? selected.proxy.host
+                                           : options_.server_name;
+        const uint16_t dial_port = via_proxy ? selected.proxy.port
+                                             : options_.port;
+        const string& bootstrap = via_proxy ? options_.proxy_bootstrap_ip
+                                            : options_.bootstrap_ip;
+
+        // A configured bootstrap value is always numeric. Validate it even in
+        // proxy mode, where bootstrap_ip is used as the CONNECT/SOCKS5 target
+        // address rather than as the local dial address.
+        if (via_proxy && !options_.bootstrap_ip.empty() &&
+            parse_ip_literal(to_view(options_.bootstrap_ip), options_.port).empty()) {
+            fail_pending(Error{ErrorCode::ConfigurationError, ErrorPhase::Resolve,
+                               format("DoT bootstrap_ip is not a numeric IP: {}",
+                                      options_.bootstrap_ip)});
+            return;
+        }
+
+        AddressList addrs;
+        if (!bootstrap.empty()) {
+            addrs = parse_ip_literal(to_view(bootstrap), dial_port);
+            if (addrs.empty()) {
+                fail_pending(Error{ErrorCode::ConfigurationError,
+                                   ErrorPhase::Resolve,
+                                   format("{} is not a numeric IP: {}",
+                                          via_proxy ? "proxy_bootstrap_ip"
+                                                    : "bootstrap_ip",
+                                          bootstrap)});
+                return;
+            }
+        }
+        if (addrs.empty() && !dial_host.empty()) {
+            addrs = parse_ip_literal(to_view(dial_host), dial_port);
         }
 
         if (!addrs.empty()) {
-            // Got a literal address — create the connection directly.
+            // SOCKS5 "local DNS" mode carries an address in the CONNECT
+            // command. A name with no address cannot be tunnelled that way;
+            // refuse instead of silently switching to proxy-side DNS.
+            if (via_proxy && selected.proxy.type == ProxyType::Socks5 &&
+                !selected.proxy.socks5_remote_dns) {
+                const string target = options_.bootstrap_ip.empty()
+                                          ? options_.server_name
+                                          : options_.bootstrap_ip;
+                if (parse_ip_literal(to_view(target), options_.port).empty()) {
+                    fail_pending(Error{
+                        ErrorCode::NotImplemented, ErrorPhase::Resolve,
+                        string("SOCKS5 local DNS needs an IP target for DoT; "
+                               "set DotOptions::bootstrap_ip or use socks5h")});
+                    return;
+                }
+            }
             create_connection(std::move(addrs));
             return;
         }
 
-        // No literal address. In strict mode this is a hard error.
         if (!options_.use_system_bootstrap) {
-            auto err = Error{ErrorCode::ConfigurationError, ErrorPhase::Resolve,
-                             string("DoT endpoint is a name but no bootstrap IP was configured; "
-                                    "set DotOptions::bootstrap_ip (strict bootstrap mode does "
-                                    "not fall back to system DNS)")};
-            // Fail all pending lookups with this configuration error.
-            auto pending = std::move(pending_);
-            pending_.clear();
-            for (auto& kv : pending) {
-                if (kv.second && kv.second->cb && kv.second->cancel &&
-                    !kv.second->cancel->is_cancelled()) {
-                    kv.second->cb(err);
-                }
-            }
+            fail_pending(Error{
+                ErrorCode::ConfigurationError, ErrorPhase::Resolve,
+                via_proxy
+                    ? string("DoT proxy is a name but no proxy_bootstrap_ip was "
+                             "configured; strict bootstrap does not fall back "
+                             "to system DNS")
+                    : string("DoT endpoint is a name but no bootstrap IP was "
+                             "configured; set DotOptions::bootstrap_ip")});
             return;
         }
 
-        // System bootstrap mode: resolve server_name via system resolver.
-        if (bootstrap_pending_) return;  // already resolving
+        // System bootstrap mode: resolve the proxy or endpoint name through the
+        // system resolver. This is the only non-literal path that may touch the
+        // system resolver, and it is opt-in.
+        if (bootstrap_pending_) return;
         if (!bootstrap_failed_ && !bootstrap_addrs_.empty()) {
-            // Previously resolved — reuse.
             create_connection(bootstrap_addrs_);
             return;
         }
         if (bootstrap_failed_) {
-            // Previous bootstrap failed — report.
-            auto err = Error{ErrorCode::DnsResolveFailed, ErrorPhase::Resolve,
-                             string("DoT bootstrap resolution failed")};
-            auto pending = std::move(pending_);
-            pending_.clear();
-            for (auto& kv : pending) {
-                if (kv.second && kv.second->cb && kv.second->cancel &&
-                    !kv.second->cancel->is_cancelled()) {
-                    kv.second->cb(err);
-                }
-            }
+            fail_pending(Error{ErrorCode::DnsResolveFailed, ErrorPhase::Resolve,
+                               string("DoT bootstrap resolution failed")});
             return;
         }
 
         bootstrap_pending_ = true;
         auto self = shared_from_this();
         auto sys_resolver = std::make_shared<SystemResolver>(executor_);
-        auto handle = sys_resolver->resolve(options_.server_name, options_.port,
+        (void)sys_resolver->resolve(dial_host, dial_port,
             [self, sys_resolver](Result<AddressList> r) {
                 self->executor_->post([self, r = std::move(r)]() mutable {
                     self->bootstrap_pending_ = false;
-                    if (r) {
-                        self->bootstrap_addrs_ = std::move(r.value());
-                        // If there are pending queries, create the connection now.
-                        if (!self->bootstrap_addrs_.empty() && self->pending_.empty()) {
-                            // Connection will be created on next resolve().
-                        }
-                        if (!self->bootstrap_addrs_.empty()) {
-                            // We may have queued queries waiting; submit them.
-                            self->create_connection(self->bootstrap_addrs_);
-                        }
-                    } else {
+                    if (!r) {
                         self->bootstrap_failed_ = true;
-                        // Fail all pending.
-                        auto pending = std::move(self->pending_);
-                        self->pending_.clear();
-                        for (auto& kv : pending) {
-                            if (kv.second && kv.second->cb && kv.second->cancel &&
-                                !kv.second->cancel->is_cancelled()) {
-                                kv.second->cb(r.error());
-                            }
-                        }
+                        self->fail_pending(r.error());
+                        return;
+                    }
+                    self->bootstrap_addrs_ = std::move(r.value());
+                    if (!self->bootstrap_addrs_.empty()) {
+                        self->create_connection(self->bootstrap_addrs_);
+                    } else {
+                        self->fail_pending(Error{
+                            ErrorCode::DnsNoData, ErrorPhase::Resolve,
+                            string("DoT bootstrap resolver returned no address")});
                     }
                 });
             });
-        (void)handle;  // Don't cancel the bootstrap resolution.
     }
 
     inline void DotResolver::create_connection(AddressList addrs) {
         if (conn_) return;  // already created (race guard)
 
-        conn_ = std::make_shared<Connection>(executor_, options_);
+        DotOptions connection_options = options_;
+        connection_options.proxy = active_proxy_;
+        conn_ = std::make_shared<Connection>(executor_, std::move(connection_options),
+                                             use_proxy_);
 
         auto self = shared_from_this();
         conn_->connect(std::move(addrs), [self](const Error* err) {

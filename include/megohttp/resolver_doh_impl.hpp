@@ -41,6 +41,88 @@ namespace megohttp {
         return out;
     }
 
+    namespace doh_detail {
+
+        // Resolves the two names a DoH request can need without ever calling
+        // the DoH resolver itself:
+        //   - the DoH endpoint (direct mode, bootstrap_ip)
+        //   - the proxy endpoint (proxy_bootstrap_ip)
+        // Unknown names either fall back to the system resolver (explicit
+        // use_system_bootstrap=true) or fail with ConfigurationError. That is
+        // what makes strict bootstrap strict: proxy-name lookup cannot silently
+        // recurse into the DNS resolver it is trying to bootstrap.
+        class BootstrapResolver final : public Resolver,
+                                        public std::enable_shared_from_this<BootstrapResolver> {
+        public:
+            struct Entry {
+                string host;
+                AddressList addresses;
+            };
+
+            BootstrapResolver(std::shared_ptr<Executor> executor,
+                              std::vector<Entry> entries,
+                              bool allow_system_bootstrap)
+                : executor_(std::move(executor)),
+                  entries_(std::move(entries)),
+                  allow_system_bootstrap_(allow_system_bootstrap) {
+                if (allow_system_bootstrap_ && executor_) {
+                    system_ = std::make_shared<SystemResolver>(executor_);
+                }
+            }
+
+            CancelHandle resolve(string host, uint16_t port, Callback cb) override {
+                for (const auto& entry : entries_) {
+                    if (!detail::ascii_iequals(to_view(host), to_view(entry.host))) {
+                        continue;
+                    }
+
+                    auto state = std::make_shared<CancelState>();
+                    CancelHandle handle(state);
+                    AddressList answers = entry.addresses;
+                    for (auto& a : answers) a.port = port;
+                    if (!executor_) {
+                        if (cb) cb(AddressList(std::move(answers)));
+                        return handle;
+                    }
+                    executor_->post([cb, answers = std::move(answers), state]() mutable {
+                        if (state->is_cancelled()) return;
+                        if (cb) cb(AddressList(std::move(answers)));
+                    });
+                    return handle;
+                }
+
+                if (system_) return system_->resolve(host, port, std::move(cb));
+
+                auto state = std::make_shared<CancelState>();
+                CancelHandle handle(state);
+                const string message = format(
+                    "strict DoH bootstrap has no address for host '{}'; configure "
+                    "bootstrap_ip/proxy_bootstrap_ip or set use_system_bootstrap",
+                    host);
+                if (!executor_) {
+                    if (cb) cb(Error{ErrorCode::ConfigurationError,
+                                     ErrorPhase::Resolve, message});
+                    return handle;
+                }
+                executor_->post([cb, message, state]() mutable {
+                    if (state->is_cancelled()) return;
+                    if (cb) cb(Error{ErrorCode::ConfigurationError,
+                                     ErrorPhase::Resolve, message});
+                });
+                return handle;
+            }
+
+            const char* name() const noexcept override { return "doh-bootstrap"; }
+
+        private:
+            std::shared_ptr<Executor> executor_;
+            std::vector<Entry> entries_;
+            bool allow_system_bootstrap_{false};
+            std::shared_ptr<SystemResolver> system_;
+        };
+
+    } // namespace doh_detail
+
     // Internal HTTP client for DoH.
     // Uses the public Client class but with isolated options.
     class DohResolver::HttpClient {
@@ -61,9 +143,17 @@ namespace megohttp {
                      const Headers& headers,
                      const std::optional<byte_buffer>& body,
                      std::function<void(Result<Response>)> cb) {
-            if (!client_) {
-                cb(Error{ErrorCode::ConfigurationError, ErrorPhase::None,
-                       string("DoH HTTP client not initialized")});
+            if (configuration_error_.has_value() || !client_) {
+                const Error error = configuration_error_.has_value()
+                                        ? configuration_error_.value()
+                                        : Error{ErrorCode::ConfigurationError,
+                                                ErrorPhase::None,
+                                                string("DoH HTTP client not initialized")};
+                if (executor_) {
+                    executor_->post([cb, error]() mutable { cb(error); });
+                } else {
+                    cb(error);
+                }
                 return;
             }
 
@@ -103,6 +193,7 @@ namespace megohttp {
             ClientOptions copts;
             copts.connect_timeout = options_.connect_timeout;
             copts.total_timeout = options_.total_timeout;
+            copts.proxy = options_.proxy;
 
             if (options_.tls.has_value()) {
                 copts.tls = options_.tls.value();
@@ -117,6 +208,92 @@ namespace megohttp {
 
             // Bound the response so a hostile endpoint cannot stream forever.
             copts.max_response_body = options_.max_response_bytes;
+
+            // Bootstrap resolution. This resolver must not be the DoH resolver
+            // itself, or strict mode would recurse: "resolve the DoH server"
+            // would issue another DoH request. Entries are numeric addresses;
+            // unknown names only reach the system resolver when the caller
+            // explicitly enabled system bootstrap.
+            std::vector<doh_detail::BootstrapResolver::Entry> entries;
+            auto add_literal = [&](const string& host, uint16_t port,
+                                   const string& literal,
+                                   const char* label) -> bool {
+                if (literal.empty()) return true;
+                AddressList addresses = parse_ip_literal(to_view(literal), port);
+                if (addresses.empty()) {
+                    configuration_error_ = Error{
+                        ErrorCode::ConfigurationError, ErrorPhase::Resolve,
+                        format("{} is not a numeric IP: {}", label, literal)};
+                    return false;
+                }
+                entries.push_back(doh_detail::BootstrapResolver::Entry{
+                    host, std::move(addresses)});
+                return true;
+            };
+
+            const auto endpoint = parse_url(options_.endpoint_url);
+            if (!endpoint) {
+                configuration_error_ = endpoint.error();
+                return;
+            }
+            const bool explicit_proxy = options_.proxy.proxy.is_set();
+            const string& endpoint_host = endpoint.value().host;
+            const string& proxy_host = options_.proxy.proxy.host;
+
+            // Direct endpoint: the URL hostname must be resolvable without the
+            // DoH resolver. An IP literal needs no bootstrap at all.
+            if (!explicit_proxy &&
+                parse_ip_literal(to_view(endpoint_host), endpoint.value().port).empty()) {
+                if (!options_.bootstrap_ip.empty()) {
+                    if (!add_literal(endpoint_host, endpoint.value().port,
+                                     options_.bootstrap_ip, "DoH bootstrap_ip")) {
+                        return;
+                    }
+                } else if (!options_.use_system_bootstrap) {
+                    configuration_error_ = Error{
+                        ErrorCode::ConfigurationError, ErrorPhase::Resolve,
+                        string("DoH endpoint is a name but no bootstrap IP was "
+                               "configured; set DohOptions::bootstrap_ip")};
+                    return;
+                }
+            }
+
+            // Proxy endpoint: resolve the proxy host without recursive DNS.
+            if (explicit_proxy &&
+                parse_ip_literal(to_view(proxy_host),
+                                 options_.proxy.proxy.port).empty()) {
+                if (!options_.proxy_bootstrap_ip.empty()) {
+                    if (!add_literal(proxy_host, options_.proxy.proxy.port,
+                                     options_.proxy_bootstrap_ip,
+                                     "DoH proxy_bootstrap_ip")) {
+                        return;
+                    }
+                } else if (!options_.use_system_bootstrap) {
+                    configuration_error_ = Error{
+                        ErrorCode::ConfigurationError, ErrorPhase::Resolve,
+                        string("DoH proxy is a name but no proxy_bootstrap_ip was "
+                               "configured; strict bootstrap does not fall back "
+                               "to system DNS")};
+                    return;
+                }
+            }
+
+            // If a caller also supplied endpoint bootstrap while using a proxy,
+            // keep it for the no_proxy bypass path. The proxy path itself sends
+            // the endpoint name to the proxy and does not resolve it locally.
+            if (explicit_proxy && !options_.bootstrap_ip.empty() &&
+                parse_ip_literal(to_view(endpoint_host), endpoint.value().port).empty()) {
+                if (!add_literal(endpoint_host, endpoint.value().port,
+                                 options_.bootstrap_ip, "DoH bootstrap_ip")) {
+                    return;
+                }
+            }
+
+            if (executor_) copts.executor = executor_;
+            if (!entries.empty() || !options_.use_system_bootstrap) {
+                copts.resolver = std::make_shared<doh_detail::BootstrapResolver>(
+                    executor_, std::move(entries), options_.use_system_bootstrap);
+            }
 
             // S5A.4-03: resource isolation is structural rather than a pool cap
             // here: the DoH internal Client is a separate object with its own
@@ -133,6 +310,7 @@ namespace megohttp {
         std::shared_ptr<Executor> executor_;
         DohOptions options_;
         std::unique_ptr<Client> client_;
+        std::optional<Error> configuration_error_;
     };
 
     inline DohResolver::DohResolver(std::shared_ptr<Executor> executor,

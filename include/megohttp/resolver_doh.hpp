@@ -27,6 +27,7 @@
 #include <megohttp/dns_wire.hpp>
 #include <megohttp/error.hpp>
 #include <megohttp/executor.hpp>
+#include <megohttp/proxy.hpp>
 #include <megohttp/resolver.hpp>
 #include <megohttp/response.hpp>
 #include <megohttp/string_adapter.hpp>
@@ -62,10 +63,20 @@ namespace megohttp {
     struct DohOptions {
         string endpoint_url;                // Full HTTPS URL (path preserved)
         string bootstrap_ip;                // Optional numeric IP to connect to
+        // Optional numeric IP for a named proxy endpoint. A proxy hostname
+        // otherwise needs use_system_bootstrap=true; the strict default never
+        // sends it to the system resolver.
+        string proxy_bootstrap_ip;
         DohMethod method{DohMethod::Post};  // POST or GET
         Duration connect_timeout{std::chrono::seconds(10)};
         Duration request_timeout{std::chrono::seconds(30)};
         Duration total_timeout{std::chrono::seconds(60)};
+
+        // Proxy for the DoH HTTP request. The proxy layer has its own TlsConfig
+        // in ProxyOptions::tls; the DoH endpoint identity is in `tls` below.
+        // Explicit proxy settings only; ProxyOptions::from_env is honoured too,
+        // but an environment-selected proxy hostname needs system bootstrap.
+        ProxyOptions proxy{};
 
         // TLS config for the HTTPS connection
         // If empty, uses system default trust
@@ -81,8 +92,8 @@ namespace megohttp {
         size_t max_redirects{3};
 
         // Bootstrap mode (task book 9-A.4). When false (default, strict mode),
-        // a named endpoint with no bootstrap_ip is a ConfigurationError.
-        // When true, the endpoint hostname is resolved via system DNS.
+        // a named endpoint or proxy with no matching bootstrap IP is a
+        // ConfigurationError. When true, those names may use system DNS.
         bool use_system_bootstrap{false};
 
         // TTL-driven answer cache (task book 9-A.6). Positive entries expire on

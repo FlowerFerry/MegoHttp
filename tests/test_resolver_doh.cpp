@@ -32,6 +32,7 @@
 #endif
 
 #include "process_job.hpp"
+#include "proxy_server_fixture.hpp"
 
 namespace {
 
@@ -453,6 +454,281 @@ TEST_CASE("cancelling a DoH lookup drops the late answer", "[doh][s5a]") {
     // Give the in-flight request time to complete and be discarded.
     std::this_thread::sleep_for(std::chrono::milliseconds(600));
     CHECK(calls.load() == 0);
+}
+
+
+// -----------------------------------------------------------------------
+// S5A.4-01 / 9-A.4: bootstrap and proxy. The endpoint is a name that only the
+// proxy's --map knows how to reach, so success proves the DoH request really
+// went through the proxy rather than silently bypassing it.
+// -----------------------------------------------------------------------
+
+namespace {
+
+DohOptions doh_proxy_options(uint16_t doh_port, uint16_t proxy_port,
+                             bool https_proxy) {
+    DohOptions o;
+    o.endpoint_url = string(("https://example.test:" +
+                             std::to_string(doh_port) + "/dns-query").c_str());
+    o.method = DohMethod::Post;
+    o.tls = TlsConfig{};
+    o.tls->hostname = string("example.test");
+    o.tls->ca_file = string(fixture("ca.pem").c_str());
+    o.proxy.proxy.type = https_proxy ? ProxyType::Https : ProxyType::Http;
+    o.proxy.proxy.host = string("proxy.test");
+    o.proxy.proxy.port = proxy_port;
+    o.proxy_bootstrap_ip = string("127.0.0.1");
+    o.use_system_bootstrap = false;
+    if (https_proxy) {
+        o.proxy.tls.ca_file = string(fixture("ca.pem").c_str());
+        // The proxy fixture certificate is valid for localhost; the proxy
+        // hostname is an override (proxy.test -> bootstrap IP), and TLS must
+        // still validate the certificate identity, not the dialled address.
+        o.proxy.tls.hostname = string("localhost");
+    }
+    o.connect_timeout = std::chrono::seconds(5);
+    o.request_timeout = std::chrono::seconds(10);
+    o.total_timeout = std::chrono::seconds(15);
+    return o;
+}
+
+std::string proxy_args(bool https_proxy) {
+    std::string args = "--mode connect --map example.test=127.0.0.1";
+    if (https_proxy) {
+        args += " --tls-cert \"";
+        args += fixture("server-cert.pem");
+        args += "\" --tls-key \"";
+        args += fixture("server-key.pem");
+        args += "\"";
+    }
+    return args;
+}
+
+} // namespace
+
+TEST_CASE("DoH goes through an HTTP proxy and bootstraps the proxy name",
+          "[doh][s5a][proxy]") {
+    DohTestServer srv;
+    REQUIRE(srv.start());
+    mghttp_test::ProxyServerFixture proxy;
+    REQUIRE(proxy.start(proxy_args(false)));
+
+    auto ex = detail::make_default_executor();
+    REQUIRE(ex);
+    auto resolver = std::make_shared<DohResolver>(
+        ex, doh_proxy_options(srv.port(), proxy.port(), false));
+
+    std::atomic<bool> done{false};
+    Result<AddressList> got = Error{ErrorCode::Unknown};
+    resolver->resolve(string("dual.example"), 443, [&](Result<AddressList> r) {
+        got = std::move(r);
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    if (!got) {
+        UNSCOPED_INFO("DoH proxy failed: "
+                      << megohttp::to_string(got.error().code())
+                      << " phase=" << megohttp::to_string(got.error().phase())
+                      << " msg=" << std::string(got.error().message().data(),
+                                                 got.error().message().size()));
+    }
+    REQUIRE(got);
+    CHECK(got.value().size() == 2);
+}
+
+TEST_CASE("DoH goes through an HTTPS proxy with independent TLS identity",
+          "[doh][s5a][proxy][tls]") {
+    DohTestServer srv;
+    REQUIRE(srv.start());
+    mghttp_test::ProxyServerFixture proxy;
+    REQUIRE(proxy.start(proxy_args(true)));
+
+    auto ex = detail::make_default_executor();
+    REQUIRE(ex);
+    auto resolver = std::make_shared<DohResolver>(
+        ex, doh_proxy_options(srv.port(), proxy.port(), true));
+
+    std::atomic<bool> done{false};
+    Result<AddressList> got = Error{ErrorCode::Unknown};
+    resolver->resolve(string("dual.example"), 443, [&](Result<AddressList> r) {
+        got = std::move(r);
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    if (!got) {
+        UNSCOPED_INFO("DoH HTTPS proxy failed: "
+                      << megohttp::to_string(got.error().code())
+                      << " phase=" << megohttp::to_string(got.error().phase())
+                      << " msg=" << std::string(got.error().message().data(),
+                                                 got.error().message().size()));
+    }
+    REQUIRE(got);
+    CHECK(got.value().size() == 2);
+}
+
+TEST_CASE("DoH direct bootstrap uses the IP without changing certificate identity",
+          "[doh][s5a][bootstrap]") {
+    DohTestServer srv;
+    REQUIRE(srv.start());
+
+    DohOptions o;
+    // example.test is a name, never a local hosts entry. The bootstrap IP is
+    // the only way to reach the fixture; TLS must still validate example.test.
+    o.endpoint_url = string(("https://example.test:" +
+                             std::to_string(srv.port()) + "/dns-query").c_str());
+    o.bootstrap_ip = string("127.0.0.1");
+    o.tls = TlsConfig{};
+    o.tls->hostname = string("example.test");
+    o.tls->ca_file = string(fixture("ca.pem").c_str());
+    o.use_system_bootstrap = false;
+    o.connect_timeout = std::chrono::seconds(5);
+    o.request_timeout = std::chrono::seconds(10);
+    o.total_timeout = std::chrono::seconds(15);
+
+    auto ex = detail::make_default_executor();
+    REQUIRE(ex);
+    auto resolver = std::make_shared<DohResolver>(ex, o);
+
+    std::atomic<bool> done{false};
+    Result<AddressList> got = Error{ErrorCode::Unknown};
+    resolver->resolve(string("dual.example"), 443, [&](Result<AddressList> r) {
+        got = std::move(r);
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    if (!got) {
+        UNSCOPED_INFO("DoH bootstrap failed: "
+                      << megohttp::to_string(got.error().code())
+                      << " phase=" << megohttp::to_string(got.error().phase())
+                      << " msg=" << std::string(got.error().message().data(),
+                                                 got.error().message().size()));
+    }
+    REQUIRE(got);
+    CHECK(got.value().size() == 2);
+}
+
+
+TEST_CASE("DoH proxy authentication uses the proxy credential only",
+          "[doh][s5a][proxy][auth]") {
+    DohTestServer srv;
+    REQUIRE(srv.start());
+    mghttp_test::ProxyServerFixture proxy;
+    REQUIRE(proxy.start(proxy_args(false) + " --require-auth"));
+
+    DohOptions o = doh_proxy_options(srv.port(), proxy.port(), false);
+    o.proxy.proxy.username = string("alice");
+    o.proxy.proxy.password = string("s3cret");
+
+    auto ex = detail::make_default_executor();
+    REQUIRE(ex);
+    auto resolver = std::make_shared<DohResolver>(ex, o);
+
+    std::atomic<bool> done{false};
+    Result<AddressList> got = Error{ErrorCode::Unknown};
+    resolver->resolve(string("dual.example"), 443, [&](Result<AddressList> r) {
+        got = std::move(r);
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    REQUIRE(got);
+    CHECK(got.value().size() == 2);
+}
+
+
+TEST_CASE("DoH goes through SOCKS5 with remote DNS", "[doh][s5a][proxy][socks5]") {
+    DohTestServer srv;
+    REQUIRE(srv.start());
+    mghttp_test::ProxyServerFixture proxy;
+    REQUIRE(proxy.start("--mode socks5 --map example.test=127.0.0.1"));
+
+    DohOptions o = doh_proxy_options(srv.port(), proxy.port(), false);
+    o.proxy.proxy.type = ProxyType::Socks5;
+    o.proxy.proxy.socks5_remote_dns = true;
+
+    auto ex = detail::make_default_executor();
+    REQUIRE(ex);
+    auto resolver = std::make_shared<DohResolver>(ex, o);
+
+    std::atomic<bool> done{false};
+    Result<AddressList> got = Error{ErrorCode::Unknown};
+    resolver->resolve(string("dual.example"), 443, [&](Result<AddressList> r) {
+        got = std::move(r);
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    if (!got) {
+        UNSCOPED_INFO("DoH SOCKS5 failed: "
+                      << megohttp::to_string(got.error().code())
+                      << " phase=" << megohttp::to_string(got.error().phase())
+                      << " msg=" << std::string(got.error().message().data(),
+                                                 got.error().message().size()));
+    }
+    REQUIRE(got);
+    CHECK(got.value().size() == 2);
+}
+
+
+TEST_CASE("DoH validates the HTTPS proxy identity separately", "[doh][s5a][proxy][tls]") {
+    mghttp_test::ProxyServerFixture proxy;
+    REQUIRE(proxy.start(proxy_args(true)));
+
+    DohOptions o = doh_proxy_options(1, proxy.port(), true);
+    // The proxy actually presents the server certificate; trusting the
+    // untrusted CA must fail at the proxy layer before any CONNECT.
+    o.proxy.tls.ca_file = string(fixture("untrusted-ca.pem").c_str());
+
+    auto ex = detail::make_default_executor();
+    REQUIRE(ex);
+    auto resolver = std::make_shared<DohResolver>(ex, o);
+
+    std::atomic<bool> done{false};
+    Result<AddressList> got = Error{ErrorCode::Unknown};
+    resolver->resolve(string("dual.example"), 443, [&](Result<AddressList> r) {
+        got = std::move(r);
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    REQUIRE(!got);
+    CHECK(got.error().phase() == ErrorPhase::ProxyTls);
+}
+
+
+TEST_CASE("DoH proxy handshake is bounded by connect_timeout",
+          "[doh][s5a][proxy][timeout]") {
+    mghttp_test::ProxyServerFixture proxy;
+    std::string args = "--mode connect --tls-cert \"";
+    args += fixture("server-cert.pem");
+    args += "\" --tls-key \"";
+    args += fixture("server-key.pem");
+    args += "\" --tls-handshake-delay 2 --map example.test=127.0.0.1";
+    REQUIRE(proxy.start(args));
+
+    DohOptions o = doh_proxy_options(1, proxy.port(), true);
+    o.connect_timeout = std::chrono::milliseconds(300);
+
+    auto ex = detail::make_default_executor();
+    REQUIRE(ex);
+    auto resolver = std::make_shared<DohResolver>(ex, o);
+
+    std::atomic<bool> done{false};
+    Result<AddressList> got = Error{ErrorCode::Unknown};
+    const auto started = std::chrono::steady_clock::now();
+    resolver->resolve(string("dual.example"), 443, [&](Result<AddressList> r) {
+        got = std::move(r);
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }, 5000));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    REQUIRE(!got);
+    CHECK(got.error().code() == ErrorCode::TimeoutConnect);
+    CHECK(elapsed < std::chrono::milliseconds(2500));
 }
 
 #endif // MEGOHTTP_HAS_DOH && !MGHTTP_TLS_NONE
