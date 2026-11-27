@@ -299,7 +299,13 @@ namespace megohttp {
 
     private:
         class Impl;
-        std::unique_ptr<Impl> impl_;
+        // shared_ptr, not unique_ptr: shutdown() posts retirement jobs to the
+        // executor, and those jobs must keep the implementation alive after the
+        // caller's Client handle is gone. With a borrowed executor nothing waits
+        // for the queue to drain, so a raw `this` in a posted job is a
+        // use-after-free the moment the Client is destroyed while a request is
+        // still in flight (found by ASan in test_resolver_doh).
+        std::shared_ptr<Impl> impl_;
     };
 
 } // namespace megohttp

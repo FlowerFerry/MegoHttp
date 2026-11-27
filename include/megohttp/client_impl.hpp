@@ -2178,7 +2178,7 @@ namespace megohttp {
     // ---------------------------------------------------------------------------
     // Client::Impl
     // ---------------------------------------------------------------------------
-    class Client::Impl {
+    class Client::Impl : public std::enable_shared_from_this<Client::Impl> {
     public:
         explicit Impl(ClientOptions opts) : options(std::move(opts)) {
             // A bad timeout is a programming error; surface it on the first request
@@ -2240,7 +2240,16 @@ namespace megohttp {
             // caller would never see the terminal callbacks shutdown() promises.
             if (!live.empty()) {
                 std::shared_ptr<Executor> ex = executor;
-                if (ex) {
+                // The retirement job below outlives this call: the caller is
+                // destroying the Client handle, and with a BORROWED executor
+                // nothing waits for the queue to drain (the bounded wait further
+                // down only runs when this Client owns the loop). Capturing a
+                // strong reference is what keeps `m_` / `in_flight_` / `retiring`
+                // valid until the last job has run. Capturing `this` was a
+                // heap-use-after-free -- ASan caught it in test_resolver_doh,
+                // where the internal DoH Client borrows the resolver's executor.
+                std::shared_ptr<Impl> self = weak_from_this().lock();
+                if (ex && self) {
                     // A latch that fires after the LAST retirement has run, so a
                     // shutdown that owns the loop can wait for those callbacks
                     // before tearing the loop down. Without it, stopping the loop
@@ -2261,7 +2270,7 @@ namespace megohttp {
                         // those requests would never get their terminal
                         // callback. The counter reaching zero is the only honest
                         // "all retirements have run" signal.
-                        ex->post([this, held = std::move(st), done]() mutable {
+                        ex->post([self, held = std::move(st), done]() mutable {
                             held->finish(Error{ErrorCode::Cancelled, ErrorPhase::None,
                                                string("client is shutting down")});
                             // finish() ran the user callback and the retirement
@@ -2270,13 +2279,13 @@ namespace megohttp {
                             // otherwise this very job keeps its state alive and
                             // the request never looks retired.
                             held.reset();
-                            if (retiring.fetch_sub(1) == 1) {
+                            if (self->retiring.fetch_sub(1) == 1) {
                                 // Truly last: every posted retirement has run.
-                                std::lock_guard<std::mutex> lk(m_);
-                                in_flight_.clear();
+                                std::lock_guard<std::mutex> lk(self->m_);
+                                self->in_flight_.clear();
                                 done->set_value();
                             }
-                            maybe_notify_drained();
+                            self->maybe_notify_drained();
                         });
                     }
                     if (owns_executor && !ex->is_in_loop_thread()) {
@@ -2285,12 +2294,13 @@ namespace megohttp {
                         (void)fut.wait_for(std::chrono::seconds(5));
                     }
                 } else {
+                    // No executor to post to, or this Impl already lost its last
+                    // strong reference (shutdown() reached from ~Impl): retire
+                    // synchronously, exactly like the no-executor path below.
                     for (auto& st : live) {
                         st->finish(Error{ErrorCode::Cancelled, ErrorPhase::None,
                                          string("client is shutting down")});
                     }
-                    // No executor to post to: every retirement above already ran
-                    // synchronously on this thread.
                     std::lock_guard<std::mutex> lk(m_);
                     in_flight_.clear();
                 }
@@ -3671,12 +3681,27 @@ namespace megohttp {
     inline Client::Client() : Client(ClientOptions{}) {}
 
     inline Client::Client(ClientOptions options)
-        : impl_(std::make_unique<Impl>(std::move(options))) {}
+        : impl_(std::make_shared<Impl>(std::move(options))) {}
 
-    inline Client::~Client() = default;
+    // Shut the implementation down while the shared_ptr is still ours: the
+    // retirement jobs read the weak self handle, and releasing the last
+    // reference first would make shutdown() unable to post them at all.
+    inline Client::~Client() {
+        if (impl_) impl_->shutdown();
+    }
 
     inline Client::Client(Client&&) noexcept = default;
-    inline Client& Client::operator=(Client&&) noexcept = default;
+
+    inline Client& Client::operator=(Client&& other) noexcept {
+        if (this != &other) {
+            // Moving onto a live Client must retire the old implementation the
+            // same way ~Client would; a plain shared_ptr assignment would drop
+            // it without posting the cancellations its in-flight requests owe.
+            if (impl_) impl_->shutdown();
+            impl_ = std::move(other.impl_);
+        }
+        return *this;
+    }
 
     inline CancelHandle Client::request(const Request& req, ResponseCallback on_complete) {
         auto state = std::make_shared<CancelState>(impl_->executor);

@@ -2050,3 +2050,52 @@ TEST_CASE("client runs on a caller-owned io_context", "[client][external][asio]"
 }
 #endif
 
+
+
+// S2.6-02 (lifetime): a Client that BORROWS its executor cannot wait for the
+// queue to drain while shutting down. The retirement job it posts therefore
+// runs after the caller's handle is gone, so that job has to hold the
+// implementation alive instead of a raw `this`. With a raw pointer this is a
+// heap-use-after-free on Client::Impl::m_ -- ASan caught exactly that in
+// test_resolver_doh, where the internal DoH client borrows the resolver's
+// executor. This case pins the shape without needing DoH.
+TEST_CASE("a borrowed-executor client survives being destroyed mid-request",
+          "[client][lifetime]") {
+    TinysilentServer srv;
+    REQUIRE(srv.start());
+
+    auto ex = megohttp::detail::make_default_executor();
+    REQUIRE(ex != nullptr);
+
+    std::atomic<int> calls{0};
+    std::atomic<int> cancelled{0};
+    {
+        ClientOptions o;
+        o.executor = ex;                              // borrowed: must not block
+        o.recv_timeout = std::chrono::seconds(30);    // keep the request in flight
+        Client client(o);
+
+        const string url = string("http://127.0.0.1:") + format("{}", srv.port()) + "/";
+        client.get(url, [&](Result<Response> r) {
+            if (!r && r.error().code() == ErrorCode::Cancelled) {
+                cancelled.fetch_add(1);
+            }
+            calls.fetch_add(1);
+        });
+
+        // Let the request reach the server, so it is genuinely in flight when
+        // the handle goes away. TinySilentServer accepts and never answers.
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    }   // ~Client posts the retirement job, then releases its reference
+
+    // The posted job runs on the loop thread after that; the terminal callback
+    // still fires exactly once with Cancelled.
+    CHECK(wait_until([&] { return calls.load() >= 1; }, 5000));
+    CHECK(calls.load() == 1);
+    CHECK(cancelled.load() == 1);
+
+    // Let the retirement job finish releasing its strong reference before this
+    // test drops the executor, so the last Impl destruction happens here rather
+    // than inside the loop.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+}
