@@ -591,6 +591,8 @@ public:
         std::string cmd = "python \"";
         cmd += MEGOHTTP_TESTS_DIR;
         cmd += "/https_test_server.py\" \"" + fixture(cert) + "\" \"" + fixture(key) + "\"";
+        // Lets the server exit if this test binary is force-killed.
+        cmd += " --parent-pid " + std::to_string(GetCurrentProcessId());
         if (extra_args) { cmd += " "; cmd += extra_args; }
         return spawn_and_read_banner(cmd);
     }

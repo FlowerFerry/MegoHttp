@@ -16,6 +16,8 @@ import sys
 import threading
 import time
 
+import parent_watchdog
+
 
 BODY = b"hello over https"
 
@@ -37,6 +39,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cert")
     ap.add_argument("key")
+    parent_watchdog.add_argument(ap)
     ap.add_argument(
         "--handshake-delay",
         type=float,
@@ -54,6 +57,8 @@ def main():
         help="send a multipart body that stops after one part (no closing boundary)",
     )
     args = ap.parse_args()
+
+    parent_watchdog.start(args.parent_pid)
 
     boundary = b"megohttp-boundary-42"
     mp_text = multipart_body(boundary, [

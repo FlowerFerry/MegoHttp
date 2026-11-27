@@ -34,6 +34,7 @@ TEST_CASE("tls layering is unavailable without a TLS backend", "[tls]") {
 #if defined(_WIN32)
 #   include <winsock2.h>
 #   include <ws2tcpip.h>
+#   include <process.h>
 #else
 #   include <arpa/inet.h>
 #   include <netinet/in.h>
@@ -159,14 +160,30 @@ private:
 // Runs a Python server script and reads its "READY ..." line, then kills it by
 // PID on destruction. The servers' accept loops never end on their own, so
 // _pclose() alone would block until the test binary is killed.
+//
+// Both server scripts take --parent-pid so they can exit by themselves when
+// this binary is force-killed; its destructor never runs in that case. The flag
+// is passed per call site so a script started by hand still works with none.
+std::string parent_pid_flag() {
+#if defined(_WIN32)
+    return std::string(" --parent-pid ") +
+           std::to_string(static_cast<long>(_getpid()));
+#else
+    return std::string(" --parent-pid ") +
+           std::to_string(static_cast<long>(::getpid()));
+#endif
+}
+
 class PyServer {
 public:
-    bool start(const char* script, const char* cert, const char* key) {
+    bool start(const char* script, const char* cert, const char* key,
+               const char* extra = "") {
         std::string cmd = "python \"";
         cmd += MEGOHTTP_TESTS_DIR;
         cmd += "/";
         cmd += script;
         cmd += "\" \"" + fixture_path(cert) + "\" \"" + fixture_path(key) + "\"";
+        cmd += extra;
         pipe_ = _popen(cmd.c_str(), "r");
         if (!pipe_) return false;
         char buf[200] = {0};
@@ -246,7 +263,8 @@ TEST_CASE("tls stream nests inside another tls stream", "[tls][layering]") {
     // second TLS listener -- the same splice an HTTP CONNECT tunnel performs.
     // If layering worked only for raw sockets this would fail.
     PyServer srv;
-    REQUIRE(srv.start("layered_tls_server.py", "server-cert.pem", "server-key.pem"));
+    REQUIRE(srv.start("layered_tls_server.py", "server-cert.pem", "server-key.pem",
+                      parent_pid_flag().c_str()));
     REQUIRE(srv.ports.size() == 2);
     const uint16_t outer_port = srv.port(0);
 
@@ -273,7 +291,8 @@ TEST_CASE("tls stream nests inside another tls stream", "[tls][layering]") {
 
 TEST_CASE("tls nesting carries application data both directions", "[tls][layering]") {
     PyServer srv;
-    REQUIRE(srv.start("layered_tls_server.py", "server-cert.pem", "server-key.pem"));
+    REQUIRE(srv.start("layered_tls_server.py", "server-cert.pem", "server-key.pem",
+                      parent_pid_flag().c_str()));
     REQUIRE(srv.ports.size() == 2);
 
     auto raw = std::make_shared<PlainSocketStream>();
@@ -334,7 +353,8 @@ TEST_CASE("tls nesting carries application data both directions", "[tls][layerin
 
 TEST_CASE("inner handshake failure does not corrupt the outer layer", "[tls][layering]") {
     PyServer srv;
-    REQUIRE(srv.start("layered_tls_server.py", "server-cert.pem", "server-key.pem"));
+    REQUIRE(srv.start("layered_tls_server.py", "server-cert.pem", "server-key.pem",
+                      parent_pid_flag().c_str()));
 
     auto raw = std::make_shared<PlainSocketStream>();
     REQUIRE(raw->connect_to(srv.port(0)));
@@ -365,7 +385,8 @@ TEST_CASE("inner handshake failure does not corrupt the outer layer", "[tls][lay
 
 TEST_CASE("outer and inner layers report their own phase", "[tls][layering]") {
     PyServer srv;
-    REQUIRE(srv.start("layered_tls_server.py", "untrusted-cert.pem", "untrusted-key.pem"));
+    REQUIRE(srv.start("layered_tls_server.py", "untrusted-cert.pem", "untrusted-key.pem",
+                      parent_pid_flag().c_str()));
     REQUIRE(srv.ports.size() == 2);
 
     auto raw = std::make_shared<PlainSocketStream>();
@@ -395,7 +416,8 @@ TEST_CASE("large payload crosses both layers without loss", "[tls][layering][bac
     // 256 KiB is far past one TLS record, so this forces many partial reads and
     // writes through the outer layer while the inner one is progressing.
     PyServer srv;
-    REQUIRE(srv.start("layered_tls_server.py", "server-cert.pem", "server-key.pem"));
+    REQUIRE(srv.start("layered_tls_server.py", "server-cert.pem", "server-key.pem",
+                      parent_pid_flag().c_str()));
 
     auto raw = std::make_shared<PlainSocketStream>();
     REQUIRE(raw->connect_to(srv.port(0)));
@@ -453,7 +475,8 @@ TEST_CASE("read during the handshake is rejected, not queued", "[tls][cancel]") 
     // Issues a read before the handshake completes: the stream is not Open yet,
     // so the read must be refused outright instead of silently parked forever.
     PyServer srv;
-    REQUIRE(srv.start("tls_test_server.py", "server-cert.pem", "server-key.pem"));
+    REQUIRE(srv.start("tls_test_server.py", "server-cert.pem", "server-key.pem",
+                      parent_pid_flag().c_str()));
 
     auto raw = std::make_shared<PlainSocketStream>();
     REQUIRE(raw->connect_to(srv.port(0)));
@@ -475,7 +498,8 @@ TEST_CASE("closing during the handshake terminates without hanging", "[tls][canc
     // The server accepts the TCP connection, so the TLS handshake is genuinely
     // in flight when close() is called.
     PyServer srv;
-    REQUIRE(srv.start("tls_test_server.py", "server-cert.pem", "server-key.pem"));
+    REQUIRE(srv.start("tls_test_server.py", "server-cert.pem", "server-key.pem",
+                      parent_pid_flag().c_str()));
 
     auto raw = std::make_shared<PlainSocketStream>();
     REQUIRE(raw->connect_to(srv.port(0)));
@@ -492,7 +516,8 @@ TEST_CASE("closing during the handshake terminates without hanging", "[tls][canc
 
 TEST_CASE("close after the handshake completes exactly once", "[tls][cancel]") {
     PyServer srv;
-    REQUIRE(srv.start("tls_test_server.py", "server-cert.pem", "server-key.pem"));
+    REQUIRE(srv.start("tls_test_server.py", "server-cert.pem", "server-key.pem",
+                      parent_pid_flag().c_str()));
 
     auto raw = std::make_shared<PlainSocketStream>();
     REQUIRE(raw->connect_to(srv.port(0)));
@@ -516,7 +541,8 @@ TEST_CASE("close after the handshake completes exactly once", "[tls][cancel]") {
 
 TEST_CASE("a second outstanding read is rejected, not queued", "[tls][cancel]") {
     PyServer srv;
-    REQUIRE(srv.start("tls_test_server.py", "server-cert.pem", "server-key.pem"));
+    REQUIRE(srv.start("tls_test_server.py", "server-cert.pem", "server-key.pem",
+                      parent_pid_flag().c_str()));
 
     auto raw = std::make_shared<PlainSocketStream>();
     REQUIRE(raw->connect_to(srv.port(0)));
@@ -539,7 +565,8 @@ TEST_CASE("a second outstanding read is rejected, not queued", "[tls][cancel]") 
 
 TEST_CASE("write on a closed stream is rejected", "[tls][cancel]") {
     PyServer srv;
-    REQUIRE(srv.start("tls_test_server.py", "server-cert.pem", "server-key.pem"));
+    REQUIRE(srv.start("tls_test_server.py", "server-cert.pem", "server-key.pem",
+                      parent_pid_flag().c_str()));
 
     auto raw = std::make_shared<PlainSocketStream>();
     REQUIRE(raw->connect_to(srv.port(0)));

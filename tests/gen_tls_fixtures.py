@@ -71,6 +71,27 @@ def make_server_cert(ca_key, ca_cert, cn, san_dns, not_before, not_after):
     return key, cert
 
 
+def make_client_cert(ca_key, ca_cert, cn, not_before, not_after):
+    """Create a client-auth leaf certificate signed by a local CA."""
+    key = make_key()
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)]))
+        .issuer_name(ca_cert.subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(not_before)
+        .not_valid_after(not_after)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.CLIENT_AUTH]),
+            critical=False,
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+    return key, cert
+
+
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else "tls_fixtures"
     os.makedirs(out, exist_ok=True)
@@ -83,6 +104,9 @@ def main():
     srv_key, srv_cert = make_server_cert(
         ca_key, ca_cert, "localhost", ["localhost", "example.test"],
         now - day, now + 30 * day,
+    )
+    client_key, client_cert = make_client_cert(
+        ca_key, ca_cert, "megohttp-test-client", now - day, now + 30 * day,
     )
 
     # Certificate that expired yesterday: must fail with TlsCertificateExpired.
@@ -102,6 +126,9 @@ def main():
     bad_key, bad_cert = make_ca("MegoHttp Untrusted CA", now - day, now + 365 * day)
     bad_srv_key, bad_srv_cert = make_server_cert(
         bad_key, bad_cert, "localhost", ["localhost"], now - day, now + 30 * day
+    )
+    bad_client_key, bad_client_cert = make_client_cert(
+        bad_key, bad_cert, "untrusted-test-client", now - day, now + 30 * day
     )
 
     pem = serialization.Encoding.PEM
@@ -137,9 +164,11 @@ def main():
     dump("intermediate-server", srv_int_key, srv_int_cert)
 
     dump("server", srv_key, srv_cert)
+    dump("client", client_key, client_cert)
     dump("expired", exp_key, exp_cert)
     dump("wrongname", other_key, other_cert)
     dump("untrusted", bad_srv_key, bad_srv_cert)
+    dump("untrusted-client", bad_client_key, bad_client_cert)
 
     print("wrote TLS fixtures to", os.path.abspath(out))
 

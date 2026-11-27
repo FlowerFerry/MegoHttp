@@ -46,6 +46,7 @@ TEST_CASE("tls stream reports TlsNotEnabled when built without TLS", "[tls]") {
 #if defined(_WIN32)
 #   include <winsock2.h>
 #   include <ws2tcpip.h>
+#   include <process.h>
 #else
 #   include <arpa/inet.h>
 #   include <netinet/in.h>
@@ -171,6 +172,17 @@ public:
         std::string cmd = "python \"";
         cmd += MEGOHTTP_TESTS_DIR;
         cmd += "/tls_test_server.py\" \"" + certp + "\" \"" + keyp + "\" ";
+        // Lets tls_test_server.py exit if this test binary is force-killed:
+        // its destructor never runs in that case, which would leave an
+        // orphaned accept loop behind.
+        cmd += " --parent-pid ";
+#if defined(_WIN32)
+        cmd += std::to_string(static_cast<long>(_getpid()));
+#else
+        cmd += std::to_string(static_cast<long>(::getpid()));
+#endif
+        // Separator: `extra` starts with a flag and has no leading space.
+        cmd += " ";
         cmd += extra;
         pipe_ = _popen(cmd.c_str(), "r");
         if (!pipe_) return false;
@@ -222,6 +234,13 @@ TlsConfig make_config(const char* hostname, const char* ca) {
     // tests are HTTP-shaped, so they opt in explicitly.
     c.alpn_protocols.push_back(string("http/1.1"));
     return c;
+}
+
+void set_client_cert(TlsConfig& c, const char* cert, const char* key) {
+    const std::string cert_path = fixture_path(cert);
+    const std::string key_path = fixture_path(key);
+    c.cert_file = string(cert_path.data(), cert_path.size());
+    c.key_file = string(key_path.data(), key_path.size());
 }
 
 struct HandshakeOutcome {
@@ -281,6 +300,62 @@ TEST_CASE("tls handshake succeeds against a trusted local server", "[tls]") {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Mutual TLS (client certificate authentication)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("mutual TLS: a client certificate signed by the server CA is accepted",
+          "[tls][mtls]") {
+    PythonTlsServer srv;
+    const std::string client_ca = fixture_path("ca.pem");
+    const std::string extra =
+        "--max-version tls1.2 --require-client-cert --client-ca " + client_ca;
+    REQUIRE(srv.start("server-cert.pem", "server-key.pem", extra.c_str()));
+
+    TlsConfig cfg = make_config("localhost", "ca.pem");
+    set_client_cert(cfg, "client-cert.pem", "client-key.pem");
+
+    HandshakeOutcome out;
+    handshake(cfg, srv.port(), &out);
+
+    REQUIRE(out.called.load());
+    CHECK(out.ok.load());
+    CHECK(static_cast<ErrorCode>(out.code.load()) == ErrorCode::Success);
+}
+
+TEST_CASE("mutual TLS: missing client certificate is rejected", "[tls][mtls]") {
+    PythonTlsServer srv;
+    const std::string client_ca = fixture_path("ca.pem");
+    const std::string extra =
+        "--max-version tls1.2 --require-client-cert --client-ca " + client_ca;
+    REQUIRE(srv.start("server-cert.pem", "server-key.pem", extra.c_str()));
+
+    HandshakeOutcome out;
+    handshake(make_config("localhost", "ca.pem"), srv.port(), &out);
+
+    REQUIRE(out.called.load());
+    CHECK_FALSE(out.ok.load());
+    CHECK(static_cast<ErrorPhase>(out.phase.load()) == ErrorPhase::TlsHandshake);
+}
+
+TEST_CASE("mutual TLS: untrusted client certificate is rejected", "[tls][mtls]") {
+    PythonTlsServer srv;
+    const std::string client_ca = fixture_path("ca.pem");
+    const std::string extra =
+        "--max-version tls1.2 --require-client-cert --client-ca " + client_ca;
+    REQUIRE(srv.start("server-cert.pem", "server-key.pem", extra.c_str()));
+
+    TlsConfig cfg = make_config("localhost", "ca.pem");
+    set_client_cert(cfg, "untrusted-client-cert.pem", "untrusted-client-key.pem");
+
+    HandshakeOutcome out;
+    handshake(cfg, srv.port(), &out);
+
+    REQUIRE(out.called.load());
+    CHECK_FALSE(out.ok.load());
+    CHECK(static_cast<ErrorPhase>(out.phase.load()) == ErrorPhase::TlsHandshake);
+}
+
 // Protocol version floor (task book 13.3 "协议版本限制")
 //
 // TlsConfig::min_version must actually be enforced, and a refusal must be

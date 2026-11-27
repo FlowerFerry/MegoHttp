@@ -63,6 +63,11 @@ public:
         cmd += MEGOHTTP_TESTS_DIR;
         cmd += "/https_test_server.py\" \"" + fixture_path(cert) + "\" \"" +
                fixture_path(key) + "\" ";
+        // Lets the server exit if this test binary is force-killed: its
+        // destructor never runs in that case.
+        cmd += " --parent-pid ";
+        cmd += std::to_string(GetCurrentProcessId());
+        cmd += " ";
         cmd += extra;
         pipe_ = _popen(cmd.c_str(), "r");
         if (!pipe_) return false;

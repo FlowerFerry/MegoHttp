@@ -63,6 +63,8 @@ public:
         cmd += MEGOHTTP_TESTS_DIR;
         cmd += "/dot_test_server.py\" --cert \"" + fixture("server-cert.pem") +
                "\" --key \"" + fixture("server-key.pem") + "\"";
+        // Lets the server exit if this test binary is force-killed.
+        cmd += " --parent-pid " + std::to_string(GetCurrentProcessId());
         if (extra) { cmd += " "; cmd += extra; }
         return spawn(cmd);
     }

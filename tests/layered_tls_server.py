@@ -19,6 +19,8 @@ import ssl
 import sys
 import threading
 
+import parent_watchdog
+
 
 def server_ctx(cert, key):
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -32,7 +34,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cert")
     ap.add_argument("key")
+    parent_watchdog.add_argument(ap)
     args = ap.parse_args()
+
+    parent_watchdog.start(args.parent_pid)
 
     outer_ctx = server_ctx(args.cert, args.key)
     inner_ctx = server_ctx(args.cert, args.key)

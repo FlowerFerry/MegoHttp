@@ -67,6 +67,8 @@ namespace {
             std::string cmd = "cmd.exe /c python -u \"" +
                               std::string(MEGOHTTP_TESTS_DIR) +
                               "/ws_deflate_server.py\"";
+            // Lets the server exit if this test binary is force-killed.
+            cmd += " --parent-pid " + std::to_string(GetCurrentProcessId());
             if (!extra_args.empty()) cmd += " " + extra_args;
             cmd += " > \"" + port_file_ + "\" 2>&1";
 

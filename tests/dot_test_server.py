@@ -12,6 +12,8 @@ import ssl
 import struct
 import threading
 
+import parent_watchdog
+
 
 def read_name(buf, off):
     """Return (end_offset,) for a wire name at `off`."""
@@ -64,7 +66,10 @@ def main():
                     help="TTL in the answer record (0 = do not cache)")
     ap.add_argument("--count-file", default=None,
                     help="Write the number of queries received to this file")
+    parent_watchdog.add_argument(ap)
     args = ap.parse_args()
+
+    parent_watchdog.start(args.parent_pid)
 
     # Shared across connections so the counter reflects the whole server, which
     # is what a cache test needs: a second lookup that hits the cache must not

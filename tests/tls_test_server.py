@@ -8,6 +8,7 @@ readiness check (task book 13 requires dynamic ports plus an explicit ready
 signal).
 
 Usage:  python tls_test_server.py <cert.pem> <key.pem> [--alpn http/1.1]
+                                  [--require-client-cert --client-ca ca.pem]
 
 Prints "READY <pid> <port>" once the socket is bound.
 """
@@ -17,12 +18,52 @@ import socket
 import ssl
 import sys
 import threading
+import time
+
+
+def _parent_alive(pid):
+    """Best-effort liveness check for the spawning test process."""
+    if pid <= 0:
+        return True
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        kernel32.CloseHandle(handle)
+        return bool(ok) and code.value == STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _watch_parent(pid):
+    """Exit when the test executable disappears.
+
+    The harness normally kills this process by PID from its destructor, but a
+    force-killed or crashed test binary never runs that destructor and would
+    leave this server in an infinite accept loop. The child must not outlive
+    the process that spawned it.
+    """
+    while True:
+        if not _parent_alive(pid):
+            os._exit(0)
+        time.sleep(1)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cert")
     ap.add_argument("key")
+    ap.add_argument("--parent-pid", type=int, default=0,
+                    help="Exit when this process disappears")
     ap.add_argument("--alpn", default="http/1.1")
     ap.add_argument(
         "--max-version",
@@ -37,7 +78,22 @@ def main():
         default=None,
         help="abort the handshake unless the client offers this server_name",
     )
+    ap.add_argument(
+        "--require-client-cert",
+        action="store_true",
+        help="require a client certificate signed by --client-ca",
+    )
+    ap.add_argument(
+        "--client-ca",
+        metavar="PATH",
+        default=None,
+        help="CA bundle used to verify the client certificate",
+    )
     args = ap.parse_args()
+
+    if args.parent_pid:
+        threading.Thread(target=_watch_parent, args=(args.parent_pid,),
+                         daemon=True).start()
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -49,6 +105,13 @@ def main():
     ctx.load_cert_chain(args.cert, args.key)
     if args.alpn:
         ctx.set_alpn_protocols([p for p in args.alpn.split(",") if p])
+
+    if args.require_client_cert:
+        if not args.client_ca:
+            print("--require-client-cert needs --client-ca", file=sys.stderr)
+            return 2
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        ctx.load_verify_locations(cafile=args.client_ca)
 
     if args.require_sni:
         # Reject the handshake unless the client offered exactly this

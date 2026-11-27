@@ -22,6 +22,8 @@ from websockets.extensions.permessage_deflate import (
     ServerPerMessageDeflateFactory,
 )
 
+import parent_watchdog
+
 
 async def main() -> None:
     ap = argparse.ArgumentParser()
@@ -33,7 +35,10 @@ async def main() -> None:
                     help="serve wss:// using the test fixtures' certificate")
     ap.add_argument("--certdir", default="",
                     help="directory holding server-cert.pem / server-key.pem")
+    parent_watchdog.add_argument(ap)
     args = ap.parse_args()
+
+    parent_watchdog.start(args.parent_pid)
 
     async def handler(ws):
         async for msg in ws:
