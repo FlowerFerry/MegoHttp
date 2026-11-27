@@ -56,6 +56,16 @@ public:
         // When true the body is written in two pieces with a small delay, so the
         // client sees a split read rather than one buffer.
         bool split_body{false};
+
+        // Delay between the response head and the body. Used by the timeout
+        // test to prove that bytes arriving after a terminal timeout are not
+        // delivered to a sink.
+        int body_delay_ms{0};
+
+        // Bytes sent before body_delay_ms. A non-zero prefix makes the client
+        // read a partial body, rearm the idle timer, and then time out while a
+        // transport read is still outstanding.
+        size_t body_prefix_bytes{0};
     };
 
     bool start() {
@@ -150,9 +160,28 @@ private:
             int n = static_cast<int>(::recv(c, buf, sizeof buf, 0));
             if (n <= 0) break;
             all.append(buf, static_cast<size_t>(n));
-            // A chunked request ends with the terminator; stop as soon as it is
-            // there so the test does not wait out the timeout.
-            if (all.find("0\r\n\r\n") != std::string::npos) break;
+
+            const size_t head_end = all.find("\r\n\r\n");
+            if (head_end == std::string::npos) continue;
+            std::string head = all.substr(0, head_end);
+            for (auto& ch : head) {
+                if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+            }
+            if (head.find("transfer-encoding: chunked") != std::string::npos) {
+                // A chunked request ends with the terminator.
+                if (all.find("0\r\n\r\n", head_end + 4) != std::string::npos) break;
+            } else {
+                size_t body_len = 0;
+                const size_t cl = head.find("content-length:");
+                if (cl != std::string::npos) {
+                    try {
+                        body_len = static_cast<size_t>(std::stoull(head.substr(cl + 15)));
+                    } catch (...) {
+                        body_len = 0;
+                    }
+                }
+                if (all.size() >= head_end + 4 + body_len) break;
+            }
         }
 
         Response r;
@@ -168,7 +197,23 @@ private:
                                      "\r\nConnection: close\r\n\r\n" + r.body
                                : r.head + r.body;
 
-        if (r.split_body && !r.body.empty()) {
+        if (r.body_delay_ms > 0) {
+            // The head is complete, but the body is deliberately late. A
+            // request that times out while waiting must ignore these bytes.
+            const size_t prefix = r.body.size() < r.body_prefix_bytes
+                                      ? r.body.size()
+                                      : r.body_prefix_bytes;
+            const size_t body_at = resp.size() - r.body.size();
+            ::send(c, resp.data(), static_cast<int>(body_at), 0);
+            if (prefix > 0) {
+                ::send(c, resp.data() + body_at, static_cast<int>(prefix), 0);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(r.body_delay_ms));
+            if (r.body.size() > prefix) {
+                ::send(c, resp.data() + body_at + prefix,
+                       static_cast<int>(r.body.size() - prefix), 0);
+            }
+        } else if (r.split_body && !r.body.empty()) {
             const size_t cut = r.body.size() / 2;
             ::send(c, resp.data(), static_cast<int>(resp.size() - r.body.size() + cut), 0);
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -586,4 +631,141 @@ TEST_CASE("a paused sink stops delivery until it resumes",
     // And the pause really did gate delivery: more than one chunk means the
     // first one was delivered, the sink paused, and the rest followed later.
     CHECK(chunks.load() >= 1);
+}
+
+// ---------------------------------------------------------------------------
+// recv_timeout is an idle timeout, and a consumer pause freezes it. The pause
+// here lasts longer than recv_timeout; the request must resume successfully,
+// because no socket read is outstanding while the sink is paused.
+// ---------------------------------------------------------------------------
+TEST_CASE("a paused sink freezes the receive idle timeout",
+          "[streaming][network][timeout][idle]") {
+    ScriptedServer srv;
+    REQUIRE(srv.start());
+    ScriptedServer::Response resp;
+    const std::string payload(200, 'p');
+    resp.head = "HTTP/1.1 200 OK\r\nContent-Length: 200\r\nConnection: close\r\n\r\n";
+    resp.body = payload;
+    resp.split_body = true;
+    srv.set_response(resp);
+
+    ClientOptions o;
+    o.recv_timeout = std::chrono::milliseconds(120);
+    o.total_timeout = Duration::zero();
+    Client c(o);
+    Request req(Method::Get, to_owning(url_for(srv.port())));
+
+    auto flow = std::make_shared<Request::BodySinkFlow>();
+    std::atomic<bool> paused_once{false};
+    std::string collected;
+    req.set_body_sink(
+        [&](string_view chunk) {
+            collected.append(chunk.data(), static_cast<size_t>(chunk.size()));
+            if (!paused_once.exchange(true)) return false; // pause on first chunk
+            return true;
+        },
+        [](VoidResult) {},
+        flow);
+
+    std::thread resumer([&] {
+        while (!paused_once.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        // Longer than recv_timeout. If the timer kept running while paused,
+        // this test would fail with TimeoutRecv.
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        flow->resume();
+    });
+
+    auto r = c.request_sync(req);
+    resumer.join();
+
+    REQUIRE(r);
+    CHECK(collected.size() == payload.size());
+}
+
+// ---------------------------------------------------------------------------
+// send_timeout is an idle timeout across body chunks. The source releases one
+// chunk every 60 ms, so the total write phase is ~420 ms, but every individual
+// no-progress gap is well under the 220 ms limit.
+// ---------------------------------------------------------------------------
+TEST_CASE("send_timeout is an idle timeout across paced body chunks",
+          "[streaming][network][timeout][idle]") {
+    ScriptedServer srv;
+    REQUIRE(srv.start());
+    srv.set_response({});
+
+    ClientOptions o;
+    o.send_timeout = std::chrono::milliseconds(220);
+    o.recv_timeout = Duration::zero();
+    o.total_timeout = Duration::zero();
+    Client c(o);
+    Request req(Method::Post, to_owning(url_for(srv.port())));
+
+    const std::string piece = "abcdefgh";
+    int sent = 0;
+    auto next = std::chrono::steady_clock::now();
+    req.set_body_source([&]() -> Result<std::pair<string_view, bool>> {
+        const auto now = std::chrono::steady_clock::now();
+        if (sent < 8 && now >= next) {
+            ++sent;
+            next = now + std::chrono::milliseconds(60);
+            return std::make_pair(string_view(piece.data(), piece.size()),
+                                  sent == 8);
+        }
+        if (sent >= 8) return std::make_pair(string_view{}, true);
+        return std::make_pair(string_view{}, false); // not ready: no progress
+    });
+
+    auto r = c.request_sync(req);
+    REQUIRE(r);
+    const std::string body = srv.received_body();
+    CHECK(body.find("8\r\nabcdefgh\r\n") != std::string::npos);
+    CHECK(body.find("0\r\n\r\n") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// A terminal timeout must close the delivery path. The server sends a complete
+// head, then waits longer than recv_timeout before sending the body. The
+// request fails at the timeout; the late bytes must never reach the sink.
+// ---------------------------------------------------------------------------
+TEST_CASE("late bytes after a receive timeout are not delivered",
+          "[streaming][network][timeout][idle]") {
+    ScriptedServer srv;
+    REQUIRE(srv.start());
+    ScriptedServer::Response resp;
+    const std::string payload(64, 'L');
+    resp.head = "HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n";
+    resp.body = payload;
+    resp.body_delay_ms = 300;
+    resp.body_prefix_bytes = 16;
+    srv.set_response(resp);
+
+    ClientOptions o;
+    o.recv_timeout = std::chrono::milliseconds(100);
+    o.total_timeout = Duration::zero();
+    Client c(o);
+    Request req(Method::Get, to_owning(url_for(srv.port())));
+
+    auto flow = std::make_shared<Request::BodySinkFlow>();
+    std::atomic<int> chunks{0};
+    req.set_body_sink(
+        [&](string_view chunk) {
+            (void)chunk;
+            ++chunks;
+            return true;
+        },
+        [](VoidResult) {},
+        flow);
+
+    auto r = c.request_sync(req);
+    REQUIRE(!r);
+    CHECK(r.error().code() == ErrorCode::TimeoutRecv);
+    // The 16-byte prefix arrived before the timeout; the remaining 48 bytes
+    // arrive after it and must never reach the sink.
+    CHECK(chunks.load() == 1);
+
+    // The server is still sleeping; stop() closes the listener and joins the
+    // accept loop. The detached serve thread only uses its local response copy.
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
 }

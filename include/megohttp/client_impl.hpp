@@ -589,34 +589,85 @@ namespace megohttp {
                 parser_ = std::move(p);
             }
 
-            // send_timeout covers the whole write of head + body: one deadline from
-            // the first byte to the last (S2.3-02).
+            // send_timeout is an IDLE timeout: every successful write
+            // (head, body chunk, trailer) starts a fresh interval. A stalled
+            // write fails after one full interval.
             void arm_send_timer() {
+                send_stage_active_ = true;
+                rearm_send_timer();
+            }
+
+            void rearm_send_timer() {
+                if (!send_stage_active_ || complete_ || state_->finished.load()) return;
                 const auto d = state_->options.send_timeout;
                 if (d == Duration::zero()) return;
+                if (send_timer_) send_timer_->cancel();
+                const uint64_t generation = ++send_timer_generation_;
                 auto self = shared_from_this();
-                send_timer_ = state_->executor->schedule_after(d, [self] {
+                send_timer_ = state_->executor->schedule_after(d, [self, generation] {
+                    if (self->complete_ || self->state_->finished.load()) return;
+                    if (generation != self->send_timer_generation_) return;
                     self->fail(Error{ErrorCode::TimeoutSend, ErrorPhase::Send,
-                                     string("request send timed out")});
+                                     string("request send idle timeout")});
                 });
             }
 
             void disarm_send_timer() {
+                send_stage_active_ = false;
+                ++send_timer_generation_;
                 if (send_timer_) { send_timer_->cancel(); send_timer_.reset(); }
             }
 
-            // recv_timeout covers the whole response (head + body), not each read.
+            // recv_timeout is an IDLE timeout: every non-empty read starts a
+            // fresh interval. It is armed when the response stage begins,
+            // paused while a consumer pause is active, and resumed with a
+            // fresh full interval.
             void arm_recv_timer() {
+                recv_stage_active_ = true;
+                rearm_recv_timer();
+            }
+
+            // The send stage may have ended while the response was already
+            // being read (for example a final status that released a held
+            // body). Start the receive idle interval only if it is not
+            // already running, so a body write does not reset a read timer.
+            void begin_recv_stage() {
+                if (!recv_stage_active_) arm_recv_timer();
+            }
+
+            void rearm_recv_timer() {
+                if (!recv_stage_active_ || complete_ || state_->finished.load()) return;
+                if (sink_paused_ || multipart_paused_ || sse_paused_) {
+                    pause_recv_timer();
+                    return;
+                }
                 const auto d = state_->options.recv_timeout;
                 if (d == Duration::zero()) return;
+                if (recv_timer_) recv_timer_->cancel();
+                const uint64_t generation = ++recv_timer_generation_;
                 auto self = shared_from_this();
-                recv_timer_ = state_->executor->schedule_after(d, [self] {
+                recv_timer_ = state_->executor->schedule_after(d, [self, generation] {
+                    if (self->complete_ || self->state_->finished.load()) return;
+                    if (generation != self->recv_timer_generation_) return;
+                    if (self->sink_paused_ || self->multipart_paused_ ||
+                        self->sse_paused_) return;
                     self->fail(Error{ErrorCode::TimeoutRecv, ErrorPhase::Receive,
-                                     string("response receive timed out")});
+                                     string("response receive idle timeout")});
                 });
             }
 
+            void pause_recv_timer() {
+                // Invalidate any callback that may already be queued, even
+                // when the handle has already been dropped.
+                ++recv_timer_generation_;
+                if (!recv_timer_) return;
+                recv_timer_->cancel();
+                recv_timer_.reset();
+            }
+
             void disarm_recv_timer() {
+                recv_stage_active_ = false;
+                ++recv_timer_generation_;
                 if (recv_timer_) { recv_timer_->cancel(); recv_timer_.reset(); }
             }
 
@@ -636,6 +687,7 @@ namespace megohttp {
                     reinterpret_cast<const uint8_t*>(head.data()), head.size(),
                     [self](Result<size_t> w) {
                         if (!w) { self->fail(w.error()); return; }
+                        self->rearm_send_timer();
                         if (self->expect_continue_pending_) {
                             // Head is out; the body waits for 100 Continue. Keep
                             // send_timer_ armed: it bounds the wait, so a server
@@ -656,6 +708,9 @@ namespace megohttp {
                 if (body_sent_) return;
                 body_sent_ = true;
                 expect_continue_pending_ = false;
+                // The 100-continue wait ended; the body is a new send
+                // stage with its own idle interval.
+                arm_send_timer();
 
                 // Streaming mode: pull from BodySource.
                 if (state_->request.body_source()) {
@@ -675,9 +730,16 @@ namespace megohttp {
                 auto self = shared_from_this();
                 auto stream = state_->stream;
                 stream->async_write(body.data(), body.size(),
-                    [](Result<size_t>) {
+                    [self](Result<size_t> w) {
                         // The server may already have answered and closed; a failed
                         // body write must not overwrite the response it sent.
+                        if (!w) {
+                            if (!self->complete_ && !self->state_->finished.load())
+                                self->fail(w.error());
+                            return;
+                        }
+                        self->disarm_send_timer();
+                        self->begin_recv_stage();
                     });
             }
 
@@ -714,6 +776,7 @@ namespace megohttp {
                 stream->async_write(body.data(), body.size(),
                     [self](Result<size_t> w) {
                         if (!w) { self->fail(w.error()); return; }
+                        self->rearm_send_timer();
                         self->disarm_send_timer();
                         self->arm_recv_timer();
                         self->read_more();
@@ -782,6 +845,7 @@ namespace megohttp {
                         [self, buf, eof](Result<size_t> w) {
                             (void)buf; // keep alive
                             if (!w) { self->fail(w.error()); return; }
+                            self->rearm_send_timer();
                             if (eof) {
                                 self->finish_body_streaming();
                             } else {
@@ -850,6 +914,7 @@ namespace megohttp {
                     [self, last](Result<size_t> w) {
                         (void)last;
                         if (!w) { self->fail(w.error()); return; }
+                        self->rearm_send_timer();
                         self->disarm_send_timer();
                         self->arm_recv_timer();
                         self->read_more();
@@ -946,7 +1011,13 @@ namespace megohttp {
                 if (expect_continue_pending_) {
                     disarm_send_timer();
                     if (head.status_code != 417) send_body_now();
-                    else { expect_continue_pending_ = false; body_sent_ = true; }
+                    else {
+                        expect_continue_pending_ = false;
+                        body_sent_ = true;
+                        // No body will be sent; the response is now the only
+                        // remaining work, so start its idle interval.
+                        begin_recv_stage();
+                    }
                 }
                 ResponseHead rh;
                 rh.status_code = head.status_code;
@@ -1119,6 +1190,10 @@ namespace megohttp {
                     multipart_flow_ = state_->request.multipart_flow();
                     if (multipart_flow_) {
                         multipart_paused_ = multipart_flow_->is_paused();
+                        if (multipart_paused_) {
+                            pause_recv_timer();
+                            if (!pause_hold_) pause_hold_ = shared_from_this();
+                        }
                         std::weak_ptr<Exchange> weak = shared_from_this();
                         auto exec = state_->executor;
                         multipart_flow_->set_wake([weak, exec]() {
@@ -1132,7 +1207,9 @@ namespace megohttp {
                                 // exists to deliver.
                                 if (!self->multipart_paused_ && !self->deferred_complete_) return;
                                 if (!self->multipart_paused_) return;
+                                auto keep = std::move(self->pause_hold_);
                                 self->multipart_paused_ = false;
+                                self->rearm_recv_timer();
                                 if (self->multipart_bridge_) self->multipart_bridge_->clear_paused();
                                 // The multipart parser still holds the block it
                                 // paused on (paused_skip_ is only cleared by the
@@ -1151,6 +1228,8 @@ namespace megohttp {
                                     if (self->multipart_bridge_->paused()) {
                                         // Paused again on the replayed block.
                                         self->multipart_paused_ = true;
+                                        self->pause_recv_timer();
+                                        if (!self->pause_hold_) self->pause_hold_ = self;
                                         self->multipart_flow_->pause();
                                         return;
                                     }
@@ -1179,6 +1258,10 @@ namespace megohttp {
                     sink_flow_ = state_->request.body_sink_flow();
                     if (sink_flow_) {
                         sink_paused_ = sink_flow_->is_paused() ? true : false;
+                        if (sink_paused_) {
+                            pause_recv_timer();
+                            if (!pause_hold_) pause_hold_ = shared_from_this();
+                        }
                         std::weak_ptr<Exchange> weak = shared_from_this();
                         auto exec = state_->executor;
                         sink_flow_->set_wake([weak, exec]() {
@@ -1187,7 +1270,9 @@ namespace megohttp {
                                 auto self = weak.lock();
                                 if (!self || self->complete_) return;
                                 if (self->sink_paused_) {
+                                    auto keep = std::move(self->pause_hold_);
                                     self->sink_paused_ = false;
+                                    self->rearm_recv_timer();
                                     self->read_more();
                                 }
                             });
@@ -1291,6 +1376,8 @@ namespace megohttp {
                         // non-hanging option.
                         if (multipart_flow_) {
                             multipart_paused_ = true;
+                            pause_recv_timer();
+                            if (!pause_hold_) pause_hold_ = shared_from_this();
                             multipart_flow_->pause();
                         }
                     }
@@ -1306,6 +1393,7 @@ namespace megohttp {
                     if (!sse_paused_ && sse_flow_ && sse_flow_->is_paused()) {
                         sse_parser_->pause();
                         sse_paused_ = true;
+                        pause_recv_timer();
                         if (!pause_hold_) pause_hold_ = shared_from_this();
                     }
                     auto r = sse_parser_->feed(data, size);
@@ -1322,6 +1410,7 @@ namespace megohttp {
                         // one more output block to feed(), which is retained
                         // under max_paused_buffer_bytes.
                         sse_paused_ = true;
+                        pause_recv_timer();
                         // No read is outstanding while paused, so nothing in
                         // the transport keeps the Exchange alive. Hold it until
                         // the caller resumes.
@@ -1371,6 +1460,10 @@ namespace megohttp {
                                          string("BodySink returned false without a BodySinkFlow")};
                         }
                         sink_paused_ = true;
+                        pause_recv_timer();
+                        // No read is outstanding while the sink is parked.
+                        // Keep the exchange alive until resume() wakes it.
+                        if (!pause_hold_) pause_hold_ = shared_from_this();
                         // The flow's own flag must agree, otherwise resume()
                         // sees "was not paused" and never fires the wake-up.
                         sink_flow_->pause();
@@ -1608,6 +1701,7 @@ namespace megohttp {
                     }
                     if (sse_parser_->is_paused()) {
                         sse_paused_ = true;
+                        pause_recv_timer();
                         pause_hold_ = shared_from_this();
                         return;
                     }
@@ -1619,6 +1713,7 @@ namespace megohttp {
                     if (!r) fail(r.error());
                     return;
                 }
+                rearm_recv_timer();
                 read_more();
             }
 
@@ -1684,6 +1779,10 @@ namespace megohttp {
                 stream->async_read_some(
                     [self](Result<string_view> r) {
                         self->reading_ = false;
+                        // A timeout/cancel closes the logical request while
+                        // the transport may still have an outstanding read.
+                        // Its late bytes must not reach the parser or a sink.
+                        if (self->state_->finished.load()) return;
                         if (!r) { self->fail(r.error()); return; }
 
                         const string_view sv = r.value();
@@ -1719,6 +1818,9 @@ namespace megohttp {
                         }
 
                         self->state_->phase = detail::RequestPhase::Receive;
+                        // Any non-empty read is progress: restart the
+                        // receive idle interval.
+                        self->rearm_recv_timer();
                         self->feed_and_continue(sv);
                     });
             }
@@ -1789,6 +1891,12 @@ namespace megohttp {
             std::unique_ptr<ResponseParser> parser_;
             std::shared_ptr<Timer> send_timer_;
             std::shared_ptr<Timer> recv_timer_;
+            // Idle-timeout generations invalidate callbacks that were already
+            // queued before a rearm/pause/disarm.
+            uint64_t send_timer_generation_{0};
+            uint64_t recv_timer_generation_{0};
+            bool send_stage_active_{false};
+            bool recv_stage_active_{false};
             // Backpressure retry for a BodySource that is not ready yet. Owned
             // here so the terminal path can cancel it; an uncancelled timer
             // would call the user's BodySource after the request finished.

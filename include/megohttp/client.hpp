@@ -52,8 +52,8 @@ namespace megohttp {
     struct ClientOptions {
         Duration dns_timeout{std::chrono::seconds(30)};
         Duration connect_timeout{std::chrono::seconds(30)};
-        Duration send_timeout{std::chrono::seconds(30)};     // 0 = disabled
-        Duration recv_timeout{std::chrono::seconds(30)};     // 0 = disabled, whole body
+        Duration send_timeout{std::chrono::seconds(30)};     // 0 = disabled; idle between write progress
+        Duration recv_timeout{std::chrono::seconds(30)};     // 0 = disabled; idle between read progress
         Duration total_timeout{std::chrono::seconds(0)};     // 0 = disabled, whole request
 
         // Send "Expect: 100-continue" for requests that carry a body and hold the

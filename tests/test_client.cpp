@@ -197,6 +197,96 @@ private:
     std::string request_line_;
 };
 
+// Sends the response head immediately, then four body chunks separated by
+// 120 ms gaps. Total response time is > 200 ms, but no individual gap is.
+// That distinguishes an idle timeout from a whole-response deadline.
+class PacedHttpServer {
+public:
+    bool start() {
+#if defined(_WIN32)
+        WSADATA wsa{};
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+        sock_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (sock_ == INVALID_SOCKET) return false;
+        int one = 1;
+        setsockopt(sock_, SOL_SOCKET, SO_REUSEADDR,
+                   reinterpret_cast<const char*>(&one), sizeof one);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        if (::bind(sock_, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0) return false;
+        if (::listen(sock_, 4) != 0) return false;
+        socklen_t len = sizeof addr;
+        if (::getsockname(sock_, reinterpret_cast<sockaddr*>(&addr), &len) != 0) return false;
+        port_ = ntohs(addr.sin_port);
+        thread_ = std::thread([this] { serve(); });
+        return true;
+    }
+
+    uint16_t port() const noexcept { return port_; }
+
+    void stop() {
+        if (stop_.exchange(true)) return;
+        if (sock_ != INVALID_SOCKET) {
+#if defined(_WIN32)
+            ::closesocket(sock_);
+#else
+            ::close(sock_);
+#endif
+            sock_ = INVALID_SOCKET;
+        }
+        if (thread_.joinable()) thread_.join();
+    }
+
+    ~PacedHttpServer() { stop(); }
+
+private:
+    void serve() {
+        sockaddr_in peer{};
+        socklen_t plen = sizeof peer;
+        auto c = ::accept(sock_, reinterpret_cast<sockaddr*>(&peer), &plen);
+        if (c == INVALID_SOCKET) return;
+
+        char buf[2048];
+        std::string head;
+        while (head.find("\r\n\r\n") == std::string::npos) {
+            int n = ::recv(c, buf, sizeof buf, 0);
+            if (n <= 0) { close_socket(c); return; }
+            head.append(buf, static_cast<size_t>(n));
+        }
+
+        const char* resp =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Length: 64\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        ::send(c, resp, static_cast<int>(std::strlen(resp)), 0);
+        for (int i = 0; i < 4; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(120));
+            const char chunk[16] = {'a','b','c','d','e','f','g','h',
+                                    'i','j','k','l','m','n','o','p'};
+            ::send(c, chunk, sizeof chunk, 0);
+        }
+        close_socket(c);
+    }
+
+    static void close_socket(SOCKET s) {
+#if defined(_WIN32)
+        ::closesocket(s);
+#else
+        ::close(s);
+#endif
+    }
+
+    SOCKET sock_{INVALID_SOCKET};
+    uint16_t port_{0};
+    std::atomic<bool> stop_{false};
+    std::thread thread_;
+};
+
 // Accepts a connection then never writes anything, so only a receive timeout
 // can end the request.
 class TinysilentServer {
@@ -847,6 +937,74 @@ TEST_CASE("recv timeout fires when the server never responds", "[client][timeout
     REQUIRE(wait_until([&] { return done.load(); }, 5000));
     REQUIRE(code == ErrorCode::TimeoutRecv);
     REQUIRE(phase == ErrorPhase::Receive);
+    client.shutdown();
+    srv.stop();
+}
+
+TEST_CASE("send_timeout bounds the 100-continue wait",
+          "[client][timeout][idle]") {
+    // The body is held until the server answers 100 Continue. That wait is a
+    // send-stage idle interval, so a server that never answers is bounded by
+    // send_timeout instead of hanging forever.
+    TinysilentServer srv;
+    if (!srv.start()) {
+        std::printf("SKIP: could not start the silent server\n");
+        return;
+    }
+
+    ClientOptions o;
+    o.expect_continue = true;
+    o.send_timeout = std::chrono::milliseconds(150);
+    o.recv_timeout = Duration::zero();
+    o.total_timeout = Duration::zero();
+    Client client(o);
+
+    Request req(Method::Post,
+                string("http://127.0.0.1:") + format("{}", srv.port()) + "/");
+    req.set_body("payload");
+
+    std::atomic<bool> done{false};
+    ErrorCode code = ErrorCode::Unknown;
+    ErrorPhase phase = ErrorPhase::None;
+    client.request(req, [&](Result<Response> r) {
+        if (!r) { code = r.error().code(); phase = r.error().phase(); }
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }, 5000));
+    REQUIRE(code == ErrorCode::TimeoutSend);
+    REQUIRE(phase == ErrorPhase::Send);
+    client.shutdown();
+    srv.stop();
+}
+
+TEST_CASE("recv_timeout is idle, not a whole-response deadline",
+          "[client][timeout][idle]") {
+    // 4 chunks x 120 ms, total 480 ms > 180 ms, but every gap is below it.
+    // The old whole-response deadline failed at 180 ms; the idle timer must
+    // survive because every arriving chunk resets the interval.
+    PacedHttpServer srv;
+    if (!srv.start()) {
+        std::printf("SKIP: could not start the paced server\n");
+        return;
+    }
+
+    ClientOptions o;
+    o.recv_timeout = std::chrono::milliseconds(180);
+    o.total_timeout = Duration::zero();
+    Client client(o);
+
+    std::atomic<bool> done{false};
+    Result<Response> got = Error{ErrorCode::Unknown};
+    client.get(string("http://127.0.0.1:") + format("{}", srv.port()) + "/",
+               [&](Result<Response> r) {
+        got = std::move(r);
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }, 5000));
+    REQUIRE(got);
+    CHECK(got.value().body_bytes().size() == 64);
     client.shutdown();
     srv.stop();
 }
