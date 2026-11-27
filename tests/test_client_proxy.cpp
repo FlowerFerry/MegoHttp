@@ -1,5 +1,7 @@
 #include <megohttp/config.hpp>
 #include <megohttp/client.hpp>
+#include <megohttp/content_range.hpp>
+#include <megohttp/multipart_sink.hpp>
 #include <megohttp/request.hpp>
 #include <megohttp/response.hpp>
 
@@ -200,7 +202,15 @@ private:
     static std::string temp_path() {
         static std::atomic<unsigned> counter{0};
         char buf[512] = {0};
-        std::snprintf(buf, sizeof buf, "%s/mgproxy_%u_%u.json", MEGOHTTP_TESTS_DIR,
+        // The pid is part of the name on purpose: the masked clock alone can
+        // collide with a file left behind by an earlier run of this exe, and a
+        // stale recording makes an assertion read another proxy's content.
+#if defined(_WIN32)
+        const unsigned pid = static_cast<unsigned>(::GetCurrentProcessId());
+#else
+        const unsigned pid = static_cast<unsigned>(::getpid());
+#endif
+        std::snprintf(buf, sizeof buf, "%s/mgproxy_%u_%u_%u.json", MEGOHTTP_TESTS_DIR, pid,
                       static_cast<unsigned>(
                           std::chrono::steady_clock::now().time_since_epoch().count() & 0xFFFFFF),
                       counter.fetch_add(1));
@@ -274,6 +284,21 @@ private:
     bool job_assigned_{false};
 };
 
+// recording() returns the first non-empty snapshot, which can predate the entry
+// an assertion is about: the proxy records socks5_greeting before the auth
+// record, and connect before connect_closed. A one-shot read therefore makes
+// these checks racy, so poll until the needle shows up.
+bool recording_contains(const ProxyServer& proxy, const char* needle,
+                        int timeout_ms = 3000) {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_ms);
+    do {
+        if (proxy.recording().find(needle) != std::string::npos) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+}
+
 // Returns the library's owning string so Request can take it directly:
 // std::string does not convert in MemeString mode, and that is correct.
 string url(uint16_t port, const char* path = "/") {
@@ -342,8 +367,7 @@ TEST_CASE("a cleartext target through a forward proxy uses absolute-form",
 
     // The proxy must have seen the absolute form: without it a forward proxy has
     // no idea where to relay.
-    const std::string rec = proxy.recording();
-    CHECK(rec.find("\"absolute_form\": true") != std::string::npos);
+    CHECK(recording_contains(proxy, "\"absolute_form\": true"));
 
     // The ORIGIN must have seen origin-form. An absolute target reaching an
     // origin is something every real proxy conceals, so only the origin can
@@ -367,7 +391,7 @@ TEST_CASE("proxy credentials never reach the target", "[proxy][client][security]
     CHECK(r.value().head().status_code == 200);
 
     // Present on the proxy hop...
-    CHECK(proxy.recording().find("Basic ") != std::string::npos);
+    CHECK(recording_contains(proxy, "Basic "));
     // ...and absent from what the origin received. This is the leak a
     // "did the request succeed" test cannot see.
     CHECK(origin.last_headers().find("roxy-authorization") == std::string::npos);
@@ -395,8 +419,10 @@ TEST_CASE("a target Authorization is not reused as proxy credentials",
     // It legitimately sees the target's Authorization header -- a forward proxy
     // relays the request and cannot avoid seeing it (task book 10.1 says so
     // explicitly) -- so the assertion is on the proxy-authorization field only.
-    const std::string rec = proxy.recording();
-    CHECK(rec.find("\"proxy_authorization\": \"Bearer") == std::string::npos);
+    // Wait for the forward entry itself before asserting on its field: a read
+    // taken before the entry lands would pass for the wrong reason.
+    CHECK(recording_contains(proxy, "\"kind\": \"forward\""));
+    CHECK(proxy.recording().find("\"proxy_authorization\": \"Bearer") == std::string::npos);
 }
 
 TEST_CASE("wrong proxy credentials surface as a 407 from the proxy",
@@ -461,11 +487,10 @@ TEST_CASE("a SOCKS5 proxy with remote DNS hands over the name",
     // single lookup here would be the proxy host itself.
     CHECK(counting->target_lookups() == 0);
 
-    const std::string rec = proxy.recording();
     // The recorded ATYP is the whole point: "domain" proves the name travelled;
     // "ipv4" would prove the client resolved it locally first.
-    CHECK(rec.find("\"atyp\": \"domain\"") != std::string::npos);
-    CHECK(rec.find("proxy.test") != std::string::npos);
+    CHECK(recording_contains(proxy, "\"atyp\": \"domain\""));
+    CHECK(recording_contains(proxy, "proxy.test"));
 }
 
 TEST_CASE("a SOCKS5 proxy that rejects the credentials fails with Socks5AuthFailed",
@@ -509,7 +534,7 @@ TEST_CASE("SOCKS5 username/password auth succeeds end to end",
          << " phase=" << (r ? 0 : static_cast<int>(r.error().phase())));
     REQUIRE(r);
     CHECK(r.value().head().status_code == 200);
-    CHECK(proxy.recording().find("\"user\": \"alice\"") != std::string::npos);
+    CHECK(recording_contains(proxy, "\"user\": \"alice\""));
 }
 
 // ---------------------------------------------------------------------------
@@ -698,8 +723,8 @@ TEST_CASE("an HTTPS proxy wraps its own connection in TLS", "[proxy][client][htt
     CHECK(r.value().head().status_code == 200);
 
     // The proxy saw the absolute form over TLS, and the origin saw origin-form.
-    CHECK(proxy.recording().find("\"tls\": true") != std::string::npos);
-    CHECK(proxy.recording().find("\"absolute_form\": true") != std::string::npos);
+    CHECK(recording_contains(proxy, "\"tls\": true"));
+    CHECK(recording_contains(proxy, "\"absolute_form\": true"));
     CHECK(origin.last_request_line().rfind("GET /via-https-proxy ", 0) == 0);
 }
 
@@ -793,10 +818,9 @@ TEST_CASE("an https target behind an HTTP proxy uses a CONNECT tunnel",
     // from the proxy's own CONNECT reply.
     CHECK(r.value().body_text() == string_view("hello over https"));
 
-    const std::string rec = proxy.recording();
-    CHECK(rec.find("\"kind\": \"connect\"") != std::string::npos);
-    CHECK(rec.find("\"method\": \"CONNECT\"") != std::string::npos);
-    CHECK(rec.find("\"target\": \"localhost:") != std::string::npos);
+    CHECK(recording_contains(proxy, "\"kind\": \"connect\""));
+    CHECK(recording_contains(proxy, "\"method\": \"CONNECT\""));
+    CHECK(recording_contains(proxy, "\"target\": \"localhost:"));
 }
 
 // ---------------------------------------------------------------------------
@@ -828,7 +852,7 @@ TEST_CASE("a CONNECT refused by the proxy does not reach the target",
     CHECK(r.error().phase() == ErrorPhase::ProxyAuth);
     CHECK(r.error().code() == ErrorCode::ProxyAuthRequired);
 
-    CHECK(proxy.recording().find("\"kind\": \"connect\"") != std::string::npos);
+    CHECK(recording_contains(proxy, "\"kind\": \"connect\""));
 }
 
 // ---------------------------------------------------------------------------
@@ -865,9 +889,8 @@ TEST_CASE("layered TLS: HTTPS proxy and HTTPS target use independent trust",
     CHECK(r.value().body_text() == string_view("hello over https"));
 
     // The proxy saw a CONNECT on its own TLS listener.
-    const std::string rec = proxy.recording();
-    CHECK(rec.find("\"kind\": \"connect\"") != std::string::npos);
-    CHECK(rec.find("\"tls\": true") != std::string::npos);
+    CHECK(recording_contains(proxy, "\"kind\": \"connect\""));
+    CHECK(recording_contains(proxy, "\"tls\": true"));
 }
 
 // ---------------------------------------------------------------------------
@@ -951,9 +974,8 @@ TEST_CASE("multipart response arrives intact through an HTTPS proxy CONNECT tunn
     CHECK(sink->payloads[1] == "part-two");
 
     // The proxy really did see a CONNECT on its own TLS listener.
-    const std::string rec = proxy.recording();
-    CHECK(rec.find("\"kind\": \"connect\"") != std::string::npos);
-    CHECK(rec.find("\"tls\": true") != std::string::npos);
+    CHECK(recording_contains(proxy, "\"kind\": \"connect\""));
+    CHECK(recording_contains(proxy, "\"tls\": true"));
 }
 
 // Diagnostic: same multipart payload, but through a PLAIN HTTP proxy CONNECT
@@ -1027,6 +1049,404 @@ TEST_CASE("a plain body arrives intact through an HTTPS proxy CONNECT tunnel",
     UNSCOPED_INFO("body len=" << got.size());
     UNSCOPED_INFO("body=" << got);
     CHECK(got.size() == 248);   // multipart body: 2 parts + header blank lines
+}
+
+// ---------------------------------------------------------------------------
+// S3.4-19 / S5.6-05 (streaming guarantees over the tunnel): backpressure,
+// cancellation and truncation must behave the same when the bytes travel
+// through proxy TLS + CONNECT + target TLS, not only over plain HTTP. The
+// multipart parser sits at the very top of that stack.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("multipart backpressure works through an HTTPS proxy CONNECT tunnel",
+          "[proxy][client][https_proxy][multipart][backpressure][s34-19][s56-05]") {
+    constexpr size_t kPartBytes = 256 * 1024;
+
+    HttpsOriginServer origin;
+    REQUIRE(origin.start("server-cert.pem", "server-key.pem",
+                         "--multipart --part-bytes 262144 --pace-chunk 8192 --pace-delay 0.005"));
+
+    ProxyServer proxy;
+    REQUIRE(proxy.start("connect", std::string("--tls-cert \"") + fixture("server-cert.pem") +
+                                       "\" --tls-key \"" + fixture("server-key.pem") + "\""));
+
+    ClientOptions o;
+    o.proxy.proxy.type = ProxyType::Https;
+    o.proxy.proxy.host = string("127.0.0.1");
+    o.proxy.proxy.port = proxy.port();
+    o.proxy.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.proxy.tls.hostname = string("localhost");
+    o.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.tls.hostname = string("localhost");
+
+    struct PausingSink : MultipartSink {
+        std::atomic<bool> paused{false};
+        std::atomic<size_t> bytes{0};
+        std::atomic<int> begun{0};
+        std::atomic<int> ended{0};
+        std::atomic<int> completions{0};
+        std::atomic<bool> wrong_byte{false};
+        void on_part_begin(const MultipartPartHead&) override { begun.fetch_add(1); }
+        bool on_part_data(const uint8_t* d, size_t n) override {
+            for (size_t i = 0; i < n; ++i) {
+                if (d[i] != 'x') { wrong_byte.store(true); break; }
+            }
+            bytes.fetch_add(n);
+            // Ask for a pause exactly once, on the first block.
+            if (!paused.exchange(true)) return false;
+            return true;
+        }
+        void on_part_end() override { ended.fetch_add(1); }
+        void on_complete() override { completions.fetch_add(1); }
+        void on_error(const Error&) override {}
+    };
+
+    auto sink = std::make_shared<PausingSink>();
+    auto flow = std::make_shared<Request::MultipartSinkFlow>();
+
+    Client c(o);
+    Request req(Method::Get, to_owning(tunnel_url(origin.port(), "/paced")));
+    MultipartResponseOptions mopts;
+    mopts.boundary = string("megohttp-boundary-42");   // explicit, bypass Content-Type parsing
+    req.set_multipart_sink(sink, mopts, flow);
+
+    std::atomic<bool> was_paused{false};
+    std::thread resumer([&] {
+        for (int i = 0; i < 500 && !sink->paused.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        // Give the exchange a moment to observe the false return and pause the
+        // flow, then record that state before resuming.
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        was_paused.store(flow->is_paused());
+        flow->resume();
+    });
+
+    auto r = c.request_sync(req);
+    resumer.join();
+
+    UNSCOPED_INFO("paused=" << was_paused.load() << " bytes=" << sink->bytes.load()
+                 << " begun=" << sink->begun.load() << " ended=" << sink->ended.load()
+                 << " completions=" << sink->completions.load());
+    REQUIRE(r);
+    CHECK(r.value().head().status_code == 200);
+    CHECK(r.value().body_is_buffered() == false);
+    CHECK(was_paused.load());                  // the pause really reached the flow
+    CHECK(sink->begun.load() == 1);
+    CHECK(sink->ended.load() == 1);
+    CHECK(sink->completions.load() == 1);
+    CHECK(sink->bytes.load() == kPartBytes);   // nothing lost across the pause
+    CHECK_FALSE(sink->wrong_byte.load());
+}
+
+TEST_CASE("cancelling a multipart stream through the tunnel ends in Cancelled",
+          "[proxy][client][https_proxy][multipart][cancel][s34-19][s56-05]") {
+    HttpsOriginServer origin;
+    REQUIRE(origin.start("server-cert.pem", "server-key.pem",
+                         "--multipart --part-bytes 1048576 --pace-chunk 4096 --pace-delay 0.005"));
+
+    ProxyServer proxy;
+    REQUIRE(proxy.start("connect", std::string("--tls-cert \"") + fixture("server-cert.pem") +
+                                       "\" --tls-key \"" + fixture("server-key.pem") + "\""));
+
+    ClientOptions o;
+    o.proxy.proxy.type = ProxyType::Https;
+    o.proxy.proxy.host = string("127.0.0.1");
+    o.proxy.proxy.port = proxy.port();
+    o.proxy.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.proxy.tls.hostname = string("localhost");
+    o.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.tls.hostname = string("localhost");
+
+    struct CountingSink : MultipartSink {
+        std::atomic<int> begun{0};
+        std::atomic<int> completions{0};
+        void on_part_begin(const MultipartPartHead&) override { begun.fetch_add(1); }
+        bool on_part_data(const uint8_t*, size_t) override { return true; }
+        void on_part_end() override {}
+        void on_complete() override { completions.fetch_add(1); }
+        void on_error(const Error&) override {}
+    };
+    auto sink = std::make_shared<CountingSink>();
+
+    Client c(o);
+    Request req(Method::Get, to_owning(tunnel_url(origin.port(), "/slow")));
+    MultipartResponseOptions mopts;
+    mopts.boundary = string("megohttp-boundary-42");
+    req.set_multipart_sink(sink, mopts);
+
+    std::atomic<bool> done{false};
+    std::atomic<int> code{0};
+    auto handle = c.request(req, [&](Result<Response> r) {
+        if (!r) code.store(static_cast<int>(r.error().code()));
+        done.store(true);
+    });
+
+    // Cancel only once the stream is actually flowing, so this is a mid-body
+    // cancellation rather than a cancel of something that never started.
+    for (int i = 0; i < 500 && sink->begun.load() == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    REQUIRE(sink->begun.load() == 1);
+    handle.cancel();
+    for (int i = 0; i < 500 && !done.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    CHECK(done.load());
+    CHECK(static_cast<ErrorCode>(code.load()) == ErrorCode::Cancelled);
+    CHECK(sink->completions.load() == 0);   // cancelling is never a success
+}
+
+TEST_CASE("a truncated multipart body through the tunnel reports MultipartTruncated",
+          "[proxy][client][https_proxy][multipart][truncation][s34-19][s56-05]") {
+    HttpsOriginServer origin;
+    REQUIRE(origin.start("server-cert.pem", "server-key.pem", "--multipart-truncated"));
+
+    ProxyServer proxy;
+    REQUIRE(proxy.start("connect", std::string("--tls-cert \"") + fixture("server-cert.pem") +
+                                       "\" --tls-key \"" + fixture("server-key.pem") + "\""));
+
+    ClientOptions o;
+    o.proxy.proxy.type = ProxyType::Https;
+    o.proxy.proxy.host = string("127.0.0.1");
+    o.proxy.proxy.port = proxy.port();
+    o.proxy.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.proxy.tls.hostname = string("localhost");
+    o.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.tls.hostname = string("localhost");
+
+    struct Recorder : MultipartSink {
+        std::atomic<int> begun{0};
+        std::atomic<int> completions{0};
+        std::atomic<bool> error_fired{false};
+        std::atomic<int> last_code{0};
+        void on_part_begin(const MultipartPartHead&) override { begun.fetch_add(1); }
+        bool on_part_data(const uint8_t*, size_t) override { return true; }
+        void on_part_end() override {}
+        void on_complete() override { completions.fetch_add(1); }
+        void on_error(const Error& e) override {
+            last_code.store(static_cast<int>(e.code()));
+            error_fired.store(true);
+        }
+    };
+    auto sink = std::make_shared<Recorder>();
+
+    Client c(o);
+    Request req(Method::Get, to_owning(tunnel_url(origin.port(), "/cut")));
+    MultipartResponseOptions mopts;
+    mopts.boundary = string("megohttp-boundary-42");
+    req.set_multipart_sink(sink, mopts);
+
+    auto r = c.request_sync(req);
+    UNSCOPED_INFO("begun=" << sink->begun.load()
+                 << " completions=" << sink->completions.load()
+                 << " error_fired=" << sink->error_fired.load());
+    REQUIRE(!r);
+    CHECK(r.error().code() == ErrorCode::MultipartTruncated);
+    CHECK(sink->error_fired.load());
+    CHECK(static_cast<ErrorCode>(sink->last_code.load()) == ErrorCode::MultipartTruncated);
+    CHECK(sink->completions.load() == 0);
+    CHECK(sink->begun.load() >= 1);   // the part that did arrive was delivered
+}
+
+// ---------------------------------------------------------------------------
+// S3.4-19 / S5.6-05 (the rest of the streaming matrix): Content-Encoding in
+// front of the parser, byteranges, and an endless x-mixed-replace stream. All
+// three have plain-HTTP coverage in test_multipart_client; these are the
+// two-TLS-layer versions.
+// ---------------------------------------------------------------------------
+
+#if MEGOHTTP_HAS_ZLIB
+TEST_CASE("gzipped multipart through the tunnel is decoded before parsing",
+          "[proxy][client][https_proxy][multipart][gzip][s34-19][s56-05]") {
+    HttpsOriginServer origin;
+    REQUIRE(origin.start("server-cert.pem", "server-key.pem", "--multipart --gzip"));
+
+    ProxyServer proxy;
+    REQUIRE(proxy.start("connect", std::string("--tls-cert \"") + fixture("server-cert.pem") +
+                                       "\" --tls-key \"" + fixture("server-key.pem") + "\""));
+
+    ClientOptions o;
+    o.proxy.proxy.type = ProxyType::Https;
+    o.proxy.proxy.host = string("127.0.0.1");
+    o.proxy.proxy.port = proxy.port();
+    o.proxy.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.proxy.tls.hostname = string("localhost");
+    o.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.tls.hostname = string("localhost");
+
+    struct Recorder : MultipartSink {
+        std::atomic<int> begun{0};
+        std::atomic<int> completions{0};
+        std::atomic<bool> error_fired{false};
+        std::vector<std::string> payloads;
+        void on_part_begin(const MultipartPartHead&) override {
+            begun.fetch_add(1);
+            payloads.push_back({});
+        }
+        bool on_part_data(const uint8_t* d, size_t n) override {
+            payloads.back().append(reinterpret_cast<const char*>(d), n);
+            return true;
+        }
+        void on_part_end() override {}
+        void on_complete() override { completions.fetch_add(1); }
+        void on_error(const Error&) override { error_fired.store(true); }
+    };
+    auto sink = std::make_shared<Recorder>();
+
+    Client c(o);
+    Request req(Method::Get, to_owning(tunnel_url(origin.port(), "/gz")));
+    MultipartResponseOptions mopts;
+    mopts.boundary = string("megohttp-boundary-42");
+    req.set_multipart_sink(sink, mopts);
+
+    auto r = c.request_sync(req);
+    REQUIRE(r);
+    CHECK(r.value().head().status_code == 200);
+    CHECK(r.value().body_decoded() == true);   // a decoder chain really ran
+    CHECK(r.value().body_is_buffered() == false);
+    CHECK(sink->begun.load() == 2);
+    CHECK(sink->completions.load() == 1);
+    CHECK_FALSE(sink->error_fired.load());
+    REQUIRE(sink->payloads.size() == 2);
+    CHECK(sink->payloads[0] == "part-one");
+    CHECK(sink->payloads[1] == "part-two");
+}
+#endif // MEGOHTTP_HAS_ZLIB
+
+TEST_CASE("multipart/byteranges through the tunnel exposes per-part Content-Range",
+          "[proxy][client][https_proxy][multipart][byteranges][s34-19][s56-05]") {
+    HttpsOriginServer origin;
+    REQUIRE(origin.start("server-cert.pem", "server-key.pem", "--byteranges"));
+
+    ProxyServer proxy;
+    REQUIRE(proxy.start("connect", std::string("--tls-cert \"") + fixture("server-cert.pem") +
+                                       "\" --tls-key \"" + fixture("server-key.pem") + "\""));
+
+    ClientOptions o;
+    o.proxy.proxy.type = ProxyType::Https;
+    o.proxy.proxy.host = string("127.0.0.1");
+    o.proxy.proxy.port = proxy.port();
+    o.proxy.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.proxy.tls.hostname = string("localhost");
+    o.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.tls.hostname = string("localhost");
+
+    struct RangeSink : MultipartSink {
+        std::vector<std::optional<ContentRange>> ranges;
+        std::vector<size_t> lengths;
+        size_t current{0};
+        bool range_error{false};
+        int completions{0};
+        bool error_fired{false};
+        void on_part_begin(const MultipartPartHead& head) override {
+            auto parsed = multipart_part_content_range(head);
+            if (!parsed) {
+                range_error = true;
+                ranges.push_back(std::nullopt);
+            } else {
+                ranges.push_back(parsed.value());
+            }
+            current = 0;
+        }
+        bool on_part_data(const uint8_t*, size_t n) override {
+            current += n;
+            return true;
+        }
+        void on_part_end() override { lengths.push_back(current); }
+        void on_complete() override { ++completions; }
+        void on_error(const Error&) override { error_fired = true; }
+    };
+    auto sink = std::make_shared<RangeSink>();
+
+    Client c(o);
+    Request req(Method::Get, to_owning(tunnel_url(origin.port(), "/ranges")));
+    MultipartResponseOptions mopts;
+    mopts.boundary = string("megohttp-boundary-42");
+    req.set_multipart_sink(sink, mopts);
+
+    auto r = c.request_sync(req);
+    REQUIRE(r);
+    CHECK(r.value().head().status_code == 200);
+    CHECK_FALSE(sink->range_error);
+    CHECK_FALSE(sink->error_fired);
+    CHECK(sink->completions == 1);
+    REQUIRE(sink->ranges.size() == 2);
+    REQUIRE(sink->lengths.size() == 2);
+
+    // The fixture sends 95-99 BEFORE 0-4 on purpose: part order must not be
+    // assumed to follow the request's Range order.
+    REQUIRE(sink->ranges[0].has_value());
+    REQUIRE(sink->ranges[1].has_value());
+    CHECK(sink->ranges[0]->first.value() == 95);
+    CHECK(sink->ranges[0]->last.value() == 99);
+    CHECK(sink->ranges[0]->total.value() == 100);
+    CHECK(sink->ranges[1]->first.value() == 0);
+    CHECK(sink->ranges[1]->last.value() == 4);
+
+    // The declared range must match the bytes that actually arrived per part.
+    CHECK(sink->lengths[0] == 5);
+    CHECK(sink->lengths[1] == 5);
+    CHECK(validate_content_range(sink->ranges[0].value(), sink->lengths[0], 100).has_value());
+    CHECK(validate_content_range(sink->ranges[1].value(), sink->lengths[1], 100).has_value());
+}
+
+TEST_CASE("an x-mixed-replace stream through the tunnel ends at connection close",
+          "[proxy][client][https_proxy][multipart][continuous][s34-19][s56-05]") {
+    HttpsOriginServer origin;
+    REQUIRE(origin.start("server-cert.pem", "server-key.pem", "--continuous"));
+
+    ProxyServer proxy;
+    REQUIRE(proxy.start("connect", std::string("--tls-cert \"") + fixture("server-cert.pem") +
+                                       "\" --tls-key \"" + fixture("server-key.pem") + "\""));
+
+    ClientOptions o;
+    o.proxy.proxy.type = ProxyType::Https;
+    o.proxy.proxy.host = string("127.0.0.1");
+    o.proxy.proxy.port = proxy.port();
+    o.proxy.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.proxy.tls.hostname = string("localhost");
+    o.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.tls.hostname = string("localhost");
+
+    struct Recorder : MultipartSink {
+        std::atomic<int> begun{0};
+        std::atomic<int> completions{0};
+        std::atomic<bool> error_fired{false};
+        std::vector<std::string> payloads;
+        void on_part_begin(const MultipartPartHead&) override {
+            begun.fetch_add(1);
+            payloads.push_back({});
+        }
+        bool on_part_data(const uint8_t* d, size_t n) override {
+            payloads.back().append(reinterpret_cast<const char*>(d), n);
+            return true;
+        }
+        void on_part_end() override {}
+        void on_complete() override { completions.fetch_add(1); }
+        void on_error(const Error&) override { error_fired.store(true); }
+    };
+    auto sink = std::make_shared<Recorder>();
+
+    Client c(o);
+    Request req(Method::Get, to_owning(tunnel_url(origin.port(), "/stream")));
+    MultipartResponseOptions mopts;
+    mopts.boundary = string("megohttp-boundary-42");
+    // Without this the missing closing delimiter is a truncation (that is what
+    // the truncation case asserts); x-mixed-replace is the documented exception.
+    mopts.allow_continuous_stream = true;
+    req.set_multipart_sink(sink, mopts);
+
+    auto r = c.request_sync(req);
+    REQUIRE(r);
+    CHECK(r.value().head().status_code == 200);
+    CHECK(sink->begun.load() == 2);
+    CHECK(sink->completions.load() == 1);
+    CHECK_FALSE(sink->error_fired.load());
+    REQUIRE(sink->payloads.size() == 2);
+    CHECK(sink->payloads[0] == "tick-1");
+    CHECK(sink->payloads[1] == "tick-2");
 }
 
 // ---------------------------------------------------------------------------

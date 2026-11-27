@@ -255,6 +255,9 @@ def handle_connect(client, recorder, use_tls, require_auth=False, first=b"",
     t2.start()
     t1.join()
     t2.join()
+    # Both directions hit EOF: the tunnel is gone. Recorded so a test can prove
+    # that cancelling a stream tears the tunnel down instead of leaking it.
+    recorder.add({"kind": "connect_closed", "target": target})
     for s in (client, upstream):
         try:
             s.close()

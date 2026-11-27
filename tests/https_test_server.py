@@ -9,6 +9,7 @@ Prints "READY <pid> <port>" once bound, so the test learns a dynamic port and
 can terminate the process by PID.
 """
 import argparse
+import gzip
 import os
 import socket
 import ssl
@@ -56,6 +57,41 @@ def main():
         action="store_true",
         help="send a multipart body that stops after one part (no closing boundary)",
     )
+    ap.add_argument(
+        "--part-bytes",
+        type=int,
+        default=0,
+        help="with --multipart: emit ONE part of this many 'x' bytes "
+             "(gives the client a body that spans many reads)",
+    )
+    ap.add_argument(
+        "--pace-chunk",
+        type=int,
+        default=0,
+        help="send the response in chunks of this many bytes (0 = one sendall)",
+    )
+    ap.add_argument(
+        "--pace-delay",
+        type=float,
+        default=0.0,
+        help="seconds to sleep between paced chunks",
+    )
+    ap.add_argument(
+        "--gzip",
+        action="store_true",
+        help="compress the body and advertise Content-Encoding: gzip",
+    )
+    ap.add_argument(
+        "--byteranges",
+        action="store_true",
+        help="answer with multipart/byteranges, parts NOT in ascending order",
+    )
+    ap.add_argument(
+        "--continuous",
+        action="store_true",
+        help="answer with multipart/x-mixed-replace and no closing delimiter, "
+             "close-delimited so EOF ends the stream",
+    )
     args = ap.parse_args()
 
     parent_watchdog.start(args.parent_pid)
@@ -67,11 +103,34 @@ def main():
         (b'Content-Type: application/octet-stream\r\nContent-Disposition: form-data; name="b"',
          b"part-two"),
     ])
+    if args.part_bytes > 0:
+        # One big part, so a pausing sink has somewhere to pause and the body
+        # spans many TLS records / reads.
+        mp_text = multipart_body(boundary, [
+            (b'Content-Type: application/octet-stream\r\n'
+             b'Content-Disposition: form-data; name="big"',
+             b"x" * args.part_bytes),
+        ])
     if args.multipart_truncated:
         # One part, then stop: the closing delimiter never arrives.
         mp_text = (b"--" + boundary + b"\r\n"
                    b'Content-Type: text/plain\r\nContent-Disposition: form-data; name="a"'
                    b"\r\n\r\npart-one\r\n")
+    if args.byteranges:
+        # Two ranges of a 100-byte resource, deliberately NOT in ascending order:
+        # the parser must not assume the parts follow the request's Range order.
+        mp_text = multipart_body(boundary, [
+            (b"Content-Type: application/octet-stream\r\n"
+             b"Content-Range: bytes 95-99/100", b"BBBBB"),
+            (b"Content-Type: application/octet-stream\r\n"
+             b"Content-Range: bytes 0-4/100", b"AAAAA"),
+        ])
+    if args.continuous:
+        # No closing delimiter: this stream only ends when the connection does.
+        mp_text = (b"--" + boundary + b"\r\n"
+                   b"Content-Type: text/plain\r\n\r\ntick-1\r\n"
+                   b"--" + boundary + b"\r\n"
+                   b"Content-Type: text/plain\r\n\r\ntick-2\r\n")
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -95,21 +154,45 @@ def main():
                     return
                 buf += chunk
 
-            if args.multipart or args.multipart_truncated:
+            if args.byteranges:
+                ctype = b'multipart/byteranges; boundary="' + boundary + b'"'
+                body = mp_text
+                close_delimited = False
+            elif args.continuous:
+                ctype = b'multipart/x-mixed-replace; boundary="' + boundary + b'"'
+                body = mp_text
+                close_delimited = True
+            elif args.multipart or args.multipart_truncated:
                 ctype = b'multipart/mixed; boundary="' + boundary + b'"'
                 body = mp_text
+                close_delimited = False
             else:
                 ctype = b"text/plain"
                 body = BODY
+                close_delimited = False
 
-            resp = (
-                b"HTTP/1.1 200 OK\r\n"
-                b"Content-Type: " + ctype + b"\r\n"
-                b"Content-Length: " + str(len(body)).encode() + b"\r\n"
-                b"Connection: keep-alive\r\n"
-                b"\r\n" + body
-            )
-            conn.sendall(resp)
+            extra = b""
+            if args.gzip:
+                body = gzip.compress(body)
+                extra = b"Content-Encoding: gzip\r\n"
+
+            resp = b"HTTP/1.1 200 OK\r\nContent-Type: " + ctype + b"\r\n" + extra
+            if close_delimited:
+                resp += b"Connection: close\r\n"
+            else:
+                resp += b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                resp += b"Connection: keep-alive\r\n"
+            resp += b"\r\n" + body
+            if args.pace_chunk > 0:
+                # Paced delivery: gives the client a real pause point and a body
+                # it cannot finish in one read, which backpressure and
+                # cancellation both need.
+                for i in range(0, len(resp), args.pace_chunk):
+                    conn.sendall(resp[i:i + args.pace_chunk])
+                    if args.pace_delay > 0:
+                        time.sleep(args.pace_delay)
+            else:
+                conn.sendall(resp)
         except Exception:
             pass
         finally:
