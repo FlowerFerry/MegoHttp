@@ -4,11 +4,14 @@
 #include <megohttp/config.hpp>
 #include <megohttp/error.hpp>
 #include <megohttp/headers.hpp>
+#include <megohttp/content_range.hpp>
 #include <megohttp/multipart_response.hpp>
 #include <megohttp/string_adapter.hpp>
 
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <utility>
 
 namespace megohttp {
 
@@ -36,6 +39,30 @@ namespace megohttp {
         size_t index{0};
     };
 
+    // Parses the optional per-part Content-Range header.
+    //
+    // A part without Content-Range is not an error: the result contains
+    // std::nullopt. A present but malformed value is reported as
+    // MultipartContentRangeInvalid. A non-bytes unit is returned as
+    // ContentRange::Kind::Unsupported, matching parse_content_range().
+    //
+    // This helper only parses the header. To check the value against the bytes
+    // actually delivered for the part, call validate_content_range() with the
+    // caller's accumulated part length.
+    inline Result<std::optional<ContentRange>>
+    multipart_part_content_range(const MultipartPartHead& head) {
+        auto value = head.headers.get("content-range");
+        if (!value) {
+            return Result<std::optional<ContentRange>>(std::optional<ContentRange>{});
+        }
+        auto parsed = parse_content_range(*value);
+        if (!parsed) {
+            return Result<std::optional<ContentRange>>(parsed.error());
+        }
+        return Result<std::optional<ContentRange>>(
+            std::optional<ContentRange>(std::move(parsed.value())));
+    }
+
     class MultipartSink {
     public:
         virtual ~MultipartSink() = default;
@@ -55,6 +82,17 @@ namespace megohttp {
         // Called when a part finishes. Says nothing about the request: the HTTP
         // message may still be truncated afterwards.
         virtual void on_part_end() = 0;
+
+        // Optional RFC 2046 lifecycle data. The defaults discard these bytes;
+        // override either callback to opt in. Data is delivered in bounded
+        // chunks as it arrives, never as one unbounded buffer, and the parser's
+        // max_preamble_size / max_epilogue_size limits still apply. Views are
+        // valid only for the call. Preamble is delivered before the first
+        // on_part_begin; epilogue is delivered after the closing boundary and
+        // may arrive after the parser has recorded multipart completion, but
+        // still before the sink's on_complete (which waits for HTTP framing).
+        virtual void on_preamble_data(const uint8_t*, size_t) {}
+        virtual void on_epilogue_data(const uint8_t*, size_t) {}
 
         // Called exactly once, when BOTH the HTTP message and the multipart
         // message are complete.

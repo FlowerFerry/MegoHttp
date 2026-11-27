@@ -15,9 +15,21 @@ namespace {
 struct Collector : MultipartResponseParser::Callbacks {
     std::vector<Headers> parts_headers;
     std::vector<std::string> parts_data;
+    std::string preamble;
+    std::string epilogue;
     int complete_count = 0;
     bool has_error = false;
     std::string error_msg;
+
+    VoidResult on_preamble_data(string_view data) override {
+        preamble.append(data.data(), data.size());
+        return VoidResult{};
+    }
+
+    VoidResult on_epilogue_data(string_view data) override {
+        epilogue.append(data.data(), data.size());
+        return VoidResult{};
+    }
 
     VoidResult on_part_start(const Headers& headers) override {
         parts_headers.push_back(headers);
@@ -91,6 +103,54 @@ TEST_CASE("multipart mixed basic parsing", "[multipart][response]") {
     CHECK(c.complete_count == 1);
     CHECK(p.is_complete());
     CHECK(p.leftover_offset() > 0); // Epilogue
+}
+
+TEST_CASE("multipart preamble and epilogue callbacks receive streamed bytes",
+          "[multipart][response][lifecycle]") {
+    const char* boundary = "lifecycle";
+    const std::string body =
+        "before the first boundary\r\n"
+        "--lifecycle\r\n"
+        "Content-Type: text/plain\r\n"
+        "\r\n"
+        "payload\r\n"
+        "--lifecycle--\r\n"
+        "after the closing boundary";
+
+    Collector c;
+    MultipartResponseParser p(c, boundary, MultipartResponseParser::Limits{});
+    // Split every byte so both lifecycle sections cross many feeds.
+    auto r = feed_in_chunks(p, body, 1);
+    REQUIRE(r);
+    CHECK(c.preamble == "before the first boundary");
+    CHECK(c.epilogue == "after the closing boundary");
+    CHECK(c.parts_data.size() == 1);
+    CHECK(c.parts_data[0] == "payload");
+    CHECK(c.complete_count == 1);
+}
+
+TEST_CASE("multipart close delimiter at EOF still finalizes the last part",
+          "[multipart][response][lifecycle]") {
+    const char* boundary = "eof";
+    const std::string body =
+        "--eof\r\n"
+        "Content-Type: text/plain\r\n"
+        "\r\n"
+        "last payload\r\n"
+        "--eof--"; // no trailing CRLF
+
+    Collector c;
+    MultipartResponseParser p(c, boundary);
+    auto r = p.feed(reinterpret_cast<const uint8_t*>(body.data()), body.size());
+    REQUIRE(r);
+    CHECK_FALSE(p.is_complete()); // close suffix is still ambiguous
+    auto eof = p.feed_eof();
+    REQUIRE(eof);
+    CHECK(p.is_complete());
+    CHECK(c.parts_data.size() == 1);
+    CHECK(c.parts_data[0] == "last payload");
+    CHECK(c.complete_count == 1);
+    CHECK(c.epilogue.empty());
 }
 
 TEST_CASE("multipart with quoted boundary parameter", "[multipart][response]") {

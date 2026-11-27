@@ -29,8 +29,9 @@ namespace megohttp {
             uint64_t max_part_bytes{64ULL * 1024 * 1024};
             // Preamble and epilogue have their own budgets. Sharing max_part_bytes
             // would let raising the part cap silently widen the preamble allowance
-            // (S3.4-25). Neither is buffered: the preamble is discarded as it
-            // streams past, the epilogue is only counted.
+            // (S3.4-25). Neither is buffered: the callback receives streamed chunks
+            // when it overrides the corresponding optional hook; the default
+            // callbacks discard the bytes.
             size_t max_preamble_size{8 * 1024};
             size_t max_epilogue_size{8 * 1024};
 
@@ -55,7 +56,17 @@ namespace megohttp {
             // Called when a part finishes.
             virtual VoidResult on_part_end() = 0;
             // Called when the whole message is done (closing boundary found).
+            // Epilogue data can still be delivered after this callback; the
+            // closing boundary is not the HTTP-message terminal.
             virtual VoidResult on_complete() = 0;
+
+            // Optional preamble/epilogue streaming hooks. The defaults discard
+            // these bytes, which is the RFC 2046 behavior. A parser never buffers
+            // a whole preamble or epilogue: data is passed in bounded chunks as
+            // it arrives, and `max_preamble_size` / `max_epilogue_size` still
+            // apply. The view is valid only for the call.
+            virtual VoidResult on_preamble_data(string_view) { return VoidResult{}; }
+            virtual VoidResult on_epilogue_data(string_view) { return VoidResult{}; }
         };
 
         // Keep the two-argument form as a real overload instead of a default

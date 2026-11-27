@@ -206,11 +206,21 @@ struct MockMultipartSink : MultipartSink {
     std::vector<MultipartPartHead> part_heads;
     std::vector<std::vector<uint8_t>> part_data;
     std::vector<size_t> part_sizes;
+    std::string preamble;
+    std::string epilogue;
     int parts_started{0};
     int parts_ended{0};
     int complete_count{0};
     bool error_fired{false};
     Error last_error{};
+
+    void on_preamble_data(const uint8_t* data, size_t size) override {
+        preamble.append(reinterpret_cast<const char*>(data), size);
+    }
+
+    void on_epilogue_data(const uint8_t* data, size_t size) override {
+        epilogue.append(reinterpret_cast<const char*>(data), size);
+    }
 
     void on_part_begin(const MultipartPartHead& head) override {
         ++parts_started;
@@ -273,6 +283,63 @@ TEST_CASE("Client delivers multipart parts via MultipartSink", "[s57][multipart]
     CHECK(sink->part_data.size() == 2);
     CHECK(std::string(sink->part_data[0].begin(), sink->part_data[0].end()) == "part one");
     CHECK(std::string(sink->part_data[1].begin(), sink->part_data[1].end()) == "part two");
+}
+
+TEST_CASE("Client forwards optional multipart preamble and epilogue",
+          "[s57][multipart][client][lifecycle]") {
+    MultipartServer srv;
+    const std::string body =
+        "preamble text\r\n" + mp_mixed() + "epilogue text";
+    REQUIRE(srv.start("multipart/mixed; boundary=b1", body));
+
+    Client c;
+    Request req(Method::Get,
+        string(("http://127.0.0.1:" + std::to_string(srv.port()) + "/").c_str()));
+    auto sink = std::make_shared<MockMultipartSink>();
+    req.set_multipart_sink(sink);
+
+    std::atomic<int> done{0};
+    c.request(req, [&](Result<Response> r) {
+        CHECK(r.has_value());
+        done.store(1);
+    });
+    for (int i = 0; i < 200 && done.load() == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    REQUIRE(done.load() == 1);
+    CHECK(sink->preamble == "preamble text");
+    CHECK(sink->epilogue == "epilogue text");
+    CHECK(sink->parts_started == 2);
+    CHECK(sink->complete_count == 1);
+    CHECK(!sink->error_fired);
+}
+
+TEST_CASE("multipart_part_content_range distinguishes absent, valid and invalid",
+          "[s57][multipart][byteranges]") {
+    MultipartPartHead head;
+    auto absent = multipart_part_content_range(head);
+    REQUIRE(absent);
+    CHECK_FALSE(absent.value().has_value());
+
+    head.headers.add("Content-Range", "bytes 0-4/100");
+    auto valid = multipart_part_content_range(head);
+    REQUIRE(valid);
+    REQUIRE(valid.value().has_value());
+    CHECK(valid.value()->first == 0);
+    CHECK(valid.value()->last == 4);
+    CHECK(valid.value()->total == 100);
+    CHECK(valid.value()->length() == 5);
+
+    head.headers.set("Content-Range", "bytes 0-4/not-a-number");
+    auto invalid = multipart_part_content_range(head);
+    REQUIRE(!invalid);
+    CHECK(invalid.error().code() == ErrorCode::MultipartContentRangeInvalid);
+
+    head.headers.set("Content-Range", "items 0-4/100");
+    auto unsupported = multipart_part_content_range(head);
+    REQUIRE(unsupported);
+    REQUIRE(unsupported.value().has_value());
+    CHECK(unsupported.value()->kind == ContentRange::Kind::Unsupported);
 }
 
 #if MEGOHTTP_HAS_ZLIB

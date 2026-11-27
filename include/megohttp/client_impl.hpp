@@ -521,6 +521,16 @@ namespace megohttp {
                 return VoidResult{};
             }
 
+            // Optional lifecycle bytes. They are not part payload, but any byte
+            // handed to the caller makes a retry unsafe, so delivered_ is set too.
+            VoidResult on_preamble_data(string_view data) override {
+                return forward_lifecycle(data, true);
+            }
+
+            VoidResult on_epilogue_data(string_view data) override {
+                return forward_lifecycle(data, false);
+            }
+
             bool on_part_data(string_view data) override {
                 try {
                     // Any byte that reaches the caller makes a retry unsafe: it
@@ -565,6 +575,25 @@ namespace megohttp {
             bool delivered() const noexcept { return delivered_; }
 
         private:
+            VoidResult forward_lifecycle(string_view data, bool preamble) {
+                try {
+                    if (!data.empty()) delivered_ = true;
+                    if (preamble) {
+                        sink_->on_preamble_data(
+                            reinterpret_cast<const uint8_t*>(data.data()), data.size());
+                    } else {
+                        sink_->on_epilogue_data(
+                            reinterpret_cast<const uint8_t*>(data.data()), data.size());
+                    }
+                } catch (...) {
+                    return Error{ErrorCode::Unknown, ErrorPhase::MultipartParse,
+                                 string(preamble
+                                            ? "multipart sink threw from on_preamble_data"
+                                            : "multipart sink threw from on_epilogue_data")};
+                }
+                return VoidResult{};
+            }
+
             std::shared_ptr<MultipartSink> sink_;
             size_t index_{0};
             bool threw_{false};

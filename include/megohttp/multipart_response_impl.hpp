@@ -37,6 +37,11 @@ namespace megohttp {
                     return fail(ErrorCode::MultipartLimitExceeded,
                                 "epilogue exceeds max_epilogue_size");
                 }
+                if (size > 0) {
+                    auto ep = callbacks_.on_epilogue_data(
+                        string_view(reinterpret_cast<const char*>(data), size));
+                    if (!ep) return fail_from(ep.error());
+                }
                 leftover_ += size;
                 return VoidResult{};
             }
@@ -85,8 +90,24 @@ namespace megohttp {
                 if (buffer_[after] == '-' && buffer_[after + 1] == '-') {
                     is_closing = true;
                     suff = 2;
-                    if (after + 3 < buffer_.size() && buffer_[after + 2] == '\r' &&
-                        buffer_[after + 3] == '\n') suff += 2;
+                    if (after + 3 < buffer_.size()) {
+                        if (buffer_[after + 2] == '\r' && buffer_[after + 3] == '\n')
+                            suff += 2;
+                    } else if (buffer_.size() == after + 3 &&
+                               buffer_[after + 2] == '\r') {
+                        // The CRLF after the close delimiter can be split
+                        // across feeds. Wait for the LF before deciding that
+                        // the remaining bytes are epilogue.
+                        close_pending_ = true;
+                        close_after_ = after;
+                        break;
+                    } else if (buffer_.size() == after + 2) {
+                        // A body may end exactly at the close delimiter. Wait
+                        // for more bytes; feed_eof() finalizes this shape.
+                        close_pending_ = true;
+                        close_after_ = after;
+                        break;
+                    }
                 } else {
                     // RFC 2046 规定 boundary 行可以有可选的 transport padding（空格或制表符），
                     // 然后才是 CRLF。当前实现拒绝这种合法形式，导致某些服务器发送的 multipart
@@ -129,24 +150,17 @@ namespace megohttp {
                                     "preamble exceeds max_preamble_size");
                     }
                     preamble_bytes_ += payload_end;
+                    if (payload_end > 0) {
+                        auto pre = callbacks_.on_preamble_data(
+                            string_view(buffer_.data(), payload_end));
+                        if (!pre) return fail_from(pre.error());
+                    }
                 }
 
                 buffer_.erase(0, after + suff);
 
                 if (is_closing) {
-                    // The bytes still in the buffer are the epilogue. They are only
-                    // counted (never buffered or delivered here), so the cap is
-                    // enforced on the count, not on a copy (S3.4-25).
-                    if (limits_.max_epilogue_size != 0 &&
-                        leftover_ + buffer_.size() > limits_.max_epilogue_size) {
-                        return fail(ErrorCode::MultipartLimitExceeded,
-                                    "epilogue exceeds max_epilogue_size");
-                    }
-                    auto r = callbacks_.on_complete();
-                    if (!r) return fail_from(r.error());
-                    state_ = State::Done;
-                    leftover_ = buffer_.size();
-                    break;
+                    return finish_close(0);
                 }
 
                 ++part_count_;
@@ -162,6 +176,48 @@ namespace megohttp {
         VoidResult feed_eof() {
             if (state_ == State::Done) return VoidResult{};
             if (state_ == State::Failed) return fail_error_;
+            if (close_pending_) {
+                // The body ended at a close delimiter whose optional CRLF
+                // was split or absent. The close-pending decision happens
+                // before the normal part-finalization block, so finish the
+                // last part (or preamble tail) before removing the delimiter.
+                const size_t boundary_pos = close_after_ - needle_.size();
+                const size_t payload_end = boundary_pos >= 2 ? boundary_pos - 2 : 0;
+                if (state_ == State::Data) {
+                    if (payload_end > 0) {
+                        part_bytes_ += payload_end;
+                        if (limits_.max_part_bytes != 0 &&
+                            part_bytes_ > limits_.max_part_bytes) {
+                            return fail(ErrorCode::MultipartLimitExceeded,
+                                        "part data exceeds max_part_bytes");
+                        }
+                        if (!callbacks_.on_part_data(
+                                string_view(buffer_.data(), payload_end))) {
+                            // Keep the same pause behavior as the normal EOF
+                            // path: the caller can resume and feed again.
+                            paused_skip_ = 0;
+                            return VoidResult{};
+                        }
+                    }
+                    auto re = callbacks_.on_part_end();
+                    if (!re) return fail_from(re.error());
+                } else if (state_ == State::Preamble && payload_end > 0) {
+                    if (limits_.max_preamble_size != 0 &&
+                        preamble_bytes_ + payload_end > limits_.max_preamble_size) {
+                        return fail(ErrorCode::MultipartLimitExceeded,
+                                    "preamble exceeds max_preamble_size");
+                    }
+                    preamble_bytes_ += payload_end;
+                    auto pre = callbacks_.on_preamble_data(
+                        string_view(buffer_.data(), payload_end));
+                    if (!pre) return fail_from(pre.error());
+                }
+                size_t epi = close_after_ + 2;
+                if (epi < buffer_.size() && buffer_[epi] == '\r') ++epi;
+                if (epi < buffer_.size() && buffer_[epi] == '\n') ++epi;
+                buffer_.erase(0, epi);
+                return finish_close(0);
+            }
             if (state_ == State::Data) {
                 // A trailing CRLF is the delimiter's leading CRLF, not payload
                 // (RFC 2046); the close-delimiter path already strips it.
@@ -203,6 +259,18 @@ namespace megohttp {
                 return fail(ErrorCode::MultipartTruncated, "EOF inside part headers");
             if (state_ == State::Preamble) {
                 if (limits_.allow_continuous_stream) {
+                    if (!buffer_.empty()) {
+                        if (limits_.max_preamble_size != 0 &&
+                            preamble_bytes_ + buffer_.size() > limits_.max_preamble_size) {
+                            return fail(ErrorCode::MultipartLimitExceeded,
+                                        "preamble exceeds max_preamble_size");
+                        }
+                        preamble_bytes_ += buffer_.size();
+                        auto pre = callbacks_.on_preamble_data(
+                            string_view(buffer_.data(), buffer_.size()));
+                        if (!pre) return fail_from(pre.error());
+                        buffer_.clear();
+                    }
                     auto rc = callbacks_.on_complete();
                     if (!rc) return fail_from(rc.error());
                     state_ = State::Done;
@@ -228,6 +296,29 @@ namespace megohttp {
             return fail_error_;
         }
 
+        // Completes a close delimiter. `buffer_` must start at the epilogue
+        // (the caller erases the delimiter and optional suffix first).
+        VoidResult finish_close(size_t epilogue_start) {
+            close_pending_ = false;
+            const size_t epilogue_size = buffer_.size() - epilogue_start;
+            if (limits_.max_epilogue_size != 0 &&
+                leftover_ + epilogue_size > limits_.max_epilogue_size) {
+                return fail(ErrorCode::MultipartLimitExceeded,
+                            "epilogue exceeds max_epilogue_size");
+            }
+            auto r = callbacks_.on_complete();
+            if (!r) return fail_from(r.error());
+            state_ = State::Done;
+            leftover_ = epilogue_size;
+            if (epilogue_size > 0) {
+                auto ep = callbacks_.on_epilogue_data(
+                    string_view(buffer_.data() + epilogue_start, epilogue_size));
+                if (!ep) return fail_from(ep.error());
+            }
+            buffer_.clear();
+            return VoidResult{};
+        }
+
         bool emit(size_t len) {
             if (len == 0) return true;
             if (state_ == State::Data) {
@@ -248,6 +339,9 @@ namespace megohttp {
                     return false;
                 }
                 preamble_bytes_ += len;
+                auto pre = callbacks_.on_preamble_data(
+                    string_view(buffer_.data(), len));
+                if (!pre) { fail_from(pre.error()); return false; }
             } else if (state_ == State::Done) {
                 if (limits_.max_epilogue_size != 0 &&
                     leftover_ + len > limits_.max_epilogue_size) {
@@ -351,6 +445,8 @@ namespace megohttp {
         size_t part_count_{0};
         size_t part_bytes_{0};
         size_t preamble_bytes_{0};
+        bool close_pending_{false};
+        size_t close_after_{0};
         size_t leftover_{0};
         bool boundary_too_long_{false};
         size_t paused_skip_{0};
