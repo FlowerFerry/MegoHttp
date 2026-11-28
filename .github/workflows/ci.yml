@@ -423,6 +423,12 @@ jobs:
           ref: v3.6.7
           path: deps/mbedtls-3.6.7
           fetch-depth: 1
+          # mbedTLS 3.6.7 vendors its build helpers as submodules: `framework`
+          # provides the `mbedtls_framework` Python package that scripts/config.py
+          # imports, and the top-level CMakeLists aborts without it. A plain
+          # checkout leaves deps/mbedtls-3.6.7/framework empty, which surfaces as
+          # ModuleNotFoundError and then a confusing "CMakeLists.txt not found".
+          submodules: recursive
 
       - name: Checkout brotli 1.1.0
         uses: actions/checkout@v4
@@ -686,6 +692,12 @@ jobs:
           ref: v3.6.7
           path: deps/mbedtls-3.6.7
           fetch-depth: 1
+          # mbedTLS 3.6.7 vendors its build helpers as submodules: `framework`
+          # provides the `mbedtls_framework` Python package that scripts/config.py
+          # imports, and the top-level CMakeLists aborts without it. A plain
+          # checkout leaves deps/mbedtls-3.6.7/framework empty, which surfaces as
+          # ModuleNotFoundError and then a confusing "CMakeLists.txt not found".
+          submodules: recursive
 
       - name: Select MSVC x64
         uses: ilammy/msvc-dev-cmd@v1
@@ -925,6 +937,12 @@ jobs:
           ref: v3.6.7
           path: deps/mbedtls-3.6.7
           fetch-depth: 1
+          # mbedTLS 3.6.7 vendors its build helpers as submodules: `framework`
+          # provides the `mbedtls_framework` Python package that scripts/config.py
+          # imports, and the top-level CMakeLists aborts without it. A plain
+          # checkout leaves deps/mbedtls-3.6.7/framework empty, which surfaces as
+          # ModuleNotFoundError and then a confusing "CMakeLists.txt not found".
+          submodules: recursive
 
       - name: Checkout MemeString
         if: matrix.string == 'memestring'
