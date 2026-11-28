@@ -27,7 +27,13 @@ CONFIGS = [
     ('build_msvc_asio', ''),
     ('build_msvc_asio_std', ''),
     ('build_msvc_mbedtls', 'Release'),
+    ('build_msvc_mbedtls_std', ''),
     ('build_tls_none', 'Release'),
+    ('build_msvc_tls_none_memepp', ''),
+    ('build_msvc_asio_mbedtls', ''),
+    ('build_msvc_asio_mbedtls_std', ''),
+    ('build_msvc_asio_tls_none', ''),
+    ('build_msvc_asio_tls_none_std', ''),
 ]
 
 

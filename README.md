@@ -85,10 +85,11 @@ The default configuration is: libuv backend, OpenSSL, `std::string` (MemeString
 off), and gzip/Brotli/SSE/WebSocket/DoT/DoH all enabled. `cmake --build` accepts
 `-j N`; keep it modest on a shared machine.
 
-Verification uses eight configurations — backend (libuv / Asio) × string mode
-(std / MemeString) × TLS (OpenSSL / mbedTLS / disabled), plus the `no_uvw`
-dependency-trimming variants. The exact list is in `tests/run_matrix.py`
-(`CONFIGS`), and each entry is just the usual CMake flags
+Verification uses the complete backend × TLS × string matrix — 2 backends
+(libuv / Asio) × 3 TLS modes (OpenSSL / mbedTLS / disabled) × 2 string modes
+(std / MemeString) — plus two `no_uvw` dependency-trimming variants, fourteen
+configurations in total. `tests/build_matrix.py` builds them and
+`tests/run_matrix.py` runs them; each entry is just the usual CMake flags
 (`-DMGHTTP_BACKEND_LIBUV=OFF -DMGHTTP_BACKEND_ASIO=ON`, `-DMGHTTP_TLS_*`,
 `-DMGHTTP_USE_MEMESTRING=OFF`, `-DMGHTTP_USE_UVW=OFF`).
 
