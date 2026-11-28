@@ -272,32 +272,40 @@ if(MGHTTP_TLS_MBEDTLS)
     set(MBEDTLS_ROOT "${MGHTTP_DEPS_DIR}/mbedtls-3.6.7")
     if(MSVC)
         set(MBEDTLS_LIB_DIR "${MBEDTLS_ROOT}/build_msvc/library/Release")
+        set(MBEDTLS_LIB_SUFFIX ".lib")
     else()
+        # A non-MSVC build produces GNU archives in the same directory layout.
         set(MBEDTLS_LIB_DIR "${MBEDTLS_ROOT}/build_mingw/library")
+        set(MBEDTLS_LIB_SUFFIX ".a")
     endif()
 
     if(EXISTS "${MBEDTLS_ROOT}/include/mbedtls/ssl.h" AND
-       EXISTS "${MBEDTLS_LIB_DIR}/mbedtls.lib")
+       EXISTS "${MBEDTLS_LIB_DIR}/mbedtls${MBEDTLS_LIB_SUFFIX}")
         set(MGHTTP_MBEDTLS_AVAILABLE ON)
         add_library(mbedtls_ext STATIC IMPORTED)
         set_target_properties(mbedtls_ext PROPERTIES
-            IMPORTED_LOCATION "${MBEDTLS_LIB_DIR}/mbedtls.lib")
+            IMPORTED_LOCATION "${MBEDTLS_LIB_DIR}/mbedtls${MBEDTLS_LIB_SUFFIX}")
         add_library(mbedx509_ext STATIC IMPORTED)
         set_target_properties(mbedx509_ext PROPERTIES
-            IMPORTED_LOCATION "${MBEDTLS_LIB_DIR}/mbedx509.lib")
+            IMPORTED_LOCATION "${MBEDTLS_LIB_DIR}/mbedx509${MBEDTLS_LIB_SUFFIX}")
         add_library(mbedcrypto_ext STATIC IMPORTED)
         set_target_properties(mbedcrypto_ext PROPERTIES
-            IMPORTED_LOCATION "${MBEDTLS_LIB_DIR}/mbedcrypto.lib")
+            IMPORTED_LOCATION "${MBEDTLS_LIB_DIR}/mbedcrypto${MBEDTLS_LIB_SUFFIX}")
+        set(MGHTTP_MBEDTLS_TARGETS mbedtls_ext mbedx509_ext mbedcrypto_ext)
         message(STATUS "mbedTLS: in-tree ${MBEDTLS_ROOT} (3.6.7)")
     else()
         find_package(MbedTLS QUIET)
         if(MbedTLS_FOUND)
             set(MGHTTP_MBEDTLS_AVAILABLE ON)
+            # A system package brings its own imported targets (and include dirs).
+            set(MGHTTP_MBEDTLS_TARGETS
+                MbedTLS::mbedtls MbedTLS::mbedx509 MbedTLS::mbedcrypto)
             message(STATUS "mbedTLS: system package")
         else()
             message(FATAL_ERROR
                 "MGHTTP_TLS_MBEDTLS=ON but mbedTLS was not found. "
-                "Expected ${MBEDTLS_LIB_DIR}/mbedtls.lib, or a system package. "
+                "Expected ${MBEDTLS_LIB_DIR}/mbedtls${MBEDTLS_LIB_SUFFIX}, "
+                "a system package, or -DCMAKE_PREFIX_PATH to an installed mbedTLS. "
                 "Build deps/mbedtls-3.6.7 first (see docs/process/resume-here.md).")
         endif()
     endif()
@@ -469,9 +477,13 @@ endif()
 
 if(MGHTTP_TLS_MBEDTLS)
     target_compile_definitions(megohttp INTERFACE MGHTTP_TLS_MBEDTLS=1)
-    target_include_directories(megohttp INTERFACE
-        $<BUILD_INTERFACE:${MBEDTLS_ROOT}/include>)
-    target_link_libraries(megohttp INTERFACE mbedtls_ext mbedx509_ext mbedcrypto_ext)
+    if(EXISTS "${MBEDTLS_ROOT}/include/mbedtls/ssl.h")
+        # In-tree build: headers sit beside the source. A system package carries
+        # its include directories on the imported targets instead.
+        target_include_directories(megohttp INTERFACE
+            $<BUILD_INTERFACE:${MBEDTLS_ROOT}/include>)
+    endif()
+    target_link_libraries(megohttp INTERFACE ${MGHTTP_MBEDTLS_TARGETS})
     if(MSVC)
         # mbedTLS needs bcrypt for CTR-DRBG entropy
         target_link_libraries(megohttp INTERFACE bcrypt)
@@ -654,7 +666,27 @@ if(MGHTTP_USE_MEMESTRING)
         get_filename_component(MEMESTRING_RUNTIME_DIR "${MEMESTRING_RUNTIME}" DIRECTORY)
         target_compile_definitions(megohttp INTERFACE MGHTTP_MEMESTRING_DIR="${MEMESTRING_RUNTIME_DIR}")
     else()
-        target_link_libraries(megohttp INTERFACE "${MEMESTRING_ROOT}/libmeme_string.so")
+        # Non-Windows: link the shared library built by MemeString itself.
+        # -DMEMESTRING_RUNTIME=<libmeme_string.so|.dylib> overrides the search.
+        if(NOT MEMESTRING_RUNTIME)
+            foreach(_cand
+                "${MEMESTRING_ROOT}/libmeme_string.so"
+                "${MEMESTRING_ROOT}/libmeme_string.dylib"
+                "${MEMESTRING_ROOT}/../MemeString/build/libmeme_string.so"
+                "${MEMESTRING_ROOT}/../MemeString/build/libmeme_string.dylib")
+                if(EXISTS "${_cand}")
+                    set(MEMESTRING_RUNTIME "${_cand}")
+                    break()
+                endif()
+            endforeach()
+        endif()
+        if(NOT MEMESTRING_RUNTIME)
+            message(FATAL_ERROR
+                "MemeString shared library not found. Build MemeString and pass "
+                "-DMEMESTRING_RUNTIME=<path to libmeme_string.so/.dylib>.")
+        endif()
+        message(STATUS "MemeString runtime: ${MEMESTRING_RUNTIME}")
+        target_link_libraries(megohttp INTERFACE "${MEMESTRING_RUNTIME}")
     endif()
 endif()
 

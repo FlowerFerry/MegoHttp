@@ -115,11 +115,28 @@ Two harness caveats:
 
 ### CI
 
-`.github/workflows/ci.yml` runs Android arm64 and iOS arm64 cross-compile smoke
-builds, a macOS trust-source test, a Windows MSVC matrix, a Linux native matrix
-(which executes a whitelisted subset of suites) and Linux cross-compile jobs.
-The cross-compile jobs are compile-only by construction and do not claim runtime
-evidence.
+`.github/workflows/ci.yml` covers the platform/backend/TLS/string axes. Job names
+follow `platform toolchain | backend + tls + string | features | scope`, so the
+enabled combination is readable without opening the file.
+
+- **Runtime** (builds and runs the suite): Windows MSVC x64/x86 on Asio +
+  TLS_NONE; Windows MSVC x64 on libuv + mbedTLS with every optional feature on
+  (the Windows runner is the only place the process-spawning fixtures can run);
+  Linux GCC/Clang x64/x86 on Asio + TLS_NONE (eight portable suites through a
+  `ctest` filter); a Clang ASan+UBSan job on the same eight suites.
+- **Build only**: Linux libuv + OpenSSL (also installs the package and builds
+  `tests/consumer` against it), Linux Asio + mbedTLS, Linux libuv + OpenSSL +
+  MemeString, macOS libuv + OpenSSL, a libuv + uvw build, a C++20 coroutines
+  build that additionally runs `test_task`, and a 12-cell
+  backend × TLS × string matrix.
+- **Compile only**: Android arm64, iOS arm64 and Linux aarch64/armv7l
+  cross-compile smoke targets.
+
+The Linux/macOS build-only jobs do not run the suite because the Python
+fixtures that serve proxies, DoT/DoH endpoints and two-layer TLS spawn
+processes through Windows APIs; runtime coverage outside Windows is limited to
+the portable-core and sanitizer jobs until those fixtures gain POSIX process
+management.
 
 ### Examples
 

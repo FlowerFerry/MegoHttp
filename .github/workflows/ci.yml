@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   android-cross:
-    name: Android arm64 cross-compile
+    name: Android arm64 | asio + tls-none + std | features off | cross-compile only
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -56,7 +56,7 @@ jobs:
           ls -l build-android/libmegohttp_cross_smoke.a
 
   ios-cross:
-    name: iOS arm64 cross-compile
+    name: iOS arm64 | asio + tls-none + std | features off | cross-compile only
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -91,7 +91,7 @@ jobs:
           ls -l build-ios/Release-iphoneos/libmegohttp_cross_smoke.a
 
   macos-trust:
-    name: macOS Keychain trust source
+    name: macOS arm64 | asio + tls-none + std | features off | trust test
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -132,7 +132,7 @@ jobs:
           ./build-macos-trust/tests/test_tls_trust
 
   windows-msvc:
-    name: Windows MSVC ${{ matrix.arch }}
+    name: Windows MSVC ${{ matrix.arch }} | asio + tls-none + std | features off | build + full test
     runs-on: windows-2022
     strategy:
       fail-fast: false
@@ -203,7 +203,7 @@ jobs:
           ctest --test-dir build --output-on-failure
 
   linux-native:
-    name: Linux ${{ matrix.name }}
+    name: Linux ${{ matrix.name }} | asio + tls-none + std | features off | build + 8-suite test
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -296,8 +296,762 @@ jobs:
           ctest --test-dir build --output-on-failure \
             -R '^(test_core|test_http|test_dns_wire|test_content_type|test_content_range|test_multipart|test_multipart_response)$'
 
+  # ---------------------------------------------------------------------------
+  # Full-feature native builds (compile coverage for every platform branch).
+  #
+  # The jobs above deliberately compile the portable core only. These turn on
+  # everything — libuv, OpenSSL/mbedTLS, gzip/brotli, SSE, WebSocket(+deflate),
+  # DoT/DoH — and compile the whole test tree as well, so the non-Windows code
+  # paths are built instead of merely parsed.
+  #
+  # They do NOT run the suite. The Python fixtures that serve proxies, DoT/DoH
+  # endpoints and two-layer TLS spawn processes through Windows APIs
+  # (`tests/proxy_server_fixture.hpp` is a stub off Windows), so a full ctest
+  # here would fail for harness reasons, not library reasons. Runtime coverage
+  # stays with `linux-native` (portable core) until those fixtures get POSIX
+  # spawn/kill support. Evidence category: compile-only.
+  # ---------------------------------------------------------------------------
+
+  linux-full-libuv:
+    name: Linux GCC x64 | libuv + openssl + std | all features | build + install/consumer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout fmt 12.1.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: fmtlib/fmt
+          ref: 12.1.0
+          path: deps/fmt-12.1.0
+          fetch-depth: 1
+
+      - name: Checkout libuv 1.53.0
+        uses: actions/checkout@v4
+        with:
+          repository: libuv/libuv
+          ref: v1.53.0
+          path: deps/libuv-1.53.0
+          fetch-depth: 1
+
+      - name: Checkout brotli 1.1.0
+        uses: actions/checkout@v4
+        with:
+          repository: google/brotli
+          ref: v1.1.0
+          path: deps/brotli-1.1.0
+          fetch-depth: 1
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build g++ libssl-dev zlib1g-dev
+
+      - name: Build libuv and brotli into the layout CMake expects
+        run: |
+          cmake -S deps/libuv-1.53.0 -B deps/libuv-1.53.0/build_mingw -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLIBUV_BUILD_SHARED=OFF \
+            -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY="$PWD/deps/libuv-1.53.0/build_mingw"
+          cmake --build deps/libuv-1.53.0/build_mingw -j 4
+          cmake -S deps/brotli-1.1.0 -B deps/brotli-1.1.0/build_mingw -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBROTLI_DISABLE_TESTS=ON \
+            -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY="$PWD/deps/brotli-1.1.0/build_mingw"
+          cmake --build deps/brotli-1.1.0/build_mingw -j 4
+          ls -l deps/libuv-1.53.0/build_mingw/libuv*.a
+          ls -l deps/brotli-1.1.0/build_mingw/libbrotli*.a
+
+      - name: Configure and build (libuv + OpenSSL, every optional feature on)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMGHTTP_BACKEND_LIBUV=ON \
+            -DMGHTTP_BACKEND_ASIO=OFF \
+            -DMGHTTP_TLS_OPENSSL=ON \
+            -DMGHTTP_TLS_MBEDTLS=OFF \
+            -DMGHTTP_TLS_NONE=OFF \
+            -DMGHTTP_USE_MEMESTRING=OFF \
+            -DMGHTTP_USE_UVW=OFF \
+            -DMGHTTP_ENABLE_GZIP=ON \
+            -DMGHTTP_ENABLE_BROTLI=ON \
+            -DMGHTTP_ENABLE_SSE=ON \
+            -DMGHTTP_ENABLE_WEBSOCKET=ON \
+            -DMGHTTP_ENABLE_WEBSOCKET_DEFLATE=ON \
+            -DMGHTTP_ENABLE_DOT=ON \
+            -DMGHTTP_ENABLE_DOH=ON \
+            -DMGHTTP_BUILD_TESTS=ON \
+            -DMGHTTP_BUILD_EXAMPLES=OFF
+          cmake --build build -j 4
+
+      - name: Install the package and consume it with find_package
+        run: |
+          cmake --install build --prefix "$PWD/install"
+          cmake -S tests/consumer -B consumer-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$PWD/install"
+          cmake --build consumer-build -j 4
+          ./consumer-build/consumer
+
+  linux-full-asio-mbedtls:
+    name: Linux GCC x64 | asio + mbedtls + std | all features | build only
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout fmt 12.1.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: fmtlib/fmt
+          ref: 12.1.0
+          path: deps/fmt-12.1.0
+          fetch-depth: 1
+
+      - name: Checkout Asio 1.38.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: chriskohlhoff/asio
+          ref: asio-1-38-0
+          path: deps/asio-asio-1-38-0
+          fetch-depth: 1
+
+      - name: Checkout mbedTLS 3.6.7
+        uses: actions/checkout@v4
+        with:
+          repository: Mbed-TLS/mbedtls
+          ref: v3.6.7
+          path: deps/mbedtls-3.6.7
+          fetch-depth: 1
+
+      - name: Checkout brotli 1.1.0
+        uses: actions/checkout@v4
+        with:
+          repository: google/brotli
+          ref: v1.1.0
+          path: deps/brotli-1.1.0
+          fetch-depth: 1
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build g++ zlib1g-dev
+
+      - name: Build mbedTLS and brotli into the layout CMake expects
+        run: |
+          cmake -S deps/mbedtls-3.6.7 -B deps/mbedtls-3.6.7/build_mingw -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_TESTING=OFF -DENABLE_PROGRAMS=OFF \
+            -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY="$PWD/deps/mbedtls-3.6.7/build_mingw/library"
+          cmake --build deps/mbedtls-3.6.7/build_mingw -j 4
+          cmake -S deps/brotli-1.1.0 -B deps/brotli-1.1.0/build_mingw -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBROTLI_DISABLE_TESTS=ON \
+            -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY="$PWD/deps/brotli-1.1.0/build_mingw"
+          cmake --build deps/brotli-1.1.0/build_mingw -j 4
+          ls -l deps/mbedtls-3.6.7/build_mingw/library/libmbed*.a
+
+      - name: Configure and build (Asio + mbedTLS, every optional feature on)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMGHTTP_BACKEND_LIBUV=OFF \
+            -DMGHTTP_BACKEND_ASIO=ON \
+            -DMGHTTP_TLS_OPENSSL=OFF \
+            -DMGHTTP_TLS_MBEDTLS=ON \
+            -DMGHTTP_TLS_NONE=OFF \
+            -DMGHTTP_USE_MEMESTRING=OFF \
+            -DMGHTTP_USE_UVW=OFF \
+            -DMGHTTP_ENABLE_GZIP=ON \
+            -DMGHTTP_ENABLE_BROTLI=ON \
+            -DMGHTTP_ENABLE_SSE=ON \
+            -DMGHTTP_ENABLE_WEBSOCKET=ON \
+            -DMGHTTP_ENABLE_WEBSOCKET_DEFLATE=ON \
+            -DMGHTTP_ENABLE_DOT=ON \
+            -DMGHTTP_ENABLE_DOH=ON \
+            -DMGHTTP_BUILD_TESTS=ON \
+            -DMGHTTP_BUILD_EXAMPLES=OFF
+          cmake --build build -j 4
+
+  linux-full-memestring:
+    name: Linux GCC x64 | libuv + openssl + memestring | all features | build only
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout fmt 12.1.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: fmtlib/fmt
+          ref: 12.1.0
+          path: deps/fmt-12.1.0
+          fetch-depth: 1
+
+      - name: Checkout libuv 1.53.0
+        uses: actions/checkout@v4
+        with:
+          repository: libuv/libuv
+          ref: v1.53.0
+          path: deps/libuv-1.53.0
+          fetch-depth: 1
+
+      - name: Checkout brotli 1.1.0
+        uses: actions/checkout@v4
+        with:
+          repository: google/brotli
+          ref: v1.1.0
+          path: deps/brotli-1.1.0
+          fetch-depth: 1
+
+      # MemeString has no 0.0.5 tag upstream (latest is v0.0.4-alpha), so this
+      # tracks the default branch. If it drifts, pin the commit whose headers
+      # match the vendored copy instead.
+      - name: Checkout MemeString
+        uses: actions/checkout@v4
+        with:
+          repository: FlowerFerry/MemeString
+          path: deps/MemeString
+          fetch-depth: 1
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build g++ libssl-dev zlib1g-dev
+
+      - name: Build libuv, brotli and MemeString
+        run: |
+          cmake -S deps/libuv-1.53.0 -B deps/libuv-1.53.0/build_mingw -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLIBUV_BUILD_SHARED=OFF \
+            -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY="$PWD/deps/libuv-1.53.0/build_mingw"
+          cmake --build deps/libuv-1.53.0/build_mingw -j 4
+          cmake -S deps/brotli-1.1.0 -B deps/brotli-1.1.0/build_mingw -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBROTLI_DISABLE_TESTS=ON \
+            -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY="$PWD/deps/brotli-1.1.0/build_mingw"
+          cmake --build deps/brotli-1.1.0/build_mingw -j 4
+          cmake -S deps/MemeString -B deps/MemeString/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build deps/MemeString/build -j 4
+          find deps/MemeString/build -maxdepth 2 -name 'libmeme_string*' -print
+          cp -v deps/MemeString/build/libmeme_string.so deps/MemeString/libmeme_string.so
+
+      - name: Configure and build (libuv + OpenSSL + MemeString layer)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMGHTTP_BACKEND_LIBUV=ON \
+            -DMGHTTP_BACKEND_ASIO=OFF \
+            -DMGHTTP_TLS_OPENSSL=ON \
+            -DMGHTTP_TLS_MBEDTLS=OFF \
+            -DMGHTTP_TLS_NONE=OFF \
+            -DMGHTTP_USE_MEMESTRING=ON \
+            -DMEMESTRING_RUNTIME="$PWD/deps/MemeString/libmeme_string.so" \
+            -DMGHTTP_USE_UVW=OFF \
+            -DMGHTTP_ENABLE_GZIP=ON \
+            -DMGHTTP_ENABLE_BROTLI=ON \
+            -DMGHTTP_ENABLE_SSE=ON \
+            -DMGHTTP_ENABLE_WEBSOCKET=ON \
+            -DMGHTTP_ENABLE_WEBSOCKET_DEFLATE=ON \
+            -DMGHTTP_ENABLE_DOT=ON \
+            -DMGHTTP_ENABLE_DOH=ON \
+            -DMGHTTP_BUILD_TESTS=ON \
+            -DMGHTTP_BUILD_EXAMPLES=OFF
+          cmake --build build -j 4
+
+  macos-full:
+    name: macOS arm64 | libuv + openssl + std | all features | build only
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout fmt 12.1.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: fmtlib/fmt
+          ref: 12.1.0
+          path: deps/fmt-12.1.0
+          fetch-depth: 1
+
+      - name: Checkout libuv 1.53.0
+        uses: actions/checkout@v4
+        with:
+          repository: libuv/libuv
+          ref: v1.53.0
+          path: deps/libuv-1.53.0
+          fetch-depth: 1
+
+      - name: Checkout brotli 1.1.0
+        uses: actions/checkout@v4
+        with:
+          repository: google/brotli
+          ref: v1.1.0
+          path: deps/brotli-1.1.0
+          fetch-depth: 1
+
+      - name: Install toolchain
+        run: brew install ninja openssl@3
+
+      - name: Build libuv and brotli into the layout CMake expects
+        run: |
+          cmake -S deps/libuv-1.53.0 -B deps/libuv-1.53.0/build_mingw -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLIBUV_BUILD_SHARED=OFF \
+            -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY="$PWD/deps/libuv-1.53.0/build_mingw"
+          cmake --build deps/libuv-1.53.0/build_mingw -j 4
+          cmake -S deps/brotli-1.1.0 -B deps/brotli-1.1.0/build_mingw -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBROTLI_DISABLE_TESTS=ON \
+            -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY="$PWD/deps/brotli-1.1.0/build_mingw"
+          cmake --build deps/brotli-1.1.0/build_mingw -j 4
+          ls -l deps/libuv-1.53.0/build_mingw/libuv*.a
+          ls -l deps/brotli-1.1.0/build_mingw/libbrotli*.a
+
+      - name: Configure and build (libuv + OpenSSL, every optional feature on)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix openssl@3)" \
+            -DMGHTTP_BACKEND_LIBUV=ON \
+            -DMGHTTP_BACKEND_ASIO=OFF \
+            -DMGHTTP_TLS_OPENSSL=ON \
+            -DMGHTTP_TLS_MBEDTLS=OFF \
+            -DMGHTTP_TLS_NONE=OFF \
+            -DMGHTTP_USE_MEMESTRING=OFF \
+            -DMGHTTP_USE_UVW=OFF \
+            -DMGHTTP_ENABLE_GZIP=ON \
+            -DMGHTTP_ENABLE_BROTLI=ON \
+            -DMGHTTP_ENABLE_SSE=ON \
+            -DMGHTTP_ENABLE_WEBSOCKET=ON \
+            -DMGHTTP_ENABLE_WEBSOCKET_DEFLATE=ON \
+            -DMGHTTP_ENABLE_DOT=ON \
+            -DMGHTTP_ENABLE_DOH=ON \
+            -DMGHTTP_BUILD_TESTS=ON \
+            -DMGHTTP_BUILD_EXAMPLES=OFF
+          cmake --build build -j 4
+
+  # ---------------------------------------------------------------------------
+  # Remaining axis coverage: the MSVC all-feature build, C++20/coroutines, uvw,
+  # the full backend x TLS x string matrix, and a sanitizer run.
+  #
+  # Job-name convention (used everywhere in this file):
+  #   <platform> <toolchain> | <backend> + <tls> + <string> | <features> | <scope>
+  # so the enabled combination is readable without opening the file.
+  # ---------------------------------------------------------------------------
+
+  windows-full:
+    name: Windows MSVC x64 | libuv + mbedtls + std | all features | build + full test
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout fmt 12.1.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: fmtlib/fmt
+          ref: 12.1.0
+          path: deps/fmt-12.1.0
+          fetch-depth: 1
+
+      - name: Checkout libuv 1.53.0
+        uses: actions/checkout@v4
+        with:
+          repository: libuv/libuv
+          ref: v1.53.0
+          path: deps/libuv-1.53.0
+          fetch-depth: 1
+
+      - name: Checkout zlib 1.3.1
+        uses: actions/checkout@v4
+        with:
+          repository: madler/zlib
+          ref: v1.3.1
+          path: deps/zlib-1.3.1
+          fetch-depth: 1
+
+      - name: Checkout brotli 1.1.0
+        uses: actions/checkout@v4
+        with:
+          repository: google/brotli
+          ref: v1.1.0
+          path: deps/brotli-1.1.0
+          fetch-depth: 1
+
+      - name: Checkout mbedTLS 3.6.7
+        uses: actions/checkout@v4
+        with:
+          repository: Mbed-TLS/mbedtls
+          ref: v3.6.7
+          path: deps/mbedtls-3.6.7
+          fetch-depth: 1
+
+      - name: Select MSVC x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build the pinned dependencies (VS generator, Release)
+        shell: bash
+        run: |
+          set -e
+          cmake -S deps/libuv-1.53.0 -B deps/libuv-1.53.0/build_msvc \
+            -G "Visual Studio 17 2022" -A x64 -DLIBUV_BUILD_SHARED=OFF
+          cmake --build deps/libuv-1.53.0/build_msvc --config Release -j 4
+          cmake -S deps/zlib-1.3.1 -B deps/zlib-1.3.1/build_msvc \
+            -G "Visual Studio 17 2022" -A x64
+          cmake --build deps/zlib-1.3.1/build_msvc --config Release -j 4
+          cmake -S deps/brotli-1.1.0 -B deps/brotli-1.1.0/build_msvc \
+            -G "Visual Studio 17 2022" -A x64 -DBROTLI_DISABLE_TESTS=ON
+          cmake --build deps/brotli-1.1.0/build_msvc --config Release -j 4
+          cmake -S deps/mbedtls-3.6.7 -B deps/mbedtls-3.6.7/build_msvc \
+            -G "Visual Studio 17 2022" -A x64 \
+            -DENABLE_TESTING=OFF -DENABLE_PROGRAMS=OFF
+          cmake --build deps/mbedtls-3.6.7/build_msvc --config Release -j 4
+          ls deps/libuv-1.53.0/build_msvc/Release/libuv.lib
+          ls deps/zlib-1.3.1/build_msvc/Release/zlibstatic.lib
+          ls deps/brotli-1.1.0/build_msvc/Release/brotlidec.lib
+          ls deps/mbedtls-3.6.7/build_msvc/library/Release/mbedtls.lib
+
+      - name: Install Python TLS/crypto helper
+        shell: bash
+        run: python -m pip install --quiet cryptography
+
+      - name: Generate TLS fixtures
+        shell: bash
+        run: python tests/gen_tls_fixtures.py tests/tls_fixtures
+
+      - name: Configure and build (libuv + mbedTLS, every optional feature on)
+        shell: bash
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMGHTTP_BACKEND_LIBUV=ON \
+            -DMGHTTP_BACKEND_ASIO=OFF \
+            -DMGHTTP_TLS_OPENSSL=OFF \
+            -DMGHTTP_TLS_MBEDTLS=ON \
+            -DMGHTTP_TLS_NONE=OFF \
+            -DMGHTTP_USE_MEMESTRING=OFF \
+            -DMGHTTP_USE_UVW=OFF \
+            -DMGHTTP_ENABLE_GZIP=ON \
+            -DMGHTTP_ENABLE_BROTLI=ON \
+            -DMGHTTP_ENABLE_SSE=ON \
+            -DMGHTTP_ENABLE_WEBSOCKET=ON \
+            -DMGHTTP_ENABLE_WEBSOCKET_DEFLATE=ON \
+            -DMGHTTP_ENABLE_DOT=ON \
+            -DMGHTTP_ENABLE_DOH=ON \
+            -DMGHTTP_BUILD_TESTS=ON \
+            -DMGHTTP_BUILD_EXAMPLES=OFF
+          cmake --build build -j 4
+
+      - name: Run the whole suite
+        shell: bash
+        run: ctest --test-dir build --output-on-failure
+
+  linux-cxx20:
+    name: Linux C++20 GCC x64 | asio + openssl + std | coroutines on | build + test_task
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout fmt 12.1.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: fmtlib/fmt
+          ref: 12.1.0
+          path: deps/fmt-12.1.0
+          fetch-depth: 1
+
+      - name: Checkout Asio 1.38.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: chriskohlhoff/asio
+          ref: asio-1-38-0
+          path: deps/asio-asio-1-38-0
+          fetch-depth: 1
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build g++ libssl-dev
+
+      - name: Configure and build (C++20, coroutines on)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_STANDARD=20 \
+            -DMGHTTP_BACKEND_LIBUV=OFF \
+            -DMGHTTP_BACKEND_ASIO=ON \
+            -DMGHTTP_TLS_OPENSSL=ON \
+            -DMGHTTP_TLS_MBEDTLS=OFF \
+            -DMGHTTP_TLS_NONE=OFF \
+            -DMGHTTP_USE_MEMESTRING=OFF \
+            -DMGHTTP_USE_UVW=OFF \
+            -DMGHTTP_ENABLE_GZIP=OFF \
+            -DMGHTTP_ENABLE_BROTLI=OFF \
+            -DMGHTTP_ENABLE_SSE=OFF \
+            -DMGHTTP_ENABLE_WEBSOCKET=OFF \
+            -DMGHTTP_ENABLE_WEBSOCKET_DEFLATE=OFF \
+            -DMGHTTP_ENABLE_DOT=OFF \
+            -DMGHTTP_ENABLE_DOH=OFF \
+            -DMGHTTP_ENABLE_COROUTINES=ON \
+            -DMGHTTP_BUILD_TESTS=ON \
+            -DMGHTTP_BUILD_EXAMPLES=OFF
+          cmake --build build -j 4
+
+      - name: Run the coroutine suite
+        run: ./build/tests/test_task
+
+  linux-uvw:
+    name: Linux GCC x64 | libuv + openssl + std | uvw on | build only
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout fmt 12.1.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: fmtlib/fmt
+          ref: 12.1.0
+          path: deps/fmt-12.1.0
+          fetch-depth: 1
+
+      - name: Checkout libuv 1.53.0
+        uses: actions/checkout@v4
+        with:
+          repository: libuv/libuv
+          ref: v1.53.0
+          path: deps/libuv-1.53.0
+          fetch-depth: 1
+
+      - name: Checkout uvw 3.4.0
+        uses: actions/checkout@v4
+        with:
+          repository: skypjack/uvw
+          ref: v3.4.0_libuv_v1.48
+          path: deps/uvw-3.4.0_libuv_v1.48
+          fetch-depth: 1
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build g++ libssl-dev
+
+      - name: Build libuv
+        run: |
+          cmake -S deps/libuv-1.53.0 -B deps/libuv-1.53.0/build_mingw -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLIBUV_BUILD_SHARED=OFF \
+            -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY="$PWD/deps/libuv-1.53.0/build_mingw"
+          cmake --build deps/libuv-1.53.0/build_mingw -j 4
+
+      - name: Configure and build (uvw on)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMGHTTP_BACKEND_LIBUV=ON \
+            -DMGHTTP_BACKEND_ASIO=OFF \
+            -DMGHTTP_TLS_OPENSSL=ON \
+            -DMGHTTP_TLS_MBEDTLS=OFF \
+            -DMGHTTP_TLS_NONE=OFF \
+            -DMGHTTP_USE_MEMESTRING=OFF \
+            -DMGHTTP_USE_UVW=ON \
+            -DMGHTTP_ENABLE_GZIP=OFF \
+            -DMGHTTP_ENABLE_BROTLI=OFF \
+            -DMGHTTP_ENABLE_SSE=OFF \
+            -DMGHTTP_ENABLE_WEBSOCKET=OFF \
+            -DMGHTTP_ENABLE_WEBSOCKET_DEFLATE=OFF \
+            -DMGHTTP_ENABLE_DOT=OFF \
+            -DMGHTTP_ENABLE_DOH=OFF \
+            -DMGHTTP_BUILD_TESTS=ON \
+            -DMGHTTP_BUILD_EXAMPLES=OFF
+          cmake --build build -j 4
+
+  linux-axis-matrix:
+    name: Linux GCC x64 | ${{ matrix.backend }} + ${{ matrix.tls }} + ${{ matrix.string }} | sse+ws, codecs off | build only
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { backend: libuv, tls: none,    string: std,       dotdoh: OFF }
+          - { backend: libuv, tls: none,    string: memestring, dotdoh: OFF }
+          - { backend: libuv, tls: openssl, string: std,       dotdoh: ON }
+          - { backend: libuv, tls: openssl, string: memestring, dotdoh: ON }
+          - { backend: libuv, tls: mbedtls, string: std,       dotdoh: ON }
+          - { backend: libuv, tls: mbedtls, string: memestring, dotdoh: ON }
+          - { backend: asio,  tls: none,    string: std,       dotdoh: OFF }
+          - { backend: asio,  tls: none,    string: memestring, dotdoh: OFF }
+          - { backend: asio,  tls: openssl, string: std,       dotdoh: ON }
+          - { backend: asio,  tls: openssl, string: memestring, dotdoh: ON }
+          - { backend: asio,  tls: mbedtls, string: std,       dotdoh: ON }
+          - { backend: asio,  tls: mbedtls, string: memestring, dotdoh: ON }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout fmt 12.1.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: fmtlib/fmt
+          ref: 12.1.0
+          path: deps/fmt-12.1.0
+          fetch-depth: 1
+
+      - name: Checkout Asio 1.38.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: chriskohlhoff/asio
+          ref: asio-1-38-0
+          path: deps/asio-asio-1-38-0
+          fetch-depth: 1
+
+      - name: Checkout libuv 1.53.0
+        if: matrix.backend == 'libuv'
+        uses: actions/checkout@v4
+        with:
+          repository: libuv/libuv
+          ref: v1.53.0
+          path: deps/libuv-1.53.0
+          fetch-depth: 1
+
+      - name: Checkout mbedTLS 3.6.7
+        if: matrix.tls == 'mbedtls'
+        uses: actions/checkout@v4
+        with:
+          repository: Mbed-TLS/mbedtls
+          ref: v3.6.7
+          path: deps/mbedtls-3.6.7
+          fetch-depth: 1
+
+      - name: Checkout MemeString
+        if: matrix.string == 'memestring'
+        uses: actions/checkout@v4
+        with:
+          repository: FlowerFerry/MemeString
+          path: deps/MemeString
+          fetch-depth: 1
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build g++ libssl-dev
+
+      - name: Build libuv
+        if: matrix.backend == 'libuv'
+        run: |
+          cmake -S deps/libuv-1.53.0 -B deps/libuv-1.53.0/build_mingw -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLIBUV_BUILD_SHARED=OFF \
+            -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY="$PWD/deps/libuv-1.53.0/build_mingw"
+          cmake --build deps/libuv-1.53.0/build_mingw -j 4
+
+      - name: Build mbedTLS
+        if: matrix.tls == 'mbedtls'
+        run: |
+          cmake -S deps/mbedtls-3.6.7 -B deps/mbedtls-3.6.7/build_mingw -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_TESTING=OFF -DENABLE_PROGRAMS=OFF \
+            -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY="$PWD/deps/mbedtls-3.6.7/build_mingw/library"
+          cmake --build deps/mbedtls-3.6.7/build_mingw -j 4
+
+      - name: Build MemeString
+        if: matrix.string == 'memestring'
+        run: |
+          cmake -S deps/MemeString -B deps/MemeString/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build deps/MemeString/build -j 4
+          cp -v deps/MemeString/build/libmeme_string.so deps/MemeString/libmeme_string.so
+
+      - name: Configure and build the axis combination
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMGHTTP_BACKEND_LIBUV=${{ matrix.backend == 'libuv' && 'ON' || 'OFF' }} \
+            -DMGHTTP_BACKEND_ASIO=${{ matrix.backend == 'asio' && 'ON' || 'OFF' }} \
+            -DMGHTTP_TLS_NONE=${{ matrix.tls == 'none' && 'ON' || 'OFF' }} \
+            -DMGHTTP_TLS_OPENSSL=${{ matrix.tls == 'openssl' && 'ON' || 'OFF' }} \
+            -DMGHTTP_TLS_MBEDTLS=${{ matrix.tls == 'mbedtls' && 'ON' || 'OFF' }} \
+            -DMGHTTP_USE_MEMESTRING=${{ matrix.string == 'memestring' && 'ON' || 'OFF' }} \
+            -DMEMESTRING_RUNTIME="$PWD/deps/MemeString/libmeme_string.so" \
+            -DMGHTTP_USE_UVW=OFF \
+            -DMGHTTP_ENABLE_GZIP=OFF \
+            -DMGHTTP_ENABLE_BROTLI=OFF \
+            -DMGHTTP_ENABLE_SSE=ON \
+            -DMGHTTP_ENABLE_WEBSOCKET=ON \
+            -DMGHTTP_ENABLE_WEBSOCKET_DEFLATE=OFF \
+            -DMGHTTP_ENABLE_DOT=${{ matrix.dotdoh }} \
+            -DMGHTTP_ENABLE_DOH=${{ matrix.dotdoh }} \
+            -DMGHTTP_BUILD_TESTS=OFF \
+            -DMGHTTP_BUILD_EXAMPLES=OFF
+          cmake --build build -j 4
+
+  linux-sanitizer:
+    name: Linux Clang x64 | asio + tls-none + std | features off | asan+ubsan, 8-suite test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout fmt 12.1.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: fmtlib/fmt
+          ref: 12.1.0
+          path: deps/fmt-12.1.0
+          fetch-depth: 1
+
+      - name: Checkout Asio 1.38.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: chriskohlhoff/asio
+          ref: asio-1-38-0
+          path: deps/asio-asio-1-38-0
+          fetch-depth: 1
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build clang
+
+      - name: Configure and build with ASan + UBSan
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
+            -DMGHTTP_BACKEND_LIBUV=OFF \
+            -DMGHTTP_BACKEND_ASIO=ON \
+            -DMGHTTP_TLS_NONE=ON \
+            -DMGHTTP_TLS_OPENSSL=OFF \
+            -DMGHTTP_TLS_MBEDTLS=OFF \
+            -DMGHTTP_USE_MEMESTRING=OFF \
+            -DMGHTTP_USE_UVW=OFF \
+            -DMGHTTP_ENABLE_GZIP=OFF \
+            -DMGHTTP_ENABLE_BROTLI=OFF \
+            -DMGHTTP_ENABLE_SSE=OFF \
+            -DMGHTTP_ENABLE_WEBSOCKET=OFF \
+            -DMGHTTP_ENABLE_WEBSOCKET_DEFLATE=OFF \
+            -DMGHTTP_ENABLE_DOT=OFF \
+            -DMGHTTP_ENABLE_DOH=OFF \
+            -DMGHTTP_BUILD_TESTS=ON \
+            -DMGHTTP_BUILD_EXAMPLES=OFF
+          cmake --build build -j 4
+
+      - name: Run the portable suites under the sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: |
+          ctest --test-dir build --output-on-failure \
+            -R '^(test_core|test_http|test_dns_wire|test_content_type|test_content_range|test_multipart|test_multipart_response|test_client)$'
+
   linux-cross:
-    name: Linux cross-compile ${{ matrix.arch }}
+    name: Linux ${{ matrix.arch }} | asio + tls-none + std | features off | cross-compile only
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
