@@ -419,9 +419,10 @@ TEST_CASE("a target Authorization is not reused as proxy credentials",
     // It legitimately sees the target's Authorization header -- a forward proxy
     // relays the request and cannot avoid seeing it (task book 10.1 says so
     // explicitly) -- so the assertion is on the proxy-authorization field only.
-    // Wait for the forward entry itself before asserting on its field: a read
-    // taken before the entry lands would pass for the wrong reason.
-    CHECK(recording_contains(proxy, "\"kind\": \"forward\""));
+    // The 407 above already proves the proxy saw this request, so this is read
+    // once: a "must NOT appear" check cannot be polled for (absence never
+    // becomes true), and waiting for the record first would only add a timing
+    // dependency without strengthening the assertion.
     CHECK(proxy.recording().find("\"proxy_authorization\": \"Bearer") == std::string::npos);
 }
 

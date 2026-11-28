@@ -13,13 +13,13 @@ R = r'D:\_mego_openlib\MegoHttp'
 VCVARS = r'D:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat'
 
 CONFIGS = [
-    ('build_msvc', '-G Ninja -DCMAKE_BUILD_TYPE=Release'),
+    ('build_msvc', '-G Ninja -DCMAKE_BUILD_TYPE=Release -DMGHTTP_USE_MEMESTRING=ON'),
     ('build_msvc_std', '-G Ninja -DCMAKE_BUILD_TYPE=Release -DMGHTTP_USE_MEMESTRING=OFF'),
-    ('build_msvc_no_uvw', '-G Ninja -DCMAKE_BUILD_TYPE=Release -DMGHTTP_USE_UVW=OFF'),
+    ('build_msvc_no_uvw', '-G Ninja -DCMAKE_BUILD_TYPE=Release -DMGHTTP_USE_UVW=OFF -DMGHTTP_USE_MEMESTRING=ON'),
     ('build_msvc_no_uvw_std', '-G Ninja -DCMAKE_BUILD_TYPE=Release -DMGHTTP_USE_UVW=OFF -DMGHTTP_USE_MEMESTRING=OFF'),
-    ('build_msvc_asio', '-G Ninja -DCMAKE_BUILD_TYPE=Release -DMGHTTP_BACKEND_LIBUV=OFF -DMGHTTP_BACKEND_ASIO=ON -DMGHTTP_USE_UVW=OFF'),
+    ('build_msvc_asio', '-G Ninja -DCMAKE_BUILD_TYPE=Release -DMGHTTP_BACKEND_LIBUV=OFF -DMGHTTP_BACKEND_ASIO=ON -DMGHTTP_USE_UVW=OFF -DMGHTTP_USE_MEMESTRING=ON'),
     ('build_msvc_asio_std', '-G Ninja -DCMAKE_BUILD_TYPE=Release -DMGHTTP_BACKEND_LIBUV=OFF -DMGHTTP_BACKEND_ASIO=ON -DMGHTTP_USE_UVW=OFF -DMGHTTP_USE_MEMESTRING=OFF'),
-    ('build_msvc_mbedtls', '-G "Visual Studio 17 2022" -A x64 -DMGHTTP_TLS_OPENSSL=OFF -DMGHTTP_TLS_MBEDTLS=ON -DMGHTTP_USE_UVW=OFF'),
+    ('build_msvc_mbedtls', '-G "Visual Studio 17 2022" -A x64 -DMGHTTP_TLS_OPENSSL=OFF -DMGHTTP_TLS_MBEDTLS=ON -DMGHTTP_USE_UVW=OFF -DMGHTTP_USE_MEMESTRING=ON'),
     ('build_tls_none', '-G "Visual Studio 17 2022" -A x64 -DMGHTTP_TLS_NONE=ON -DMGHTTP_TLS_OPENSSL=OFF -DMGHTTP_TLS_MBEDTLS=OFF -DMGHTTP_USE_UVW=OFF -DMGHTTP_USE_MEMESTRING=OFF -DMGHTTP_ENABLE_DOT=OFF -DMGHTTP_ENABLE_DOH=OFF'),
 ]
 

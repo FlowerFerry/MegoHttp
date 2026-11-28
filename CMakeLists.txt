@@ -19,7 +19,10 @@ option(MGHTTP_TLS_NONE "Disable TLS" OFF)
 option(MGHTTP_TLS_OPENSSL "Use OpenSSL for TLS" ON)
 option(MGHTTP_TLS_MBEDTLS "Use mbedTLS for TLS" OFF)
 
-option(MGHTTP_USE_MEMESTRING "Use MemeString instead of std::string" ON)
+# OFF by default: the std::string mode is the zero-dependency string layer, so a
+# fresh checkout builds without the MemeString runtime. Turn it ON to switch every
+# library-owned text type to memepp::string (requires deps/MemeString).
+option(MGHTTP_USE_MEMESTRING "Use MemeString instead of std::string" OFF)
 
 option(MGHTTP_ENABLE_GZIP "Enable gzip content encoding" ON)
 option(MGHTTP_ENABLE_BROTLI "Enable Brotli content encoding" ON)
