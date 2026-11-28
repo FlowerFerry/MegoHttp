@@ -70,6 +70,13 @@ is deliberately not tracked, so a fresh clone must fetch the pinned versions
 listed above. Each dependency keeps its own licence. `CMakeLists.txt` carries
 the per-dependency build commands in its comments.
 
+## Licence
+
+MegoHttp itself is distributed under the BSD 3-Clause licence; the full text is
+in [`LICENSE`](LICENSE). The dependencies in the table above are not
+vendored into the repository and each keeps its own licence — check the tree you
+fetch for the exact terms.
+
 All verification evidence is from **Windows + MSVC 2022 x64** (Ninja and the
 Visual Studio generator; the local OpenSSL is 1.1.1g). Other platforms keep a
 build path by design but have not been exercised on this host.

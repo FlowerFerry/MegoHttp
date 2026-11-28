@@ -808,6 +808,13 @@ install(DIRECTORY include/
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 
+# Ship the licence with the installed package: a consumer that vendors the
+# installed tree (not the git checkout) still needs the terms that apply to it.
+# Installed under the doc dir so it never collides with a consumer's own file.
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/MegoHttp
+)
+
 # Package configuration
 include(CMakePackageConfigHelpers)
 
@@ -857,7 +864,29 @@ if(MGHTTP_USE_MEMESTRING)
     install(FILES "${MEMESTRING_RUNTIME}"  DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
-install(FILES "${ZLIB_ROOT}/zlib.h" "${ZLIB_ROOT}/zconf.h" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} OPTIONAL)
+# Brotli's public headers are part of this library's public interface whenever
+# the feature is compiled in: content_decoder_impl.hpp includes
+# <brotli/decode.h>. Without them an installed consumer fails at compile time,
+# exactly like the missing zconf.h did.
+if(MGHTTP_ENABLE_BROTLI AND MGHTTP_BROTLI_AVAILABLE)
+    install(DIRECTORY "${BROTLI_ROOT}/c/include/" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+endif()
+
+# zlib generates zconf.h in its BUILD tree (the source tree only has
+# zconf.h.cmakein), and zlib.h includes <zconf.h>. Installing the source path
+# alone silently produced an include dir that cannot compile — OPTIONAL hid the
+# missing file. Look in both locations before installing.
+set(_mghttp_zlib_zconf "")
+foreach(_candidate
+        "${ZLIB_ROOT}/zconf.h"
+        "${ZLIB_ROOT}/${MGHTTP_DEP_BUILD}/zconf.h")
+    if(EXISTS "${_candidate}")
+        set(_mghttp_zlib_zconf "${_candidate}")
+        break()
+    endif()
+endforeach()
+install(FILES "${ZLIB_ROOT}/zlib.h" ${_mghttp_zlib_zconf}
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} OPTIONAL)
 
 install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/MegoHttpConfig.cmake"
