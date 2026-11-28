@@ -296,9 +296,10 @@ namespace megohttp {
         // Uncompressed input bytes represented by the queued frames above.
         size_t send_queue_raw_bytes_{0};
         bool sending_{false};
-        // At most one scheduled pump: AsioExecutor::is_in_loop_thread() is
-        // always false (an external io_context may have many threads), so a
-        // naive "post if not on the loop thread" would post forever.
+        // At most one scheduled pump. For an EXTERNAL io_context
+        // is_in_loop_thread() is false by contract (no single driver thread), so
+        // a naive "post if not on the loop thread" would post forever. An
+        // internal loop answers accurately and runs the pump inline.
         std::atomic<bool> pump_posted_{false};
         mutable std::mutex send_mutex_;
 

@@ -106,19 +106,18 @@ inline FutureRequest Client::get(string_view url) {
 
 inline Result<Response> Client::request_sync(const Request& req) {
     // S2.7-04: detect the "caller == loop thread" deadlock.
-    // Only reliable when the Client owns an internal loop (libuv).
-    // For Asio or external executors the caller must ensure another thread
-    // drives the loop.
-#if MGHTTP_BACKEND_LIBUV
-    if (impl_->owns_executor) {
-        if (auto uv_ex = std::dynamic_pointer_cast<libuv_backend::UvExecutor>(impl_->executor)) {
-            if (uv_ex->is_in_loop_thread()) {
-                return Error{ErrorCode::InvalidArgument, ErrorPhase::None,
-                             string("request_sync called from the executor loop thread (would deadlock)")};
-            }
-        }
+    //
+    // Backend-neutral, and it asks the executor rather than the backend:
+    //   • libuv internal loop, Asio internal io_context -> the executor started
+    //     the thread, knows its id, and answers accurately (including when the
+    //     executor was supplied by the caller instead of created by the Client).
+    //   • external loop (libuv uv_loop_t* or Asio io_context&) -> no single
+    //     driver thread to compare against, so the contract answer is false and
+    //     this cannot misfire. The caller must not block on the loop thread.
+    if (impl_->executor && impl_->executor->is_in_loop_thread()) {
+        return Error{ErrorCode::InvalidArgument, ErrorPhase::None,
+                     string("request_sync called from the executor loop thread (would deadlock)")};
     }
-#endif
     return request(req).get();
 }
 

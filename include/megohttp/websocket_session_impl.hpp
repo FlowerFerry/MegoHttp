@@ -1167,10 +1167,11 @@ namespace megohttp {
         // any thread (task book 12.1); enqueueing is mutex-protected, but the
         // actual async_write must run on the executor.
         //
-        // AsioExecutor::is_in_loop_thread() is always false because an external
-        // io_context may be driven by many threads. Posting on every call would
-        // therefore post forever; `pump_posted_` allows at most one scheduled
-        // pump, and the posted lambda runs the write directly.
+        // A send may arrive on any thread. For an EXTERNAL io_context
+        // is_in_loop_thread() is false by contract (it may be driven by many
+        // threads), so posting on every call would post forever; `pump_posted_`
+        // allows at most one scheduled pump. An internal loop answers accurately
+        // and runs the write inline.
         if (pump_posted_.exchange(true)) return;
         auto self = shared_from_this();
         auto run = [this, self]() {

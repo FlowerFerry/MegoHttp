@@ -4,9 +4,11 @@
 // standalone Asio backend: Executor + Timer over asio::io_context.
 //
 // Contract differences from the libuv backend that callers must know:
-//   • An external io_context may be driven by SEVERAL threads. All serialized
-//     state therefore runs on a strand, not "the loop thread" — there is no
-//     single loop thread to check, so is_in_loop_thread() reports false.
+//   • An external io_context may be driven by SEVERAL threads, so for an
+//     EXTERNAL context there is no single loop thread to check and
+//     is_in_loop_thread() reports false. An INTERNAL context (create_internal)
+//     is driven by exactly one thread that we started, so that case answers
+//     accurately — which is what lets the sync API reject a would-deadlock call.
 //   • The executor holds a work guard while it is alive, so an external loop
 //     does not exit while work is outstanding. reset() is called on shutdown.
 #include <megohttp/config.hpp>
@@ -81,6 +83,9 @@ namespace asio_backend {
 
         std::atomic<bool> stopped_{false};
         std::thread thread_;
+        // Driver thread id for internal mode. Stored from thread_.get_id() right
+        // after construction, so the thread body never has to touch `this`.
+        std::atomic<std::thread::id> thread_id_{};
 
     public:
         bool owns_ioc() const noexcept { return own_ioc_ != nullptr; }

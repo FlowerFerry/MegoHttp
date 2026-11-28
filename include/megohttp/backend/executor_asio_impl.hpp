@@ -120,6 +120,9 @@ namespace asio_backend {
         // Capture the io_context, NOT `this`: see shutdown().
         auto io = own_ioc_;
         thread_ = std::thread([io]() { io->run(); });
+        // get_id() is valid as soon as the thread object exists and equals the
+        // id that thread sees as its own, so the body does not have to publish it.
+        thread_id_.store(thread_.get_id());
     }
 
     inline void AsioExecutor::post(std::function<void()> fn) {
@@ -137,10 +140,20 @@ namespace asio_backend {
     }
 
     inline bool AsioExecutor::is_in_loop_thread() const noexcept {
-        // An external io_context may be driven by several threads through the
-        // strand, so there is no single loop thread to compare against. Reporting
-        // false is honest; guessing would risk a false "deadlock" diagnosis.
-        return false;
+        // Ask Asio first: io_context::executor_type::running_in_this_thread()
+        // reports whether this thread is currently executing handlers of THIS
+        // context (it checks a thread-local stack of running contexts). That is
+        // true for an internal io_context on its driver thread, and equally true
+        // for an EXTERNAL context on any of the threads driving it — including a
+        // thread pool, which no stored id could track.
+        if (ioc_.get_executor().running_in_this_thread()) return true;
+
+        // Fallback for internal mode: the driver thread is known, so a call made
+        // there outside a handler (should not happen with run(), but cheap and
+        // harmless) is refused as well. External contexts have no id to compare.
+        if (!owns_ioc()) return false;
+        const auto id = thread_id_.load();
+        return id != std::thread::id{} && id == std::this_thread::get_id();
     }
 
     inline std::shared_ptr<Timer> AsioExecutor::schedule_after(

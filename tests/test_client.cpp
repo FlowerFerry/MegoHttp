@@ -1354,6 +1354,79 @@ TEST_CASE("sync request_sync rejects an invalid URL", "[client][sync]") {
     client.shutdown();
 }
 
+TEST_CASE("a sync request from the I/O thread is rejected instead of deadlocking",
+          "[client][sync][deadlock]") {
+    // S2.7-04. The head callback runs on the Client's I/O thread (see
+    // test_head_callback's threading case), so a blocking sync request made
+    // there would wait for a completion that can only be delivered by the very
+    // thread it is blocking. The Client must reject it up front; without the
+    // guard this test hangs (that is the reverse verification).
+    TinyHttpServer srv;
+    REQUIRE(srv.start());
+
+    Client client;   // owns its loop -> the guard is armed
+    const string url = string("http://127.0.0.1:") + format("{}", srv.port()) + "/";
+
+    std::atomic<bool> called{false};
+    ErrorCode inner_code = ErrorCode::Unknown;
+    ErrorPhase inner_phase = ErrorPhase::Receive;
+
+    Request req(Method::Get, url);
+    req.set_head_callback([&](const ResponseHead&) {
+        called.store(true);
+        auto inner = client.get_sync(url);
+        if (!inner) {
+            inner_code = inner.error().code();
+            inner_phase = inner.error().phase();
+        }
+    });
+
+    auto outer = client.request_sync(req);
+    REQUIRE(outer.has_value());
+    CHECK(outer.value().head().status_code == 200);
+    CHECK(called.load());
+    CHECK(inner_code == ErrorCode::InvalidArgument);
+    CHECK(inner_phase == ErrorPhase::None);
+    client.shutdown();
+}
+
+TEST_CASE("a sync request from a borrowed internal loop thread is rejected too",
+          "[client][sync][deadlock]") {
+    // S2.7-04: owns_executor is false here, but the executor still owns the
+    // thread this callback runs on, so the same deadlock applies.
+    TinyHttpServer srv;
+    REQUIRE(srv.start());
+
+    // Internal loop of whichever backend this build uses: created by us, so the
+    // executor knows the driver thread id.
+    auto ex = detail::make_default_executor();
+    REQUIRE(ex);
+
+    ClientOptions options;
+    options.executor = ex;
+    Client client(options);   // borrowed executor
+
+    const string url = string("http://127.0.0.1:") + format("{}", srv.port()) + "/";
+
+    std::atomic<bool> done{false};
+    ErrorCode code = ErrorCode::Unknown;
+    ErrorPhase phase = ErrorPhase::Receive;
+
+    ex->post([&] {
+        auto r = client.get_sync(url);
+        if (!r) {
+            code = r.error().code();
+            phase = r.error().phase();
+        }
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    CHECK(code == ErrorCode::InvalidArgument);
+    CHECK(phase == ErrorPhase::None);
+    client.shutdown();
+}
+
 TEST_CASE("sync request can be interrupted by shutdown from another thread",
           "[client][sync]") {
     auto res = std::make_shared<ControlledResolver>();
@@ -2051,6 +2124,54 @@ TEST_CASE("client runs on a caller-owned io_context", "[client][external][asio]"
 #endif
 
 
+
+#if defined(MGHTTP_BACKEND_ASIO)
+TEST_CASE("a sync request from an external io_context handler is rejected",
+          "[client][sync][deadlock][asio]") {
+    // S2.7-04: Asio answers this for an EXTERNAL io_context too, because
+    // io_context::executor_type::running_in_this_thread() reports whether the
+    // current thread is executing handlers of that context. No thread id has to
+    // be registered, and a multi-threaded pool is covered.
+    TinyHttpServer srv;
+    REQUIRE(srv.start());
+
+    asio::io_context ioc;
+    auto ex = asio_backend::AsioExecutor::create_external(ioc);
+    REQUIRE(ex);
+    std::thread driver([&] { ioc.run(); });
+
+    ClientOptions o;
+    o.executor = ex;                 // injected: the Client must not own it
+    Client client(o);
+
+    const string url = string("http://127.0.0.1:") + format("{}", srv.port()) + "/";
+
+    std::atomic<bool> done{false};
+    ErrorCode code = ErrorCode::Unknown;
+    ErrorPhase phase = ErrorPhase::Receive;
+
+    ex->post([&] {
+        // Runs on the caller's driver thread: blocking here would stall the very
+        // context that has to deliver the completion.
+        auto r = client.get_sync(url);
+        if (!r) {
+            code = r.error().code();
+            phase = r.error().phase();
+        }
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    CHECK(code == ErrorCode::InvalidArgument);
+    CHECK(phase == ErrorPhase::None);
+
+    client.shutdown();
+    ex->shutdown();
+    CHECK(wait_until([&] { return ioc.stopped(); }, 2000));
+    driver.join();
+    srv.stop();
+}
+#endif // MGHTTP_BACKEND_ASIO
 
 // S2.6-02 (lifetime): a Client that BORROWS its executor cannot wait for the
 // queue to drain while shutting down. The retirement job it posts therefore
