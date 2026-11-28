@@ -115,13 +115,25 @@ namespace mghttp_test {
         return true;
     }
 
-    // Fallback for environments where AssignProcessToJobObject is refused.
-    // /T kills cmd.exe plus its Python child.
-    inline void terminate_tree(DWORD pid) {
+    // Terminates the direct child spawned by spawn_in_job (the Python server).
+    //
+    // Deliberately NOT `taskkill /F /T`: on this host that command fast-fails
+    // (0xC0000409, no output) when it runs after a DoH client + borrowed
+    // executor have been torn down, which made test_resolver_doh crash at
+    // fixture teardown in essentially every run (bisected: /T is the trigger;
+    // /F without /T and TerminateProcess are both clean). Terminating the child
+    // directly is also cheaper - no cmd.exe spawn per fixture.
+    //
+    // The fixtures start the Python interpreter directly, so there is no
+    // grandchild that /T would have reached. Where a Job Object exists,
+    // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE already kills the whole tree.
+    inline void terminate_child(DWORD pid) {
         if (pid == 0) return;
-        const std::string cmd =
-            "taskkill /F /T /PID " + std::to_string(pid) + " > nul 2>&1";
-        std::system(cmd.c_str());
+        HANDLE process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+        if (!process) return;   // already gone, or not ours to kill
+        TerminateProcess(process, 0);
+        WaitForSingleObject(process, 5000);
+        CloseHandle(process);
     }
 
 } // namespace mghttp_test

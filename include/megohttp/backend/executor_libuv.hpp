@@ -77,6 +77,15 @@ namespace libuv_backend {
 
         void start_owned_thread();
         void drain_pending();
+        // Closes every remaining handle, drains the close callbacks and destroys
+        // the owned loop. Must run on a thread that is NOT inside uv_run.
+        void close_owned_loop();
+        // Deleter for create_internal(): a shared_ptr<UvExecutor> can lose its
+        // last reference inside a handler running on the executor's own loop
+        // thread, where joining that thread is impossible and closing the loop
+        // from inside uv_run is illegal. This hands the join+close+delete to a
+        // helper thread instead of letting ~std::thread call std::terminate.
+        static void destroy_internal(UvExecutor* p);
         void attach_wake_handle_if_on_loop_thread();
         static void on_async(uv_async_t* h);
         static void on_wake_timer(uv_timer_t* h);
@@ -93,6 +102,9 @@ namespace libuv_backend {
 
         std::thread thread_;
         std::atomic<bool> stopping_{false};
+        // Set when shutdown() is called from the loop thread: the closing work
+        // can only run there, after uv_run returns.
+        std::atomic<bool> close_on_exit_{false};
         std::atomic<std::thread::id> loop_thread_id_{};
         bool started_{false};
     };

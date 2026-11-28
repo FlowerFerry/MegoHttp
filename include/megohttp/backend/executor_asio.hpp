@@ -59,14 +59,21 @@ namespace asio_backend {
         // Public so std::make_shared can reach it; the ownership contract lives
         // in create_internal() / create_external().
         AsioExecutor(asio::io_context& ioc,
-                     std::unique_ptr<asio::io_context> own_ioc = nullptr);
+                     std::shared_ptr<asio::io_context> own_ioc = nullptr);
 
     private:
         void start_owned_thread();
 
         // Declared BEFORE ioc_ so it is destroyed AFTER it in internal mode: the
         // io_context must outlive the strand and the work guard.
-        std::unique_ptr<asio::io_context> own_ioc_;
+        //
+        // Held by shared_ptr because the driver thread captures it directly: the
+        // thread must not touch `this`. The last reference to an internal
+        // executor can be released inside a handler running on that very thread
+        // (the multi-address connect race does exactly this), so shutdown() may
+        // run on the loop thread and cannot join it; the io_context therefore has
+        // to outlive the object on the thread's own reference.
+        std::shared_ptr<asio::io_context> own_ioc_;
 
         asio::io_context& ioc_;
         asio::strand<asio::io_context::executor_type> strand_;

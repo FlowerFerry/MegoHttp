@@ -78,7 +78,7 @@ public:
             job_.terminate();
             pid_ = 0;
         } else if (pid_ > 0) {
-            mghttp_test::terminate_tree(static_cast<DWORD>(pid_));
+            mghttp_test::terminate_child(static_cast<DWORD>(pid_));
             pid_ = 0;
         }
         job_.close();
@@ -311,6 +311,48 @@ TEST_CASE("DoT refuses a named endpoint with no bootstrap address", "[dot][s5a]"
     // Task book 9-A.4: strict mode must report a configuration error rather than
     // silently falling back to the system resolver.
     CHECK(got.code() == ErrorCode::ConfigurationError);
+}
+
+TEST_CASE("DoT strict mode never falls back to system DNS for a resolvable name",
+          "[dot][s5a][bootstrap][strict]") {
+    // Task book 13.9 asks for a counting resolver or an equivalent observation
+    // that strict bootstrap issues no system lookup. This is that observation:
+    // "localhost" is resolvable everywhere AND the port below runs a live DoT
+    // endpoint, so an implementation that quietly fell back to system DNS would
+    // SUCCEED with this exact configuration (see "DoT system bootstrap resolves
+    // a named endpoint", which is the same setup with use_system_bootstrap
+    // true). ConfigurationError is therefore only reachable when no lookup
+    // happened at all.
+    DotTestServer srv;
+    REQUIRE(srv.start());
+
+    auto ex = detail::make_default_executor();
+    REQUIRE(ex);
+
+    DotOptions o;
+    o.server_name = string("localhost");   // resolvable on purpose
+    o.port = srv.port();                   // a live endpoint behind that name
+    o.tls.ca_file = string(fixture("ca.pem").c_str());
+    o.connect_timeout = std::chrono::milliseconds(300);
+    o.use_system_bootstrap = false;        // strict
+
+    auto resolver = std::make_shared<DotResolver>(ex, o);
+
+    std::atomic<bool> done{false};
+    Result<AddressList> got = Error{ErrorCode::Unknown};
+    resolver->resolve(string("example.com"), 443, [&](Result<AddressList> r) {
+        got = std::move(r);
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }, 5000));
+    if (got) {
+        UNSCOPED_INFO("strict DoT resolved through system DNS: "
+                      << got.value().size() << " address(es)");
+    }
+    REQUIRE(!got);
+    CHECK(got.error().code() == ErrorCode::ConfigurationError);
+    CHECK(got.error().phase() == ErrorPhase::Resolve);
 }
 
 TEST_CASE("a cancelled DoT lookup does not receive its late answer", "[dot][s5a]") {

@@ -170,7 +170,15 @@ namespace libuv_backend {
             return nullptr;   // loop memory freed when `loop` leaves scope
         }
         // The executor takes ownership of the initialized loop; hand it over.
-        auto ex = std::make_shared<UvExecutor>(loop.release(), true);
+        //
+        // The deleter is not std::default_delete. The last reference to this
+        // executor can be dropped from inside a handler running on its own loop
+        // thread (the multi-address connect race releases the losing attempt's
+        // TcpStream there). ~UvExecutor on that thread would have to join the
+        // running thread - impossible - and would uv_run the loop from inside
+        // uv_run - illegal. destroy_internal() moves that work to a helper.
+        std::shared_ptr<UvExecutor> ex(new UvExecutor(loop.release(), true),
+                                       &UvExecutor::destroy_internal);
         ex->start_owned_thread();
         return ex;
     }
@@ -192,6 +200,30 @@ namespace libuv_backend {
         shutdown();
     }
 
+    inline void UvExecutor::destroy_internal(UvExecutor* p) {
+        if (p == nullptr) return;
+        const bool on_loop_thread =
+            p->started_ && p->thread_.joinable() &&
+            p->thread_.get_id() == std::this_thread::get_id();
+        if (!p->owns_loop_ || !on_loop_thread) {
+            delete p;   // normal path: ~UvExecutor stops, joins and closes
+            return;
+        }
+
+        // Last reference lost inside our own uv_run callback. Stop the loop
+        // here (uv_stop is not thread-safe, and this IS the loop thread), then
+        // hand the join + loop close + delete to a helper thread.
+        p->stopping_.store(true);
+        uv_stop(p->loop_);
+        if (p->async_initialized_) uv_async_send(&p->async_);
+
+        std::thread([p] {
+            p->thread_.join();       // returns once uv_run sees the stop flag
+            p->close_owned_loop();
+            delete p;                // ~UvExecutor sees stopping_ and returns
+        }).detach();
+    }
+
     inline void UvExecutor::start_owned_thread() {
         // uv_async_t is used to wake the loop when another thread posts work.
         // Initialize it here (before the thread starts) so a post() that races
@@ -208,6 +240,9 @@ namespace libuv_backend {
             uv_run(loop_, UV_RUN_DEFAULT);
             // Drain anything still queued so posted handlers are not silently lost.
             drain_pending();
+            // shutdown() called from this thread could not join itself or close
+            // the loop from inside uv_run; it set the flag instead.
+            if (close_on_exit_.exchange(false)) close_owned_loop();
         });
     }
 
@@ -228,28 +263,38 @@ namespace libuv_backend {
         }
 
         if (started_) {
-            // Stop the owned loop and join our thread.
             uv_stop(loop_);
             if (async_initialized_) uv_async_send(&async_);
-            if (thread_.joinable() && thread_.get_id() != std::this_thread::get_id()) {
+            if (thread_.joinable() &&
+                thread_.get_id() != std::this_thread::get_id()) {
                 thread_.join();
+            } else if (thread_.joinable()) {
+                // Called on the loop thread: we cannot join ourselves and must
+                // not close the loop from inside uv_run. The thread body runs
+                // close_owned_loop() the moment uv_run returns.
+                close_on_exit_.store(true);
+                started_ = false;
+                return;
             }
             started_ = false;
         }
 
-        if (loop_ != nullptr) {
-            // Close every remaining handle (including our async handle), let the
-            // close callbacks run, then destroy the loop.
-            uv_walk(loop_, [](uv_handle_t* h, void*) {
-                if (!uv_is_closing(h)) uv_close(h, nullptr);
-            }, nullptr);
-            uv_run(loop_, UV_RUN_DEFAULT);
-            uv_loop_close(loop_);
-            // Adopt the loop memory so it is freed on scope exit, without a manual
-            // delete. Ownership came from make_unique in create_internal().
-            std::unique_ptr<uv_loop_t> owned(loop_);
-            loop_ = nullptr;
-        }
+        close_owned_loop();
+    }
+
+    inline void UvExecutor::close_owned_loop() {
+        if (loop_ == nullptr) return;
+        // Close every remaining handle (including our async handle), let the
+        // close callbacks run, then destroy the loop.
+        uv_walk(loop_, [](uv_handle_t* h, void*) {
+            if (!uv_is_closing(h)) uv_close(h, nullptr);
+        }, nullptr);
+        uv_run(loop_, UV_RUN_DEFAULT);
+        uv_loop_close(loop_);
+        // Adopt the loop memory so it is freed on scope exit, without a manual
+        // delete. Ownership came from make_unique in create_internal().
+        std::unique_ptr<uv_loop_t> owned(loop_);
+        loop_ = nullptr;
         async_initialized_ = false;
     }
 

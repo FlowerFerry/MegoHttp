@@ -116,7 +116,7 @@ namespace {
             if (job_assigned_) {
                 job_.terminate();
             } else if (pid_ != 0) {
-                mghttp_test::terminate_tree(pid_);
+                mghttp_test::terminate_child(pid_);
             }
             job_.close();
             if (hproc_) {

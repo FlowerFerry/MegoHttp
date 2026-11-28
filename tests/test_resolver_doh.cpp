@@ -79,7 +79,7 @@ public:
             job_.terminate();
             pid_ = 0;
         } else if (pid_ > 0) {
-            mghttp_test::terminate_tree(static_cast<DWORD>(pid_));
+            mghttp_test::terminate_child(static_cast<DWORD>(pid_));
             pid_ = 0;
         }
         job_.close();
@@ -616,6 +616,106 @@ TEST_CASE("DoH direct bootstrap uses the IP without changing certificate identit
 }
 
 
+TEST_CASE("DoH system bootstrap resolves a name-only endpoint through system DNS",
+          "[doh][s5a][bootstrap]") {
+    DohTestServer srv;
+    REQUIRE(srv.start());
+
+    DohOptions o;
+    // No bootstrap_ip: "localhost" has to come from the system resolver. This
+    // is the positive control for the strict case below - if it did not resolve
+    // (or the fixture were unreachable), proving "no lookup" would be vacuous.
+    o.endpoint_url = string(("https://localhost:" +
+                             std::to_string(srv.port()) + "/dns-query").c_str());
+    o.tls = TlsConfig{};
+    o.tls->hostname = string("localhost");
+    o.tls->ca_file = string(fixture("ca.pem").c_str());
+    o.use_system_bootstrap = true;
+    o.connect_timeout = std::chrono::seconds(5);
+    o.request_timeout = std::chrono::seconds(10);
+    o.total_timeout = std::chrono::seconds(15);
+
+    auto ex = detail::make_default_executor();
+    REQUIRE(ex);
+    auto resolver = std::make_shared<DohResolver>(ex, o);
+
+    std::atomic<bool> done{false};
+    Result<AddressList> got = Error{ErrorCode::Unknown};
+    resolver->resolve(string("dual.example"), 443, [&](Result<AddressList> r) {
+        got = std::move(r);
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    if (!got) {
+        UNSCOPED_INFO("DoH system bootstrap failed: "
+                      << megohttp::to_string(got.error().code())
+                      << " phase=" << megohttp::to_string(got.error().phase())
+                      << " msg=" << std::string(got.error().message().data(),
+                                                got.error().message().size()));
+    }
+    REQUIRE(got);
+    CHECK(got.value().size() == 2);
+}
+
+TEST_CASE("DoH strict mode never falls back to system DNS for a resolvable name",
+          "[doh][s5a][bootstrap][strict]") {
+    // Task book 13.9 (counting resolver or equivalent observation). The
+    // configuration is identical to the passing system-bootstrap case above
+    // except for the strict flag: "localhost" resolves on every host and the
+    // port runs a live DoH endpoint, so a silent fallback would SUCCEED here.
+    // Only "no lookup happened" produces ConfigurationError.
+    DohTestServer srv;
+    REQUIRE(srv.start());
+
+    DohOptions o;
+    o.endpoint_url = string(("https://localhost:" +
+                             std::to_string(srv.port()) + "/dns-query").c_str());
+    o.tls = TlsConfig{};
+    o.tls->hostname = string("localhost");
+    o.tls->ca_file = string(fixture("ca.pem").c_str());
+    o.use_system_bootstrap = false;        // strict: no system fallback
+    o.connect_timeout = std::chrono::milliseconds(300);
+    o.request_timeout = std::chrono::milliseconds(300);
+    o.total_timeout = std::chrono::milliseconds(500);
+
+    auto ex = detail::make_default_executor();
+    REQUIRE(ex);
+    auto resolver = std::make_shared<DohResolver>(ex, o);
+
+    {   // Premise for the strict check below: the name really is system-resolvable
+        // and the fixture really is listening, so a silent fallback to system DNS
+        // would have succeeded instead of failing with ConfigurationError.
+        auto sys = std::make_shared<SystemResolver>(ex);
+        std::atomic<bool> sys_done{false};
+        Result<AddressList> sys_got = Error{ErrorCode::Unknown};
+        sys->resolve(string("localhost"), srv.port(),
+                     [&](Result<AddressList> r) {
+                         sys_got = std::move(r);
+                         sys_done.store(true);
+                     });
+        REQUIRE(wait_until([&] { return sys_done.load(); }));
+        REQUIRE(sys_got);
+        CHECK(!sys_got.value().empty());
+    }
+
+    std::atomic<bool> done{false};
+    Result<AddressList> got = Error{ErrorCode::Unknown};
+    resolver->resolve(string("dual.example"), 443, [&](Result<AddressList> r) {
+        got = std::move(r);
+        done.store(true);
+    });
+
+    REQUIRE(wait_until([&] { return done.load(); }));
+    if (got) {
+        UNSCOPED_INFO("strict DoH resolved through system DNS: "
+                      << got.value().size() << " address(es)");
+    }
+    REQUIRE(!got);
+    CHECK(got.error().code() == ErrorCode::ConfigurationError);
+    CHECK(got.error().phase() == ErrorPhase::Resolve);
+}
+
 TEST_CASE("DoH proxy authentication uses the proxy credential only",
           "[doh][s5a][proxy][auth]") {
     DohTestServer srv;
@@ -734,6 +834,8 @@ TEST_CASE("DoH proxy handshake is bounded by connect_timeout",
     REQUIRE(!got);
     CHECK(got.error().code() == ErrorCode::TimeoutConnect);
     CHECK(elapsed < std::chrono::milliseconds(2500));
+
 }
+
 
 #endif // MEGOHTTP_HAS_DOH && !MGHTTP_TLS_NONE

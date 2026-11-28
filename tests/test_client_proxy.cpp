@@ -190,7 +190,7 @@ public:
             // Closing the job with KILL_ON_JOB_CLOSE terminates the tree.
             pid_ = 0;
         } else if (pid_ > 0) {
-            mghttp_test::terminate_tree(static_cast<DWORD>(pid_));
+            mghttp_test::terminate_child(static_cast<DWORD>(pid_));
             pid_ = 0;
         }
         job_.close();
@@ -632,7 +632,7 @@ public:
             job_.terminate();
             pid_ = 0;
         } else if (pid_ > 0) {
-            mghttp_test::terminate_tree(static_cast<DWORD>(pid_));
+            mghttp_test::terminate_child(static_cast<DWORD>(pid_));
             pid_ = 0;
         }
         job_.close();

@@ -42,7 +42,7 @@ public:
             job_.terminate();
             pid_ = 0;
         } else if (pid_ > 0) {
-            terminate_tree(static_cast<DWORD>(pid_));
+            terminate_child(static_cast<DWORD>(pid_));
             pid_ = 0;
         }
         job_.close();

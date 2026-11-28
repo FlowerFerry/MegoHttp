@@ -62,7 +62,7 @@ namespace asio_backend {
 
     // ---------------------------------------------------------------------------
     inline AsioExecutor::AsioExecutor(asio::io_context& ioc,
-                                      std::unique_ptr<asio::io_context> own_ioc)
+                                      std::shared_ptr<asio::io_context> own_ioc)
         : own_ioc_(std::move(own_ioc)),
           ioc_(ioc),
           strand_(asio::make_strand(ioc.get_executor())),
@@ -71,10 +71,10 @@ namespace asio_backend {
                      asio::make_work_guard(ioc.get_executor()))) {}
 
     inline std::shared_ptr<AsioExecutor> AsioExecutor::create_internal() {
-        // The io_context is heap-allocated and handed to the executor, which
-        // destroys it AFTER the strand and the work guard (member order in the
-        // header). Keeping it in a local shared_ptr would dangle.
-        auto own = std::make_unique<asio::io_context>();
+        // shared_ptr, not unique_ptr: the driver thread captures the io_context
+        // itself, so it stays valid even when this object is destroyed from
+        // inside one of its own handlers (shutdown() can then only detach).
+        auto own = std::make_shared<asio::io_context>();
         auto& ref = *own;
         auto ex = std::make_shared<AsioExecutor>(ref, std::move(own));
         ex->start_owned_thread();
@@ -95,15 +95,31 @@ namespace asio_backend {
         // We never call ioc_.stop() in external mode: that would be a global stop
         // of somebody else's loop, which the spec forbids.
         guard_.reset();
-        if (own_ioc_ && thread_.joinable() &&
-            thread_.get_id() != std::this_thread::get_id()) {
-            ioc_.stop();
-            thread_.join();
+        if (!own_ioc_ || !thread_.joinable()) return;
+
+        ioc_.stop();
+
+        // The last reference to an internal executor can be released inside a
+        // handler running on this very thread: the multi-address connect race
+        // hands the winning stream to the caller and then releases the losing
+        // attempt's TcpStream (which holds the executor) from the loop thread.
+        // ~AsioExecutor therefore has to work on its own loop thread, where
+        // join() is impossible and a joinable std::thread would call
+        // std::terminate (0xC0000409). The driver thread captures the
+        // io_context, never `this`, so detaching here is safe: the loop keeps
+        // running until run() returns and then releases the last io_context
+        // reference itself.
+        if (thread_.get_id() == std::this_thread::get_id()) {
+            thread_.detach();
+            return;
         }
+        thread_.join();
     }
 
     inline void AsioExecutor::start_owned_thread() {
-        thread_ = std::thread([this]() { ioc_.run(); });
+        // Capture the io_context, NOT `this`: see shutdown().
+        auto io = own_ioc_;
+        thread_ = std::thread([io]() { io->run(); });
     }
 
     inline void AsioExecutor::post(std::function<void()> fn) {
