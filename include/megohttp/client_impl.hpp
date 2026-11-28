@@ -407,9 +407,30 @@ namespace megohttp {
             // finish), false when the policy declined.
             std::function<bool(Error)> on_retry;
 
+            // Weak hook into the current Exchange's sink notification. Set when
+            // an Exchange is created, used by finish() for the terminal paths
+            // that bypass Exchange::fail(). See finish() for why.
+            std::function<void(const Error&)> sink_fail_notifier;
+
             // Fires the terminal callback exactly once.
             void finish(Result<Response> result) {
                 if (finished.exchange(true)) return;
+                // Streaming sinks are promised on_error exactly once on failure,
+                // cancellation and timeout included (multipart_sink.hpp). A
+                // cancel or a total timeout reaches finish() directly, without
+                // going through Exchange::fail(), so without this hook the
+                // multipart sink and the BodySink completion callback would
+                // never hear about it. The hook is weak, and both notify paths
+                // are idempotent, so the Exchange's own fail() path firing first
+                // is harmless.
+                if (!result && sink_fail_notifier) {
+                    auto notify = std::move(sink_fail_notifier);
+                    sink_fail_notifier = nullptr;
+                    try {
+                        notify(result.error());
+                    } catch (...) {
+                    }
+                }
                 if (on_terminal_cleanup) {
                     auto cleanup = std::move(on_terminal_cleanup);
                     cleanup();
@@ -616,6 +637,16 @@ namespace megohttp {
 
             void set_parser(std::unique_ptr<ResponseParser> p) {
                 parser_ = std::move(p);
+            }
+
+            // Internal: deliver "this request failed" to whichever streaming
+            // sink is attached. Called from fail(), and from RequestState::finish
+            // through the weak hook so cancel/timeout do not skip it. Both
+            // notify_* helpers are idempotent (they move the sink out), so a
+            // double call is harmless.
+            void notify_failure_to_sinks(const Error& e) {
+                notify_sink_failed(e);
+                notify_multipart_failed(e);
             }
 
             // send_timeout is an IDLE timeout: every successful write
@@ -3624,6 +3655,15 @@ namespace megohttp {
             std::weak_ptr<detail::Exchange> weak_exchange = exchange;
             st->on_terminal_cleanup = [weak_exchange]() {
                 if (auto ex = weak_exchange.lock()) ex->clear_pause_hold();
+            };
+            // Cancel and total-timeout terminate through RequestState::finish(),
+            // never through Exchange::fail(). Give the state a weak hook so a
+            // streaming BodySink / MultipartSink still receives its promised
+            // on_error on those paths (multipart_sink.hpp names cancellation and
+            // timeout explicitly). Weak, so a finished Exchange is not kept alive
+            // and the hook is a no-op once it is gone.
+            st->sink_fail_notifier = [weak_exchange](const Error& e) {
+                if (auto ex = weak_exchange.lock()) ex->notify_failure_to_sinks(e);
             };
             auto parser = std::make_unique<ResponseParser>(
                 *exchange, st->options.parser_limits);

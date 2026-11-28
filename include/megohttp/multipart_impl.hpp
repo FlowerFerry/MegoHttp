@@ -58,7 +58,11 @@ namespace megohttp {
                 raw[i + 3] = kHex[(v >> 16) & 0xF];
             }
             fmt::memory_buffer buf;
-            buf.append("----MegoHttpBoundary", "----MegoHttpBoundary" + 21);
+            // sizeof - 1, not + 21: the literal is 20 characters long, and
+            // appending past the NUL byte embeds a 0x00 in the boundary, which
+            // then makes the Content-Type header invalid on the wire.
+            static const char kPrefix[] = "----MegoHttpBoundary";
+            buf.append(kPrefix, kPrefix + (sizeof kPrefix - 1));
             buf.append(raw, raw + sizeof raw);
             return detail::sb_release(buf);
         }

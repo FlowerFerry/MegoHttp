@@ -1050,6 +1050,217 @@ jobs:
           ctest --test-dir build --output-on-failure \
             -R '^(test_core|test_http|test_dns_wire|test_content_type|test_content_range|test_multipart|test_multipart_response|test_client)$'
 
+  linux-examples:
+    name: Linux GCC x64 | libuv + openssl + std | examples on | build + run offline examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout fmt 12.1.0 headers
+        uses: actions/checkout@v4
+        with:
+          repository: fmtlib/fmt
+          ref: 12.1.0
+          path: deps/fmt-12.1.0
+          fetch-depth: 1
+
+      - name: Checkout libuv 1.53.0
+        uses: actions/checkout@v4
+        with:
+          repository: libuv/libuv
+          ref: v1.53.0
+          path: deps/libuv-1.53.0
+          fetch-depth: 1
+
+      - name: Install toolchain and TLS fixture dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build g++ libssl-dev
+          python3 -m pip install --quiet cryptography
+
+      - name: Build libuv
+        run: |
+          cmake -S deps/libuv-1.53.0 -B deps/libuv-1.53.0/build_mingw -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLIBUV_BUILD_SHARED=OFF \
+            -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY="$PWD/deps/libuv-1.53.0/build_mingw"
+          cmake --build deps/libuv-1.53.0/build_mingw -j 4
+
+      - name: Build the examples (every feature that needs no extra dependency)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMGHTTP_BACKEND_LIBUV=ON \
+            -DMGHTTP_BACKEND_ASIO=OFF \
+            -DMGHTTP_TLS_OPENSSL=ON \
+            -DMGHTTP_TLS_MBEDTLS=OFF \
+            -DMGHTTP_TLS_NONE=OFF \
+            -DMGHTTP_USE_MEMESTRING=OFF \
+            -DMGHTTP_USE_UVW=OFF \
+            -DMGHTTP_ENABLE_GZIP=OFF \
+            -DMGHTTP_ENABLE_BROTLI=OFF \
+            -DMGHTTP_ENABLE_SSE=ON \
+            -DMGHTTP_ENABLE_WEBSOCKET=ON \
+            -DMGHTTP_ENABLE_WEBSOCKET_DEFLATE=ON \
+            -DMGHTTP_ENABLE_DOT=ON \
+            -DMGHTTP_ENABLE_DOH=ON \
+            -DMGHTTP_BUILD_TESTS=OFF \
+            -DMGHTTP_BUILD_EXAMPLES=ON
+          cmake --build build -j 4
+          ls build/examples
+
+      - name: Run the plain-HTTP examples
+        run: |
+          set -e
+          python3 -m http.server 8080 --bind 127.0.0.1 > http.log 2>&1 &
+          for i in $(seq 1 50); do
+            if python3 -c "import socket;socket.create_connection(('127.0.0.1',8080),1)" 2>/dev/null; then break; fi
+            sleep 0.2
+          done
+          ./build/examples/megohttp_example_sync_get http://127.0.0.1:8080/README.md
+          ./build/examples/megohttp_example_future_get http://127.0.0.1:8080/README.md
+          ./build/examples/megohttp_example_stream_download http://127.0.0.1:8080/README.md out.bin
+          cmp README.md out.bin
+          ./build/examples/megohttp_example_external_libuv_loop http://127.0.0.1:8080/README.md
+
+      - name: Run the SSE example against the bundled server
+        run: |
+          set -e
+          python3 examples/servers/sse_server.py 8081 > sse.log 2>&1 &
+          for i in $(seq 1 50); do
+            if python3 -c "import socket;socket.create_connection(('127.0.0.1',8081),1)" 2>/dev/null; then break; fi
+            sleep 0.2
+          done
+          ./build/examples/megohttp_example_sse_client http://127.0.0.1:8081/events 3
+
+      - name: Run the WebSocket example against the bundled echo server
+        run: |
+          set -e
+          python3 examples/servers/ws_echo_server.py 8082 > ws.log 2>&1 &
+          for i in $(seq 1 50); do
+            if python3 -c "import socket;socket.create_connection(('127.0.0.1',8082),1)" 2>/dev/null; then break; fi
+            sleep 0.2
+          done
+          ./build/examples/megohttp_example_websocket_echo ws://127.0.0.1:8082/chat
+
+      - name: Run the encrypted-DNS examples against the TLS fixtures
+        run: |
+          set -e
+          python3 tests/gen_tls_fixtures.py tests/tls_fixtures
+          python3 tests/dot_test_server.py --cert tests/tls_fixtures/server-cert.pem \
+            --key tests/tls_fixtures/server-key.pem > dot.log 2>&1 &
+          python3 tests/doh_test_server.py --cert tests/tls_fixtures/server-cert.pem \
+            --key tests/tls_fixtures/server-key.pem > doh.log 2>&1 &
+          for i in $(seq 1 50); do
+            grep -q READY dot.log && grep -q READY doh.log && break
+            sleep 0.2
+          done
+          DOT_PORT=$(awk '/READY/{print $3}' dot.log)
+          DOH_PORT=$(awk '/READY/{print $3}' doh.log)
+          echo "DoT port $DOT_PORT, DoH port $DOH_PORT"
+          ./build/examples/megohttp_example_dot_resolve --port "$DOT_PORT" example.com
+          ./build/examples/megohttp_example_doh_resolve --port "$DOH_PORT" dual.example
+          ./build/examples/megohttp_example_encrypted_dns_strict_bootstrap --port "$DOT_PORT"
+
+      - name: Run the cancellation example against the slow server
+        run: |
+          set -e
+          python3 examples/servers/slow_server.py 8084 500 > slow.log 2>&1 &
+          for i in $(seq 1 50); do
+            if python3 -c "import socket;socket.create_connection(('127.0.0.1',8084),1)" 2>/dev/null; then break; fi
+            sleep 0.2
+          done
+          set +e
+          ./build/examples/megohttp_example_callback_cancel http://127.0.0.1:8084/ 100
+          rc=$?
+          set -e
+          echo "callback_cancel exit code: $rc (2 = cancelled, as intended)"
+          test "$rc" -eq 2
+
+      - name: Run the HTTPS custom-CA example against the TLS fixture
+        run: |
+          set -e
+          python3 tests/https_test_server.py tests/tls_fixtures/server-cert.pem \
+            tests/tls_fixtures/server-key.pem > https.log 2>&1 &
+          for i in $(seq 1 50); do
+            grep -q READY https.log && break
+            sleep 0.2
+          done
+          PORT=$(awk '/READY/{print $3}' https.log)
+          echo "https fixture port $PORT"
+          ./build/examples/megohttp_example_https_custom_ca --port "$PORT"
+
+      - name: Run the multipart examples against the multipart server
+        run: |
+          set -e
+          python3 examples/servers/multipart_server.py 8085 > mp.log 2>&1 &
+          for i in $(seq 1 50); do
+            if python3 -c "import socket;socket.create_connection(('127.0.0.1',8085),1)" 2>/dev/null; then break; fi
+            sleep 0.2
+          done
+          ./build/examples/megohttp_example_multipart_upload http://127.0.0.1:8085/upload README.md
+          ./build/examples/megohttp_example_multipart_response http://127.0.0.1:8085/batch
+          ./build/examples/megohttp_example_multipart_continuous http://127.0.0.1:8085/stream
+
+      - name: Run the WebSocket compression and reconnect examples
+        run: |
+          set -e
+          python3 examples/servers/ws_server.py 8087 > ws_def.log 2>&1 &
+          python3 examples/servers/ws_server.py 8088 --require-token-prefix "Bearer demo-" \
+            --drop-after 1 > ws_auth.log 2>&1 &
+          python3 examples/servers/ws_server.py 8089 --vary-negotiation --drop-after 1 \
+            > ws_vary.log 2>&1 &
+          for i in $(seq 1 100); do
+            grep -q READY ws_def.log && grep -q READY ws_auth.log && grep -q READY ws_vary.log && break
+            sleep 0.2
+          done
+          ./build/examples/megohttp_example_ws_deflate_negotiation ws://127.0.0.1:8087/chat
+          ./build/examples/megohttp_example_ws_deflate_stream      ws://127.0.0.1:8087/chat
+          ./build/examples/megohttp_example_ws_reconnect_auth      ws://127.0.0.1:8088/chat
+          ./build/examples/megohttp_example_ws_reconnect_deflate   ws://127.0.0.1:8089/chat
+
+      - name: Run the proxy and cookie examples
+        run: |
+          set -e
+          python3 examples/servers/cookie_server.py 8090 > cookie.log 2>&1 &
+          python3 tests/proxy_test_server.py --mode forward > p_fwd.log 2>&1 &
+          python3 tests/proxy_test_server.py --mode forward \
+            --tls-cert tests/tls_fixtures/server-cert.pem \
+            --tls-key tests/tls_fixtures/server-key.pem > p_https_fwd.log 2>&1 &
+          python3 tests/proxy_test_server.py --mode connect \
+            --tls-cert tests/tls_fixtures/server-cert.pem \
+            --tls-key tests/tls_fixtures/server-key.pem > p_https_conn.log 2>&1 &
+          python3 tests/https_test_server.py \
+            tests/tls_fixtures/intermediate-server-fullchain.pem \
+            tests/tls_fixtures/intermediate-server-key.pem > t_int.log 2>&1 &
+          python3 examples/servers/ws_server.py 8091 \
+            --cert tests/tls_fixtures/server-cert.pem \
+            --key tests/tls_fixtures/server-key.pem > ws_wss.log 2>&1 &
+          for i in $(seq 1 150); do
+            grep -q READY p_fwd.log && grep -q READY p_https_fwd.log && \
+              grep -q READY p_https_conn.log && grep -q READY t_int.log && \
+              grep -q READY ws_wss.log && break
+            sleep 0.2
+          done
+          P_FWD=$(awk '/READY/{print $3}' p_fwd.log)
+          P_HTTPS_FWD=$(awk '/READY/{print $3}' p_https_fwd.log)
+          P_HTTPS_CONN=$(awk '/READY/{print $3}' p_https_conn.log)
+          T_INT=$(awk '/READY/{print $3}' t_int.log)
+          echo "forward=$P_FWD https-forward=$P_HTTPS_FWD https-connect=$P_HTTPS_CONN target=$T_INT"
+          ./build/examples/megohttp_example_proxy_cookie \
+            --proxy "127.0.0.1:$P_FWD" http://127.0.0.1:8090
+          ./build/examples/megohttp_example_https_proxy_to_http \
+            --proxy "localhost:$P_HTTPS_FWD" --proxy-ca tests/tls_fixtures/ca.pem \
+            http://127.0.0.1:8090/
+          ./build/examples/megohttp_example_https_proxy_to_https \
+            --proxy "localhost:$P_HTTPS_CONN" --proxy-ca tests/tls_fixtures/ca.pem \
+            --target-ca tests/tls_fixtures/intermediate-ca-chain.pem \
+            "https://localhost:$T_INT/"
+          ./build/examples/megohttp_example_wss_via_https_proxy \
+            --proxy "localhost:$P_HTTPS_CONN" --proxy-ca tests/tls_fixtures/ca.pem \
+            --target-ca tests/tls_fixtures/ca.pem wss://localhost:8091/chat
+
   linux-cross:
     name: Linux ${{ matrix.arch }} | asio + tls-none + std | features off | cross-compile only
     runs-on: ubuntu-latest

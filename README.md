@@ -141,18 +141,27 @@ management.
 
 ### Examples
 
-Examples are gated per feature, so a C++17 build simply skips the coroutine
-example instead of failing to compile. Only the coroutine example exists today
-(`examples/coroutine_get.cpp`); the remaining examples listed in the task book
-are still part of phase 8.
+All twenty-four examples from the task book list live in `examples/`, each gated
+on the feature it demonstrates so a build with that feature off prints a `skip`
+line instead of failing — from sync GET and future/callback forms through external
+loops, HTTPS with a custom CA, multipart upload/streaming, SSE, WebSocket
+(echo, permessage-deflate negotiation, streaming compression, reconnects with
+credential refresh and re-negotiation) and proxies (HTTP/SOCKS5 with a cookie jar,
+HTTPS proxy to HTTP, HTTPS proxy to HTTPS with separate proxy/target CAs, WSS
+through an HTTPS proxy with deflate) to DoT/DoH/strict bootstrap and the C++20
+coroutine GET. `examples/README.md` lists the local server each one needs (the
+demo servers live in `examples/servers/`).
 
 ```bash
-cmake -S . -B build_cxx20 -G Ninja -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_CXX_STANDARD=20 -DMGHTTP_BUILD_TESTS=OFF
-cmake --build build_cxx20 --target megohttp_example_coroutine_get
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMGHTTP_BUILD_EXAMPLES=ON
+cmake --build build
 python -m http.server 8080                       # another terminal
-build_cxx20/examples/megohttp_example_coroutine_get http://127.0.0.1:8080/
+build/examples/megohttp_example_sync_get http://127.0.0.1:8080/
 ```
+
+The coroutine example additionally needs `-DCMAKE_CXX_STANDARD=20
+-DMGHTTP_ENABLE_COROUTINES=ON`. The remaining examples from the task book list
+are still part of phase 8.
 
 ## Minimal usage
 

@@ -140,6 +140,19 @@ namespace megohttp {
         size_t reconnect_attempts() const noexcept { return attempts_.load(); }
         uint64_t connection_generation() const noexcept { return generation_.load(); }
 
+        // Negotiated permessage-deflate parameters for the CURRENT physical
+        // connection. `enabled == false` when no connection is open, or when
+        // the server did not accept the extension.
+        //
+        // Re-read it after a reconnect: every physical connection negotiates
+        // independently, so the second connection may agree on different window
+        // bits or context-takeover flags than the first (task book 12.2:
+        // "重连后查询新的压缩协商结果").
+        DeflateNegotiated negotiated_deflate() const {
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            return session_ ? session_->negotiated_deflate() : DeflateNegotiated{};
+        }
+
     private:
         void attempt_connect();
         void attach(std::shared_ptr<WebSocketSession> session);
